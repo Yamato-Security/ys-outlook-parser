@@ -24,7 +24,7 @@ use crate::{
     AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
     ltp::{
         heap::HeapNode,
-        prop_context::{BinaryValue, PropertyContext, PropertyValue},
+        prop_context::{BinaryValue, ObjectValue, PropertyContext, PropertyValue},
         prop_type::PropertyType,
         read_write::*,
     },
@@ -78,6 +78,39 @@ impl AttachmentProperties {
             invalid => {
                 Err(MessagingError::InvalidAttachmentMethod(PropertyType::from(invalid)).into())
             }
+        }
+    }
+
+    /// `PidTagAttachDataBinary` (0x3701) of an `afByValue` attachment.
+    fn data_binary(&self) -> MessagingResult<&BinaryValue> {
+        match self
+            .properties
+            .get(&0x3701)
+            .ok_or(MessagingError::AttachmentFileBinaryDataNotFound)?
+        {
+            PropertyValue::Binary(value) => Ok(value),
+            invalid => Err(MessagingError::InvalidAttachmentFileBinaryData(
+                PropertyType::from(invalid),
+            )),
+        }
+    }
+
+    /// `PidTagAttachDataObject` (0x3701) of an `afEmbeddedMessage` or `afStorage` attachment.
+    fn data_object(&self, method: AttachmentMethod) -> MessagingResult<&ObjectValue> {
+        let storage = method == AttachmentMethod::Storage;
+        let value = self.properties.get(&0x3701).ok_or(if storage {
+            MessagingError::AttachmentStorageObjectDataNotFound
+        } else {
+            MessagingError::AttachmentMessageObjectDataNotFound
+        })?;
+        match value {
+            PropertyValue::Object(value) => Ok(value),
+            invalid if storage => Err(MessagingError::InvalidStorageObjectData(
+                PropertyType::from(invalid),
+            )),
+            invalid => Err(MessagingError::InvalidMessageObjectData(
+                PropertyType::from(invalid),
+            )),
         }
     }
 
@@ -280,33 +313,11 @@ where
             let attachment_method = AttachmentMethod::try_from(properties.attachment_method()?)?;
             let data = match attachment_method {
                 AttachmentMethod::ByValue => {
-                    let binary_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Binary(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into());
-                        }
-                    };
+                    let binary_data = properties.data_binary()?;
                     Some(AttachmentData::Binary(binary_data.clone()))
                 }
                 AttachmentMethod::EmbeddedMessage => {
-                    let object_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Object(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into());
-                        }
-                    };
+                    let object_data = properties.data_object(attachment_method)?;
 
                     // The embedded message is in the attachment's sub-node tree, not the message's.
                     let sub_node = object_data.node();
@@ -334,18 +345,7 @@ where
                     None
                 }
                 AttachmentMethod::Storage => {
-                    let object_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Object(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into());
-                        }
-                    };
+                    let object_data = properties.data_object(attachment_method)?;
                     let sub_node = object_data.node();
                     let node = message
                         .sub_nodes()
@@ -466,5 +466,66 @@ impl AttachmentReadWrite<AnsiPstFile> for AnsiAttachment {
     ) -> io::Result<Rc<Self>> {
         let inner = AttachmentInner::read(message, sub_node, prop_ids)?;
         Ok(Rc::new(Self { inner }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn properties(data: Option<PropertyValue>) -> AttachmentProperties {
+        AttachmentProperties {
+            properties: data.into_iter().map(|value| (0x3701, value)).collect(),
+        }
+    }
+
+    #[test]
+    fn test_by_value_data_errors_name_the_method() {
+        let err = properties(None).data_binary().unwrap_err();
+        assert!(matches!(
+            err,
+            MessagingError::AttachmentFileBinaryDataNotFound
+        ));
+        assert!(err.to_string().contains("afByValue"));
+
+        let err = properties(Some(PropertyValue::Integer32(1)))
+            .data_binary()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MessagingError::InvalidAttachmentFileBinaryData(PropertyType::Integer32)
+        ));
+    }
+
+    #[test]
+    fn test_storage_data_errors_name_the_method() {
+        let err = properties(None)
+            .data_object(AttachmentMethod::Storage)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MessagingError::AttachmentStorageObjectDataNotFound
+        ));
+        assert!(err.to_string().contains("afStorage"));
+
+        let err = properties(Some(PropertyValue::Binary(BinaryValue::new(vec![1]))))
+            .data_object(AttachmentMethod::Storage)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MessagingError::InvalidStorageObjectData(PropertyType::Binary)
+        ));
+    }
+
+    #[test]
+    fn test_embedded_message_data_errors_name_the_method() {
+        let err = properties(None)
+            .data_object(AttachmentMethod::EmbeddedMessage)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MessagingError::AttachmentMessageObjectDataNotFound
+        ));
+        assert!(err.to_string().contains("afEmbeddedMessage"));
     }
 }
