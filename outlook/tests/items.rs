@@ -225,27 +225,24 @@ fn embedded(item: &Item) -> usize {
 #[test]
 fn embedded_messages_that_hold_themselves() {
     // dist-list.pst with both embedded messages of the appointment pointing back at the
-    // appointment's own data: each level holds two copies of itself.
+    // appointment's own data: each would hold two copies of itself, level after level.
     let data = common::outlook_fixture("dist-list-embedded-loop.pst");
     let store = PstStore::from_reader(Cursor::new(data), &Options::default()).unwrap();
     let start = std::time::Instant::now();
     let calendar = items(&store, "/Top of Personal Folders/Calendar");
     assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
     let appointment = &calendar[0];
-    assert_eq!(embedded(appointment), outlook::pst::MAX_EMBEDDED_MESSAGES);
-    fn problems(item: &Item) -> Vec<String> {
-        item.attachments
-            .iter()
-            .flat_map(|a| {
-                let mut p = a.problems.clone();
-                p.extend(a.embedded.as_deref().map(problems).unwrap_or_default());
-                p
-            })
-            .collect()
-    }
-    assert!(
-        problems(appointment)
-            .iter()
-            .any(|p| p.contains("embedded messages in the item: not read"))
-    );
+    // the pst crate refuses an embedded message with the blocks of a message it is in
+    assert_eq!(appointment.attachments.len(), 2);
+    assert_eq!(embedded(appointment), 0);
+    let cycles = store
+        .problems()
+        .iter()
+        .filter(|p| {
+            p.contains("embedded message: Embedded message has the data and sub-node blocks")
+        })
+        .count();
+    assert_eq!(cycles, 2, "{:?}", store.problems());
+    // what is left of the appointment is read
+    assert_eq!(appointment.subject.as_deref(), Some("Test appointment"));
 }
