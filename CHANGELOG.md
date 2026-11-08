@@ -30,7 +30,11 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
 - Read-only: a file is never opened for writing, and upstream's write support is removed.
   (@YamatoSecurity)
 - No input makes the crates panic, abort or allocate without bound, and every walk ends: B-tree,
-  block, heap, folder and embedded-message walks have loop and depth limits. (@YamatoSecurity)
+  block, heap, folder and embedded-message walks have loop and depth limits; a walk's blocks may
+  inflate to at most 8 times the file's size; each heap allocation or sub-node is the value of one
+  property only, and an object's values are limited; an embedded message that has the blocks of a
+  message it is embedded in is refused; and an item reads at most 1024 embedded messages.
+  (@YamatoSecurity)
 
 ### Fixed
 - From upstream pull requests (MIT): `PtypObject` property records (#86), every BTH record read
