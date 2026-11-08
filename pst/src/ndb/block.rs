@@ -761,16 +761,27 @@ pub const MAX_BLOCK_TREE_DEPTH: usize = 8;
 /// are what guarantee the walk ends.
 pub(crate) struct TreeWalk {
     visited: BTreeSet<u64>,
+    offsets: BTreeSet<u64>,
     remaining: u64,
+    remaining_inflated: u64,
 }
 
+/// How many times the file's size the blocks of one data tree or sub-node tree may hold once
+/// inflated. Only the zlib-compressed blocks of the 4 KiB layout inflate: the most compressible
+/// OST of the public data set holds 1.1 times its size over all of its blocks, while a crafted
+/// one could hold 128 times (a 512-byte slot for each 64 KiB block).
+pub const MAX_BLOCK_TREE_INFLATION: u64 = 8;
+
 impl TreeWalk {
-    /// A walk whose blocks may hold at most as many bytes as the file.
+    /// A walk whose blocks may hold at most as many bytes as the file, and at most
+    /// [`MAX_BLOCK_TREE_INFLATION`] times that once inflated.
     pub(crate) fn new<R: PstReader>(f: &mut R) -> io::Result<Self> {
         let remaining = f.seek(SeekFrom::End(0))?;
         Ok(Self {
             visited: Default::default(),
+            offsets: Default::default(),
             remaining,
+            remaining_inflated: remaining.saturating_mul(MAX_BLOCK_TREE_INFLATION),
         })
     }
 
@@ -779,8 +790,9 @@ impl TreeWalk {
         self.visited.insert(block.search_key().into());
     }
 
-    /// Count a block of the tree: an error if it is already in the tree, or if the tree's blocks
-    /// would hold more bytes than the file.
+    /// Count a block of the tree: an error if it, or another block at the same file offset, is
+    /// already in the tree, or if the tree's blocks would hold more bytes than the file (or more
+    /// than [`MAX_BLOCK_TREE_INFLATION`] times that once inflated).
     fn visit<Pst>(&mut self, block: &<Pst as PstFile>::BlockBTreeEntry) -> NdbResult<()>
     where
         Pst: PstFile,
@@ -790,6 +802,16 @@ impl TreeWalk {
         if !self.visited.insert(id) {
             return Err(NdbError::BlockTreeLoop(id));
         }
+        // Each block has its own slot: block IDs that share one are the same bytes read again.
+        let offset: u64 = block.block().index().index().into();
+        if !self.offsets.insert(offset) {
+            return Err(NdbError::BlockTreeSharedOffset(id, offset));
+        }
+        let inflated = u64::from(block.inflated_size().unwrap_or(block.size()));
+        self.remaining_inflated = self
+            .remaining_inflated
+            .checked_sub(inflated)
+            .ok_or(NdbError::BlockTreeTooLarge(id))?;
         let size = u64::from(block.size());
         // The slot the block fills in the file: 512-byte aligned with a 24-byte trailer in the
         // 4 KiB layout, else 64-byte aligned with the layout's trailer.
@@ -2277,8 +2299,88 @@ mod tests {
         }
         blocks.put(0x2000, 0x102, &xblock(1, &bids));
         let err = all_blocks(&blocks, 0x102).unwrap_err();
+        assert!(err.to_string().contains("file offset 0x0"), "{err}");
+        assert!(read_all(&blocks, 0x102).is_err());
+
+        // Fifty overlapping 8 KiB blocks, each at its own offset.
+        let mut blocks = Blocks::default();
+        blocks.put(0x000, 0x104, &[0x55; 8000]);
+        for (i, bid) in bids.iter().enumerate() {
+            blocks.entry(64 * i, *bid, 8000);
+        }
+        blocks.put(0x2000, 0x102, &xblock(1, &bids));
+        let err = all_blocks(&blocks, 0x102).unwrap_err();
         assert!(err.to_string().contains("more than the file"), "{err}");
         assert!(read_all(&blocks, 0x102).is_err());
+    }
+
+    /// A block BTree entry of the 4 KiB layout.
+    fn entry_4k(bid: u64, offset: usize, size: u16, inflated: u16) -> UnicodeBlockBTreeEntry {
+        let mut entry = bid.to_le_bytes().to_vec();
+        entry.extend_from_slice(&(offset as u64).to_le_bytes());
+        for value in [size, inflated, 1, 0] {
+            entry.extend_from_slice(&value.to_le_bytes());
+        }
+        <UnicodeBlockBTreeEntry as BTreeEntryReadWrite>::read_4k(&mut entry.as_slice()).unwrap()
+    }
+
+    /// A block of the 4 KiB layout: `stored` and a 24-byte trailer, in 512-byte slots.
+    fn put_4k(file: &mut Vec<u8>, offset: usize, bid: u64, stored: &[u8]) {
+        let slot = (stored.len() + 24).div_ceil(512) * 512;
+        if file.len() < offset + slot {
+            file.resize(offset + slot, 0);
+        }
+        file[offset..offset + stored.len()].copy_from_slice(stored);
+        let trailer = offset + slot - 24;
+        file[trailer..trailer + 2].copy_from_slice(&(stored.len() as u16).to_le_bytes());
+        file[trailer + 4..trailer + 8].copy_from_slice(&compute_crc(0, stored).to_le_bytes());
+        file[trailer + 8..trailer + 16].copy_from_slice(&bid.to_le_bytes());
+    }
+
+    #[test]
+    fn test_inflation_of_4k_blocks() {
+        use std::io::Write as _;
+
+        // 64 KiB of zeros compresses to about 80 bytes, which fill a 512-byte slot: an XBLOCK of
+        // `count` such blocks in a file of `count` + 1 slots, or of `len` bytes.
+        let inflated = MAX_UNICODE_4K_BLOCK_DATA_SIZE;
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        zlib.write_all(&vec![0; usize::from(inflated)]).unwrap();
+        let compressed = zlib.finish().unwrap();
+        let read = |count: usize, len: usize| {
+            let mut file = Vec::new();
+            let bids: Vec<u64> = (0..count as u64).map(|i| 0x200 + 4 * i).collect();
+            let mut xblock = xblock(1, &bids);
+            xblock[4..8].copy_from_slice(&(count as u32 * u32::from(inflated)).to_le_bytes());
+            put_4k(&mut file, 0, 0x102, &xblock);
+            let mut entries = vec![entry_4k(0x102, 0, xblock.len() as u16, xblock.len() as u16)];
+            for bid in &bids {
+                let offset = file.len();
+                put_4k(&mut file, offset, *bid, &compressed);
+                entries.push(entry_4k(*bid, offset, compressed.len() as u16, inflated));
+            }
+            file.resize(file.len().max(len), 0);
+            let blocks = Blocks { file, entries };
+            let mut f = Cursor::new(blocks.file.clone());
+            let tree = Tree::read(&mut f, NdbCryptMethod::None, &blocks.find(0x102)).unwrap();
+            tree.blocks(
+                &mut f,
+                NdbCryptMethod::None,
+                &blocks.btree(),
+                &mut Default::default(),
+                &mut Default::default(),
+            )
+            .map(|blocks| blocks.map(|block| block.data().len()).sum::<usize>())
+        };
+        // 250 blocks in a file of 127 KiB: inflated, 16 MiB, 126 times the file.
+        let err = read(250, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("MAX_BLOCK_TREE_INFLATION"),
+            "{err}"
+        );
+        // In a file of 100 KiB, 12 blocks (786,144 bytes) are within 8 times it, 13 are not.
+        assert_eq!(read(12, 100 << 10).unwrap(), 12 * usize::from(inflated));
+        assert!(read(13, 100 << 10).is_err());
     }
 
     type SubNodes = SubNodeTree<UnicodePstFile>;

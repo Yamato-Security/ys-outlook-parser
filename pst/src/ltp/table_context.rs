@@ -656,10 +656,13 @@ pub enum TableRowColumnValue {
 pub struct TableRowData {
     id: TableRowId,
     unique: u32,
-    align_4byte: Vec<u8>,
-    align_2byte: Vec<u8>,
-    align_1byte: Vec<u8>,
-    existence_bitmap: Vec<u8>,
+    /// The rest of the row as read, in one allocation: rgdwData after `PidTagLtpRowVer`, rgwData,
+    /// rgbData and rgCEB. A cell is read from it when asked for.
+    data: Box<[u8]>,
+    /// Where rgwData, rgbData and rgCEB start in `data`.
+    start_2byte: u32,
+    start_1byte: u32,
+    start_existence_bitmap: u32,
 }
 
 impl TableRowData {
@@ -671,14 +674,52 @@ impl TableRowData {
         align_1byte: Vec<u8>,
         existence_bitmap: Vec<u8>,
     ) -> Self {
+        let offset = |len: usize| u32::try_from(len).unwrap_or(u32::MAX);
+        let start_2byte = offset(align_4byte.len());
+        let start_1byte = offset(align_4byte.len().saturating_add(align_2byte.len()));
+        let start_existence_bitmap = offset(
+            align_4byte
+                .len()
+                .saturating_add(align_2byte.len())
+                .saturating_add(align_1byte.len()),
+        );
+        let data = [align_4byte, align_2byte, align_1byte, existence_bitmap]
+            .concat()
+            .into_boxed_slice();
         Self {
             id,
             unique,
-            align_4byte,
-            align_2byte,
-            align_1byte,
-            existence_bitmap,
+            data,
+            start_2byte,
+            start_1byte,
+            start_existence_bitmap,
         }
+    }
+
+    /// Bytes `start..end` of the rest of the row.
+    fn section(&self, start: u32, end: Option<u32>) -> &[u8] {
+        let start = start as usize;
+        match end {
+            Some(end) => self.data.get(start..end as usize),
+            None => self.data.get(start..),
+        }
+        .unwrap_or_default()
+    }
+
+    fn align_4byte(&self) -> &[u8] {
+        self.section(0, Some(self.start_2byte))
+    }
+
+    fn align_2byte(&self) -> &[u8] {
+        self.section(self.start_2byte, Some(self.start_1byte))
+    }
+
+    fn align_1byte(&self) -> &[u8] {
+        self.section(self.start_1byte, Some(self.start_existence_bitmap))
+    }
+
+    fn existence_bitmap(&self) -> &[u8] {
+        self.section(self.start_existence_bitmap, None)
     }
 
     pub fn id(&self) -> TableRowId {
@@ -698,7 +739,7 @@ impl TableRowData {
             .iter()
             .map(|column| {
                 let existence_bit = column.existence_bitmap_index() as usize;
-                if !check_existence_bitmap(existence_bit, &self.existence_bitmap)? {
+                if !check_existence_bitmap(existence_bit, self.existence_bitmap())? {
                     return Ok(None);
                 }
 
@@ -834,7 +875,7 @@ impl TableRowData {
     }
 
     fn read_1byte_offset(&self, context: &TableContextInfo, offset: u16) -> LtpResult<u8> {
-        let bytes = Self::column_bytes(&self.align_1byte, context.end_2byte_values(), offset, 1)?;
+        let bytes = Self::column_bytes(self.align_1byte(), context.end_2byte_values(), offset, 1)?;
         bytes
             .first()
             .copied()
@@ -842,15 +883,15 @@ impl TableRowData {
     }
 
     fn read_2byte_offset(&self, context: &TableContextInfo, offset: u16) -> LtpResult<&[u8]> {
-        Self::column_bytes(&self.align_2byte, context.end_4byte_values(), offset, 2)
+        Self::column_bytes(self.align_2byte(), context.end_4byte_values(), offset, 2)
     }
 
     fn read_4byte_offset(&self, offset: u16) -> LtpResult<&[u8]> {
-        Self::column_bytes(&self.align_4byte, 8, offset, 4)
+        Self::column_bytes(self.align_4byte(), 8, offset, 4)
     }
 
     fn read_8byte_offset(&self, offset: u16) -> LtpResult<&[u8]> {
-        Self::column_bytes(&self.align_4byte, 8, offset, 8)
+        Self::column_bytes(self.align_4byte(), 8, offset, 8)
     }
 }
 
@@ -861,64 +902,29 @@ impl TableRowReadWrite for TableRowData {
             id: f.read_u32::<LittleEndian>()?,
         };
 
-        // rgdwData
+        // rgdwData: PidTagLtpRowVer, then the rest of it, rgwData, rgbData and rgCEB, which is
+        // sized by rgib, so it holds a bit for each column of the file's TCINFO, also those a
+        // lenient read left out of the context's columns. TCINFO's checks hold the offsets to an
+        // increasing order from 8.
         let unique = f.read_u32::<LittleEndian>()?;
-        // TableContextInfo::new checked that the offsets increase.
-        let mut align_4byte = vec![0; usize::from(context.end_4byte_values().saturating_sub(8))];
-        f.read_exact(align_4byte.as_mut_slice())?;
+        let start = |end: u16| u32::from(end.saturating_sub(8));
+        let mut data = vec![0; start(context.end_existence_bitmap()) as usize].into_boxed_slice();
+        f.read_exact(&mut data)?;
 
-        // rgwData
-        let mut align_2byte = vec![
-            0;
-            usize::from(
-                context
-                    .end_2byte_values()
-                    .saturating_sub(context.end_4byte_values())
-            )
-        ];
-        f.read_exact(align_2byte.as_mut_slice())?;
-
-        // rgbData
-        let mut align_1byte = vec![
-            0;
-            usize::from(
-                context
-                    .end_1byte_values()
-                    .saturating_sub(context.end_2byte_values())
-            )
-        ];
-        f.read_exact(align_1byte.as_mut_slice())?;
-
-        // rgbCEB
-        // rgCEB: sized by rgib, which holds a bit for each column of the file's TCINFO, also those
-        // a lenient read left out of the context's columns.
-        let mut existence_bitmap = vec![
-            0;
-            usize::from(
-                context
-                    .end_existence_bitmap()
-                    .saturating_sub(context.end_1byte_values())
-            )
-        ];
-        f.read_exact(existence_bitmap.as_mut_slice())?;
-
-        Ok(Self::new(
+        Ok(Self {
             id,
             unique,
-            align_4byte,
-            align_2byte,
-            align_1byte,
-            existence_bitmap,
-        ))
+            data,
+            start_2byte: start(context.end_4byte_values()),
+            start_1byte: start(context.end_2byte_values()),
+            start_existence_bitmap: start(context.end_1byte_values()),
+        })
     }
 
     fn write(&self, f: &mut dyn Write) -> io::Result<()> {
         f.write_u32::<LittleEndian>(u32::from(self.id))?;
         f.write_u32::<LittleEndian>(self.unique)?;
-        f.write_all(&self.align_4byte)?;
-        f.write_all(&self.align_2byte)?;
-        f.write_all(&self.align_1byte)?;
-        f.write_all(&self.existence_bitmap)
+        f.write_all(&self.data)
     }
 }
 
@@ -1415,6 +1421,8 @@ mod tests {
             }
         }
         assert_eq!(cursor.position(), 126);
+        // A row is its ID, PidTagLtpRowVer and one allocation of the rest of its bytes.
+        assert!(std::mem::size_of::<TableRowData>() <= 40);
     }
 
     #[test]

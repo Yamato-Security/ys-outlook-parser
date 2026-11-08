@@ -38,10 +38,12 @@ truncated file, a block of the wrong size, a loop) is an error.
 
 ## Limits
 
-No input makes this crate panic, abort or allocate without bound: sizes and offsets from the file are
-checked before use, and every walk ends. A B-tree lookup goes through each page at most once and at
-most `MAX_BTREE_DEPTH` pages deep; a data tree or sub-node tree reads each block at most once, at
-most `MAX_BLOCK_TREE_DEPTH` levels deep and no more bytes than the file holds; a BTree-on-heap reads
-each heap allocation at most once; embedded messages are read at most `MAX_EMBEDDED_MESSAGE_DEPTH`
-levels down; and `messaging::folder::walk_folders` walks the folder hierarchy with each folder at
-most once, at most `MAX_FOLDER_DEPTH` levels down.
+No input makes this crate panic, abort or allocate without bound: sizes and offsets from the file
+are checked before use, and every walk ends. A B-tree lookup goes through each page at most once and
+at most `MAX_BTREE_DEPTH` pages deep; a data tree or sub-node tree reads each block at most once
+(and no two blocks from the same file offset), at most `MAX_BLOCK_TREE_DEPTH` levels deep, and no
+more bytes than the file holds, nor, once the zlib-compressed blocks of a 4 KiB-page OST are
+inflated, more than `MAX_BLOCK_TREE_INFLATION` (8) times that; a BTree-on-heap reads each heap
+allocation at most once; embedded messages are read at most `MAX_EMBEDDED_MESSAGE_DEPTH` levels
+down; and `messaging::folder::walk_folders` walks the folder hierarchy with each folder at most
+once, at most `MAX_FOLDER_DEPTH` levels down.

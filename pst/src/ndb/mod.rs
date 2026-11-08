@@ -138,8 +138,14 @@ pub enum NdbError {
     SubNodeNotFound(NodeId),
     #[error("Block 0x{0:X} is in its data or sub-node tree twice: a loop or a corrupt block")]
     BlockTreeLoop(u64),
-    #[error("Data or sub-node tree holds more than the file, at block 0x{0:X}")]
+    #[error(
+        "Data or sub-node tree holds more than the file (or, inflated, more than MAX_BLOCK_TREE_INFLATION times it), at block 0x{0:X}"
+    )]
     BlockTreeTooLarge(u64),
+    #[error(
+        "Block 0x{0:X} is at file offset 0x{1:X} with another block of its data or sub-node tree"
+    )]
+    BlockTreeSharedOffset(u64, u64),
     #[error("Data or sub-node tree deeper than MAX_BLOCK_TREE_DEPTH, at block 0x{0:X}")]
     BlockTreeTooDeep(u64),
 }
