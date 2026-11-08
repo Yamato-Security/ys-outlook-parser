@@ -12,6 +12,7 @@
 // and limitations under the RPL.
 
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 
 mod guid;
 mod message;
@@ -115,9 +116,9 @@ pub struct MsgFile {
     pub named_properties: NamedProperties,
     /// The message.
     pub message: Message,
-    /// Problems that concern the whole file (the named-property mapping). Problems of the
-    /// message, its recipients and attachments are in [`Message::problems`]; see
-    /// [`MsgFile::all_problems`].
+    /// Problems that concern the whole file (the compound file structure, the named-property
+    /// mapping). Problems of the message, its recipients and attachments are in
+    /// [`Message::problems`]; see [`MsgFile::all_problems`].
     pub problems: Vec<Problem>,
 }
 
