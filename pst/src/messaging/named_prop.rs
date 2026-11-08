@@ -65,7 +65,7 @@ impl From<NamedPropertyGuid> for u16 {
             NamedPropertyGuid::None => 0x0000,
             NamedPropertyGuid::Mapi => 0x0001,
             NamedPropertyGuid::PublicStrings => 0x0002,
-            NamedPropertyGuid::GuidIndex(index) => index + 3,
+            NamedPropertyGuid::GuidIndex(index) => index.saturating_add(3),
         }
     }
 }
@@ -345,7 +345,17 @@ impl NamedPropertyMapProperties {
         }
     }
 
+    /// The GUID of a NAMEID's `wGuid`: [`PS_MAPI`], [`PS_PUBLIC_STRINGS`], or the GUID at that
+    /// index of the GUID stream (`PidTagNameidStreamGuid`).
     pub fn lookup_guid(&self, index: NamedPropertyGuid) -> io::Result<GuidValue> {
+        let guid_index = match index {
+            NamedPropertyGuid::None => {
+                return Err(MessagingError::NamedPropertyMapGuidIndexOutOfBounds(0).into());
+            }
+            NamedPropertyGuid::Mapi => return Ok(PS_MAPI),
+            NamedPropertyGuid::PublicStrings => return Ok(PS_PUBLIC_STRINGS),
+            NamedPropertyGuid::GuidIndex(guid_index) => guid_index,
+        };
         let stream_guid = self
             .properties
             .get(&0x0002)
@@ -353,9 +363,15 @@ impl NamedPropertyMapProperties {
 
         match stream_guid {
             PropertyValue::Binary(value) => {
-                let start = u16::from(index) as usize * 16;
-                let end = start + 16;
-                let mut cursor = Cursor::new(&value.buffer()[start..end]);
+                // wGuid 3 and up index the GUID stream from its start (MS-PST 2.4.7.1).
+                let start = usize::from(guid_index) * 16;
+                let Some(guid) = value.buffer().get(start..start + 16) else {
+                    return Err(
+                        MessagingError::NamedPropertyMapGuidIndexOutOfBounds(u16::from(index))
+                            .into(),
+                    );
+                };
+                let mut cursor = Cursor::new(guid);
                 let entry = PropertyValue::read(&mut cursor, PropertyType::Guid)?;
                 match entry {
                     PropertyValue::Guid(guid) => Ok(guid),
@@ -652,6 +668,58 @@ mod tests {
             .collect();
         assert!(names.len() > 1);
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn test_lookup_guid() {
+        let guid = |data1: u32| {
+            let mut bytes = data1.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&[0; 12]);
+            bytes
+        };
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(
+                0x0002,
+                PropertyValue::Binary(BinaryValue::new([guid(0x11), guid(0x22)].concat())),
+            )]),
+        };
+        let data1 = |index| map.lookup_guid(index).map(|guid| guid.data1());
+        // wGuid 3 is the first GUID of the stream, wGuid 4 the second.
+        assert_eq!(data1(NamedPropertyGuid::GuidIndex(0)).unwrap(), 0x11);
+        assert_eq!(data1(NamedPropertyGuid::GuidIndex(1)).unwrap(), 0x22);
+        assert!(data1(NamedPropertyGuid::GuidIndex(2)).is_err());
+        assert!(data1(NamedPropertyGuid::GuidIndex(u16::MAX)).is_err());
+        assert!(data1(NamedPropertyGuid::None).is_err());
+        assert_eq!(data1(NamedPropertyGuid::Mapi).unwrap(), PS_MAPI.data1());
+        assert_eq!(
+            data1(NamedPropertyGuid::PublicStrings).unwrap(),
+            PS_PUBLIC_STRINGS.data1()
+        );
+    }
+
+    #[test]
+    fn test_lookup_guid_of_every_entry() {
+        // Every NAMEID of Empty.pst names a GUID that lookup_guid finds.
+        let store = crate::open_store(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Empty.pst"
+        ))
+        .unwrap();
+        let map = store.named_property_map().unwrap();
+        let properties = map.properties();
+        let guids = properties.stream_guid().unwrap();
+        let mut indexed = 0;
+        for entry in properties.stream_entry().unwrap() {
+            let guid = properties.lookup_guid(entry.guid()).unwrap();
+            if let NamedPropertyGuid::GuidIndex(index) = entry.guid() {
+                assert_eq!(
+                    format!("{guid:?}"),
+                    format!("{:?}", guids[usize::from(index)])
+                );
+                indexed += 1;
+            }
+        }
+        assert!(indexed > 0);
     }
 
     #[test]
