@@ -26,6 +26,8 @@ defect reading can go past is recorded as a `Problem` and reading goes on.
   attachment table, an attachment's data, a table's row index.
 - A store without a usable `PidTagRecordKey` makes entry IDs with a record key of zeros, so its
   folders and messages still open by node ID.
+- A folder's hierarchy, contents or associated contents table that cannot be read is `None` (read
+  strictly, the tables are read when the folder is opened, and opening it fails instead).
 
 `PstFile::problems()` lists the problems found so far, each once, in the order found, each with its
 kind (`ProblemKind`), the file offset or node it was found in when known, and a description; at most

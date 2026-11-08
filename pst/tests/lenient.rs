@@ -254,3 +254,53 @@ fn property_value_that_cannot_be_read() {
         Some(u32::from(NID_MESSAGE_STORE))
     );
 }
+
+#[test]
+fn folder_table_that_cannot_be_read() {
+    // The contents table of a folder with messages gets the store's property context as its data:
+    // its TCINFO does not read.
+    let data = fixture("outlook.pst.gz");
+    let read_store = |data: &[u8], validation| {
+        let file = Rc::new(
+            UnicodePstFile::read_from_with(Box::new(Cursor::new(data.to_vec())), validation)
+                .unwrap(),
+        );
+        (file.clone(), UnicodeStore::read(file).unwrap())
+    };
+    let (_, store) = read_store(&data, Validation::Strict);
+    let folder = walk_folders(store.as_ref())
+        .find(|entry| {
+            entry.folder.as_ref().is_ok_and(|folder| {
+                folder
+                    .contents_table()
+                    .is_some_and(|table| table.rows_matrix().count() > 0)
+            })
+        })
+        .map(|entry| u32::from(entry.node_id))
+        .unwrap();
+    let mut pst = UnicodePst(data);
+    let (store_entry, _) = pst.nbt_entry(u32::from(NID_MESSAGE_STORE));
+    let store_data = pst.u64_at(store_entry + 8);
+    let (entry, page) = pst.nbt_entry((folder & !0x1F) | 0x0E);
+    pst.set_u64(entry + 8, store_data);
+    pst.fix_page_crc(page);
+
+    // Strictly, the folder does not open.
+    let (_, store) = read_store(&pst.0, Validation::Strict);
+    let opened = walk_folders(store.as_ref())
+        .find(|entry| u32::from(entry.node_id) == folder)
+        .unwrap();
+    let err = opened.folder.err().unwrap();
+    assert!(err.to_string().contains("TCINFO"), "{err}");
+
+    // Leniently, it opens without a contents table, and that is a problem.
+    let (file, store) = read_store(&pst.0, Validation::Lenient);
+    let opened = walk_folders(store.as_ref())
+        .find(|entry| u32::from(entry.node_id) == folder)
+        .unwrap();
+    let opened = opened.folder.unwrap();
+    assert!(opened.contents_table().is_none());
+    assert!(opened.hierarchy_table().is_some());
+    assert_eq!(kinds(&file), [ProblemKind::Table]);
+    assert_eq!(file.problems()[0].node().map(u32::from), Some(folder));
+}

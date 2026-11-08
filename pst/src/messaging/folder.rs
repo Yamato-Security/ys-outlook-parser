@@ -26,7 +26,7 @@ use std::{
 
 use super::{read_write::*, store::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileInternal, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileInternal, UnicodePstFile, Validation,
     ltp::{
         heap::HeapNode,
         prop_context::{BinaryValue, PropertyContext, PropertyValue},
@@ -121,6 +121,10 @@ impl FolderProperties {
     }
 }
 
+/// A folder. Its tables are `None` when it has none. Read leniently, they are read when first
+/// asked for, and a table that cannot be read is `None` and a [`Problem`]; read strictly
+/// ([`Validation::Strict`]), they are read when the folder is opened, which fails if one cannot be
+/// read.
 pub trait Folder {
     fn store(&self) -> Rc<dyn Store>;
     fn properties(&self) -> &FolderProperties;
@@ -325,17 +329,36 @@ where
             }
         };
 
-        Ok(Self {
+        let folder = Self {
             store,
             properties,
             hierarchy_table: Default::default(),
             contents_table: Default::default(),
             associated_table: Default::default(),
-        })
+        };
+
+        // Read strictly, a table that cannot be read is an error: the table methods return an
+        // Option, so the tables are read now, and opening the folder fails instead.
+        if folder.store.pst().validation() == Validation::Strict {
+            for (cell, node_id_type) in [
+                (&folder.hierarchy_table, NodeIdType::HierarchyTable),
+                (&folder.contents_table, NodeIdType::ContentsTable),
+                (
+                    &folder.associated_table,
+                    NodeIdType::AssociatedContentsTable,
+                ),
+            ] {
+                let table = folder.read_table(node_id_type)?;
+                let _ = cell.set(table);
+            }
+        }
+
+        Ok(folder)
     }
 
-    /// [`Self::read_table`], with a table that cannot be read a [`Problem`](crate::Problem),
-    /// whatever the validation: the folder's table methods return an `Option`.
+    /// [`Self::read_table`], with a table that cannot be read a [`Problem`](crate::Problem): the
+    /// folder's table methods return an `Option`. Read strictly, the tables are read when the
+    /// folder is opened, and this is not called.
     fn read_table_or_problem(&self, node_id_type: NodeIdType) -> Option<Rc<dyn TableContext>> {
         match self.read_table(node_id_type) {
             Ok(table) => table,
