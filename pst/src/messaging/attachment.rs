@@ -195,6 +195,9 @@ where
     message: Rc<Pst::Message>,
     properties: AttachmentProperties,
     data: Option<AttachmentData>,
+    /// The embedded message of [`AttachmentData::Message`], as its own type, so that its
+    /// attachments can be read too.
+    embedded: Option<Rc<Pst::Message>>,
 }
 
 impl<Pst> AttachmentInner<Pst>
@@ -386,6 +389,7 @@ where
             (properties, data)
         };
 
+        let mut embedded_message = None;
         let data = match embedded {
             Some(node) => {
                 let embedded = <<Pst as PstFile>::Message as MessageReadWrite<Pst>>::read_embedded(
@@ -401,7 +405,10 @@ where
                     "embedded message",
                     embedded,
                 )?
-                .map(|message| AttachmentData::Message(message))
+                .map(|message| {
+                    embedded_message = Some(message.clone());
+                    AttachmentData::Message(message)
+                })
             }
             None => data,
         };
@@ -410,6 +417,7 @@ where
             message,
             properties,
             data,
+            embedded: embedded_message,
         })
     }
 }
@@ -425,6 +433,14 @@ impl UnicodeAttachment {
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
         <Self as AttachmentReadWrite<UnicodePstFile>>::read(message, sub_node, prop_ids)
+    }
+}
+
+impl UnicodeAttachment {
+    /// The embedded message of an `afEmbeddedMessage` attachment that was read, as a
+    /// [`UnicodeMessage`]: its own recipients and attachments can be read from it.
+    pub fn embedded_message(&self) -> Option<Rc<UnicodeMessage>> {
+        self.inner.embedded.clone()
     }
 }
 
@@ -464,6 +480,14 @@ impl AnsiAttachment {
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
         <Self as AttachmentReadWrite<AnsiPstFile>>::read(message, sub_node, prop_ids)
+    }
+}
+
+impl AnsiAttachment {
+    /// The embedded message of an `afEmbeddedMessage` attachment that was read, as a
+    /// [`AnsiMessage`]: its own recipients and attachments can be read from it.
+    pub fn embedded_message(&self) -> Option<Rc<AnsiMessage>> {
+        self.inner.embedded.clone()
     }
 }
 
