@@ -157,7 +157,8 @@ fn read_tree(data: &[u8]) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let mut cfb = cfb::CompoundFile::open(Cursor::new(data)).unwrap();
     let entries: Vec<(String, bool)> = cfb
         .walk()
-        .map(|e| (e.path().to_string_lossy().into_owned(), e.is_stream()))
+        // `/` separators on every platform (names cannot contain `\\`).
+        .map(|e| (e.path().to_string_lossy().replace('\\', "/"), e.is_stream()))
         .collect();
     let mut streams = Vec::new();
     let mut storages = Vec::new();
@@ -489,6 +490,33 @@ fn storage_names_that_are_path_components_are_not_followed() {
             "{a:?}/{b:?}"
         );
     }
+}
+
+#[test]
+fn property_streams_with_the_wrong_header_size_are_read() {
+    // PidTagMessageFlags = 1, written after a 24-byte (embedded-message) header at the top level.
+    let mut props = vec![0; 24];
+    props[16..20].copy_from_slice(&7u32.to_le_bytes());
+    props.extend_from_slice(&0x0E07_0003u32.to_le_bytes());
+    props.extend_from_slice(&[6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    // The same entry listed three times.
+    let entry = props[24..40].to_vec();
+    props.extend_from_slice(&entry);
+    props.extend_from_slice(&entry);
+    let data = write_tree(&[("/__properties_version1.0".to_owned(), props)], &[]);
+    let file = MsgFile::from_bytes(&data).unwrap();
+    let m = &file.message;
+    assert_eq!(m.properties.int(outlook_msg::tags::MESSAGE_FLAGS), Some(1));
+    assert_eq!(m.header.map(|h| h.recipient_count), Some(7));
+    let details: Vec<&str> = m.problems.iter().map(|p| p.detail.as_str()).collect();
+    assert!(
+        details.contains(&"the header is 24 bytes, not 32"),
+        "{details:?}"
+    );
+    assert!(
+        details.contains(&"property 0x0E070003 is listed 3 times; the first entry is used"),
+        "{details:?}"
+    );
 }
 
 #[test]

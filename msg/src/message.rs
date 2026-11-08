@@ -544,8 +544,33 @@ impl<F: Read + Seek> Context<'_, F> {
         let (data, _) = self.reader.read(&spath, problems);
         let expected = kind.header_len();
         let fits = |h: usize| data.len() >= h && (data.len() - h).is_multiple_of(16);
-        let mut header_len = expected;
-        if data.len() < expected {
+        // Some writers give embedded messages the top-level header, or the reverse.
+        let other = match kind {
+            Kind::TopLevel => Some(24),
+            Kind::Embedded => Some(32),
+            Kind::Child => None,
+        };
+        let header_len = if fits(expected) {
+            expected
+        } else if let Some(h) = other.filter(|&h| fits(h)) {
+            problems.push(
+                &spath,
+                ProblemKind::PropertyStream,
+                format!("the header is {h} bytes, not {expected}"),
+            );
+            h
+        } else if data.len() >= expected {
+            problems.push(
+                &spath,
+                ProblemKind::PropertyStream,
+                format!(
+                    "{} bytes after the header is not a multiple of 16: the last {} bytes are ignored",
+                    data.len() - expected,
+                    (data.len() - expected) % 16
+                ),
+            );
+            expected
+        } else {
             problems.push(
                 &spath,
                 ProblemKind::PropertyStream,
@@ -555,34 +580,7 @@ impl<F: Read + Seek> Context<'_, F> {
                 ),
             );
             return (None, Vec::new());
-        }
-        if !fits(expected) {
-            // Some writers give embedded messages the top-level header, or the reverse.
-            let other = match kind {
-                Kind::TopLevel => Some(24),
-                Kind::Embedded => Some(32),
-                Kind::Child => None,
-            };
-            match other.filter(|&h| fits(h)) {
-                Some(h) => {
-                    problems.push(
-                        &spath,
-                        ProblemKind::PropertyStream,
-                        format!("the header is {h} bytes, not {expected}"),
-                    );
-                    header_len = h;
-                }
-                None => problems.push(
-                    &spath,
-                    ProblemKind::PropertyStream,
-                    format!(
-                        "{} bytes after the header is not a multiple of 16: the last {} bytes are ignored",
-                        data.len() - expected,
-                        (data.len() - expected) % 16
-                    ),
-                ),
-            }
-        }
+        };
         let u32_at = |off: usize| {
             u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
         };
@@ -592,27 +590,29 @@ impl<F: Read + Seek> Context<'_, F> {
             recipient_count: u32_at(16),
             attachment_count: u32_at(20),
         });
-        let mut seen = BTreeSet::new();
-        let mut entries = Vec::new();
+        let mut duplicates: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut entries: Vec<RawEntry> = Vec::new();
         for chunk in data[header_len..].as_chunks::<16>().0 {
             let tag = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let flags = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
             let mut value = [0; 8];
             value.copy_from_slice(&chunk[8..]);
-            if !seen.insert(tag) {
-                problems.push(
-                    &spath,
-                    ProblemKind::PropertyStream,
-                    format!(
-                        "property 0x{tag:08X} is listed more than once; the first entry is used"
-                    ),
-                );
+            if let Some(n) = duplicates.get_mut(&tag) {
+                *n += 1;
                 continue;
             }
+            duplicates.insert(tag, 1);
             entries.push(RawEntry {
                 tag,
                 entry: PropertyEntry { flags, value },
             });
+        }
+        for (tag, n) in duplicates.into_iter().filter(|&(_, n)| n > 1) {
+            problems.push(
+                &spath,
+                ProblemKind::PropertyStream,
+                format!("property 0x{tag:08X} is listed {n} times; the first entry is used"),
+            );
         }
         (header, entries)
     }
