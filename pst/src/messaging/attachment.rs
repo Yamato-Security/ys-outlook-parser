@@ -352,13 +352,31 @@ where
                     AttachmentMethod::Storage => {
                         let object_data = properties.data_object(attachment_method)?;
                         let sub_node = object_data.node();
-                        let node = message
-                            .sub_nodes()
-                            .get(&sub_node)
-                            .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+                        // Like an embedded message, the storage is a sub-node of the attachment
+                        // (MS-PST 2.3.3.5); look in the message's sub-nodes too, as before.
+                        let mut data_block = None;
+                        if let Some(attachment_sub_nodes) = attachment_sub_nodes {
+                            let block = block_btree.find_entry(
+                                file,
+                                attachment_sub_nodes.search_key(),
+                                &mut page_cache,
+                            )?;
+                            data_block = SubNodeTree::<Pst>::read(file, &block)?
+                                .entries(file, &block_btree, &mut page_cache)?
+                                .find(|entry| entry.node() == sub_node)
+                                .map(|entry| entry.block());
+                        }
+                        let data_block = match data_block {
+                            Some(block) => block,
+                            None => message
+                                .sub_nodes()
+                                .get(&sub_node)
+                                .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?
+                                .block(),
+                        };
                         let block = block_btree.find_entry(
                             file,
-                            node.block().search_key(),
+                            data_block.search_key(),
                             &mut page_cache,
                         )?;
                         let block = DataTree::read(file, encoding, &block)?;
