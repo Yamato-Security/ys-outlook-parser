@@ -16,6 +16,7 @@
 //! Problems with the header (sizes, CRC) are flags on the result, not errors: the data is
 //! decompressed anyway, as far as it goes.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// `COMPTYPE` of compressed RTF ("LZFu").
@@ -71,6 +72,9 @@ pub enum RtfFlag {
     },
     /// `COMPTYPE` is neither compressed nor uncompressed: nothing decompressed.
     UnknownCompressionType(u32),
+    /// The compressed data has no end marker: it was cut short. It was decompressed as far
+    /// as it goes.
+    Truncated,
     /// The decompressor stopped with an error: nothing decompressed.
     Decompression(String),
 }
@@ -92,6 +96,7 @@ impl fmt::Display for RtfFlag {
                 "RAWSIZE says {declared} bytes but {actual} bytes were decompressed"
             ),
             Self::UnknownCompressionType(t) => write!(f, "unknown COMPTYPE 0x{t:08X}"),
+            Self::Truncated => f.write_str("the compressed data has no end marker: cut short"),
             Self::Decompression(e) => write!(f, "decompression failed: {e}"),
         }
     }
@@ -113,30 +118,70 @@ pub struct Rtf {
     pub flags: Vec<RtfFlag>,
 }
 
-/// The length of the data that compressed RTF data decompresses to ([MS-OXRTFCP] 2.2.3.2),
-/// without decompressing it: up to the end marker (a reference to the dictionary's write
-/// offset), or as far as the data goes.
-fn decompressed_len(body: &[u8]) -> u64 {
+/// Where compressed data ends inside a dictionary reference.
+struct Cut {
+    /// Offset of the control byte of the reference.
+    control: usize,
+    /// The reference's bit in the control byte.
+    bit: u32,
+    /// The length of the data before the reference.
+    keep: usize,
+}
+
+/// What the compressed data decompresses to, found without decompressing it
+/// ([MS-OXRTFCP] 2.2.3.2).
+struct Walk {
+    /// The length of the decompressed data: up to the end marker (a reference to the
+    /// dictionary's write offset), or as far as the data goes.
+    len: u64,
+    /// Whether the data ends with the end marker, as compressed data must.
+    marker: bool,
+    /// Set if the data ends inside a dictionary reference (or where one should start).
+    cut: Option<Cut>,
+}
+
+fn walk(body: &[u8]) -> Walk {
     // The initial dictionary ([MS-OXRTFCP] 2.1.2.1) is 207 bytes long.
     let mut write = 207usize;
     let mut len = 0u64;
-    let mut bytes = body.iter().copied();
-    while let Some(control) = bytes.next() {
+    let mut i = 0;
+    while let Some(&control) = body.get(i) {
+        let control_at = i;
+        i += 1;
         for bit in 0..8 {
             if control & (1 << bit) == 0 {
-                if bytes.next().is_none() {
-                    return len;
+                if i >= body.len() {
+                    return Walk {
+                        len,
+                        marker: false,
+                        cut: None,
+                    };
                 }
+                i += 1;
                 len += 1;
                 write = (write + 1) % 4096;
             } else {
-                let (Some(hi), Some(lo)) = (bytes.next(), bytes.next()) else {
-                    return len;
+                let Some(&[hi, lo]) = body.get(i..i + 2).and_then(|r| r.first_chunk::<2>()) else {
+                    let cut = Cut {
+                        control: control_at,
+                        bit,
+                        keep: i,
+                    };
+                    return Walk {
+                        len,
+                        marker: false,
+                        cut: Some(cut),
+                    };
                 };
+                i += 2;
                 let reference = u16::from_be_bytes([hi, lo]);
                 let offset = usize::from(reference >> 4);
                 if offset == write {
-                    return len;
+                    return Walk {
+                        len,
+                        marker: true,
+                        cut: None,
+                    };
                 }
                 let n = usize::from(reference & 0x0F) + 2;
                 len += n as u64;
@@ -144,7 +189,11 @@ fn decompressed_len(body: &[u8]) -> u64 {
             }
         }
     }
-    len
+    Walk {
+        len,
+        marker: false,
+        cut: None,
+    }
 }
 
 /// The CRC of [MS-OXRTFCP] 2.1.3.2: CRC-32 (reflected polynomial 0xEDB88320) starting from 0
@@ -207,9 +256,8 @@ pub(crate) fn decompress(data: &[u8]) -> Rtf {
     let body = &data[HEADER_LEN..end];
     // `compressed_rtf::decompress_rtf` trusts the header: give it one that is consistent with
     // the data (the flags above keep what the file said).
-    let mut fixed = Vec::with_capacity(end);
-    fixed.extend_from_slice(&((end - 4) as u32).to_le_bytes());
-    match header.compression_type {
+    // The data given to the decompressor, and the length it decompresses to.
+    let (data, decompressed_len) = match header.compression_type {
         COMPRESSED => {
             let computed = crc(body);
             if computed != header.crc {
@@ -218,22 +266,27 @@ pub(crate) fn decompress(data: &[u8]) -> Rtf {
                     computed,
                 });
             }
-            // RAWSIZE only sizes the output buffer: cap it at what the data can expand to (a
-            // control byte and eight 2-byte references give at most 8 * 17 bytes).
-            let most = (body.len() as u64).saturating_mul(8);
-            let raw = u64::from(header.raw_size)
-                .min(most)
-                .min(u64::from(u32::MAX)) as u32;
-            fixed.extend_from_slice(&raw.to_le_bytes());
-            fixed.extend_from_slice(&COMPRESSED.to_le_bytes());
-            fixed.extend_from_slice(&computed.to_le_bytes());
+            let walk = walk(body);
+            if !walk.marker {
+                flags.push(RtfFlag::Truncated);
+            }
+            match walk.cut {
+                None => (Cow::Borrowed(body), walk.len),
+                Some(cut) => {
+                    // The data ends inside a dictionary reference (or where one should
+                    // start), which `compressed_rtf` takes as an error: drop the partial
+                    // reference and make the bits of the control byte from it on literals,
+                    // which end the data cleanly.
+                    let mut data = body[..cut.keep].to_vec();
+                    data[cut.control] &= (1u8 << cut.bit) - 1;
+                    (Cow::Owned(data), walk.len)
+                }
+            }
         }
-        UNCOMPRESSED => {
-            let raw = header.raw_size.min(body.len() as u32);
-            fixed.extend_from_slice(&raw.to_le_bytes());
-            fixed.extend_from_slice(&UNCOMPRESSED.to_le_bytes());
-            fixed.extend_from_slice(&header.crc.to_le_bytes());
-        }
+        UNCOMPRESSED => (
+            Cow::Borrowed(body),
+            u64::from(header.raw_size).min(body.len() as u64),
+        ),
         other => {
             flags.push(RtfFlag::UnknownCompressionType(other));
             return Rtf {
@@ -243,13 +296,25 @@ pub(crate) fn decompress(data: &[u8]) -> Rtf {
                 flags,
             };
         }
-    }
-    let decompressed_len = if header.compression_type == COMPRESSED {
-        decompressed_len(body)
-    } else {
-        u64::from(header.raw_size).min(body.len() as u64)
     };
-    fixed.extend_from_slice(body);
+    let mut fixed = Vec::with_capacity(HEADER_LEN + data.len());
+    fixed.extend_from_slice(&(data.len() as u32 + 12).to_le_bytes());
+    if header.compression_type == COMPRESSED {
+        // RAWSIZE only sizes the output buffer: cap it at what the data can expand to (a
+        // control byte and eight 2-byte references give at most 8 * 17 bytes).
+        let most = (data.len() as u64).saturating_mul(8);
+        let raw = u64::from(header.raw_size)
+            .min(most)
+            .min(u64::from(u32::MAX)) as u32;
+        fixed.extend_from_slice(&raw.to_le_bytes());
+        fixed.extend_from_slice(&COMPRESSED.to_le_bytes());
+        fixed.extend_from_slice(&crc(&data).to_le_bytes());
+    } else {
+        fixed.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        fixed.extend_from_slice(&UNCOMPRESSED.to_le_bytes());
+        fixed.extend_from_slice(&header.crc.to_le_bytes());
+    }
+    fixed.extend_from_slice(&data);
     let rtf = match compressed_rtf::decompress_rtf(&fixed) {
         // `decompress_rtf` maps each byte to the char of the same value.
         Ok(text) => Some(text.chars().map(|c| c as u32 as u8).collect::<Vec<u8>>()),

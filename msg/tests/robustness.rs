@@ -699,6 +699,31 @@ fn overlapping_named_property_names_are_decoded_within_bounds() {
 }
 
 #[test]
+fn truncated_rtf_is_decompressed_as_far_as_it_goes() {
+    let text: String = (0..60)
+        .map(|i| format!("{{\\rtf1\\ansi word{} }}", i % 37))
+        .collect();
+    let good = compressed_rtf::compress_rtf(&text).unwrap();
+    for cut in 17..good.len() {
+        let streams = vec![
+            ("/__properties_version1.0".to_owned(), vec![0; 32]),
+            ("/__substg1.0_10090102".to_owned(), good[..cut].to_vec()),
+        ];
+        let file = MsgFile::from_bytes(&write_tree(&streams, &[])).unwrap();
+        let rtf = file.message.rtf.as_ref().unwrap();
+        let out = rtf
+            .rtf
+            .as_ref()
+            .unwrap_or_else(|| panic!("cut at {cut}: {:?}", rtf.flags));
+        assert!(text.as_bytes().starts_with(out), "cut at {cut}");
+        assert!(
+            rtf.flags.contains(&outlook_msg::RtfFlag::Truncated),
+            "cut at {cut}"
+        );
+    }
+}
+
+#[test]
 fn corpus_does_not_panic() {
     let Some(dir) = std::env::var_os("OUTLOOK_MSG_CORPUS") else {
         eprintln!("OUTLOOK_MSG_CORPUS is not set: skipped");
