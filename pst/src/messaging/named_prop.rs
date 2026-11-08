@@ -27,7 +27,7 @@ use std::{
 
 use super::{read_write::*, store::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileCaches, UnicodePstFile,
     crc::compute_crc,
     ltp::{
         heap::HeapNode,
@@ -503,7 +503,7 @@ where
 
 impl<Pst> NamedPropertyMapInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileCaches<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,

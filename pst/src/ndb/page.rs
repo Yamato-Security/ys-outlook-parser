@@ -431,22 +431,13 @@ impl<const PAGE_TYPE: u8> MapPageReadWrite<UnicodePstFile, PAGE_TYPE>
 
         Ok(Self { map_bits, trailer })
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        f.write_all(&self.map_bits)?;
-
-        let crc = compute_crc(0, &self.map_bits);
-        let trailer = UnicodePageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
-    }
 }
 
 pub struct AnsiMapPage<const P: u8> {
     map_bits: MapBits,
     trailer: AnsiPageTrailer,
+    // Kept as read.
+    #[allow(dead_code)]
     padding: u32,
 }
 
@@ -506,24 +497,6 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::AllocationMap as u8 }>
             padding,
         })
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-        cursor.write_all(&self.map_bits)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
-    }
 }
 
 impl MapPageReadWrite<AnsiPstFile, { PageType::AllocationPageMap as u8 }>
@@ -567,24 +540,6 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::AllocationPageMap as u8 }>
             trailer,
             padding,
         })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-        cursor.write_all(&self.map_bits)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -630,24 +585,6 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::FreeMap as u8 }>
             padding,
         })
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_all(&self.map_bits)?;
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
-    }
 }
 
 impl MapPageReadWrite<AnsiPstFile, { PageType::FreePageMap as u8 }>
@@ -691,24 +628,6 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::FreePageMap as u8 }>
             trailer,
             padding,
         })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_all(&self.map_bits)?;
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -881,43 +800,6 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
             trailer,
         })
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 496]);
-
-        // bFlags
-        cursor.write_u8(if self.backfill_complete { 0x01 } else { 0 })?;
-
-        // cEntDList
-        cursor.write_u8(self.entry_count)?;
-
-        // wPadding
-        cursor.write_u16::<LittleEndian>(0)?;
-
-        // ulCurrentPage
-        cursor.write_u32::<LittleEndian>(self.current_page)?;
-
-        // rgDListPageEnt
-        for entry in self.entries.iter() {
-            entry.write(&mut cursor)?;
-        }
-
-        // rgPadding
-        cursor.write_all(&[0; 12])?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.seek(SeekFrom::Start(DENSITY_LIST_FILE_OFFSET))?;
-        f.write_all(&buffer)?;
-
-        // pageTrailer
-        let trailer = UnicodePageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
-    }
 }
 
 pub struct AnsiDensityListPage {
@@ -1039,43 +921,6 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
             entries,
             trailer,
         })
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        // bFlags
-        cursor.write_u8(if self.backfill_complete { 0x01 } else { 0 })?;
-
-        // cEntDList
-        cursor.write_u8(self.entry_count)?;
-
-        // wPadding
-        cursor.write_u16::<LittleEndian>(0)?;
-
-        // ulCurrentPage
-        cursor.write_u32::<LittleEndian>(self.current_page)?;
-
-        // rgDListPageEnt
-        for entry in self.entries.iter() {
-            entry.write(&mut cursor)?;
-        }
-
-        // rgPadding
-        cursor.write_all(&[0; 12])?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.seek(SeekFrom::Start(DENSITY_LIST_FILE_OFFSET))?;
-        f.write_all(&buffer)?;
-
-        // pageTrailer
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -2129,10 +1974,6 @@ where
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as UnicodeBTreePageReadWrite<UnicodeBTreePageEntry>>::read(f)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as UnicodeBTreePageReadWrite<UnicodeBTreePageEntry>>::write(self, f)
-    }
 }
 
 impl<Entry, LeafPage> RootBTreeIntermediatePage<AnsiPstFile, Entry, LeafPage> for AnsiBTreeEntryPage
@@ -2153,10 +1994,6 @@ where
 {
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as AnsiBTreePageReadWrite<AnsiBTreePageEntry>>::read(f)
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as AnsiBTreePageReadWrite<AnsiBTreePageEntry>>::write(self, f)
     }
 }
 
@@ -2181,10 +2018,6 @@ impl RootBTreeLeafPageReadWrite<UnicodePstFile> for UnicodeBlockBTreePage {
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as UnicodeBTreePageReadWrite<UnicodeBlockBTreeEntry>>::read(f)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as UnicodeBTreePageReadWrite<UnicodeBlockBTreeEntry>>::write(self, f)
-    }
 }
 
 impl RootBTreeLeafPage<AnsiPstFile> for AnsiBlockBTreePage {
@@ -2196,10 +2029,6 @@ impl RootBTreeLeafPageReadWrite<AnsiPstFile> for AnsiBlockBTreePage {
 
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as AnsiBTreePageReadWrite<AnsiBlockBTreeEntry>>::read(f)
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as AnsiBTreePageReadWrite<AnsiBlockBTreeEntry>>::write(self, f)
     }
 }
 
@@ -2213,10 +2042,6 @@ impl RootBTreeLeafPageReadWrite<UnicodePstFile> for UnicodeNodeBTreePage {
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as UnicodeBTreePageReadWrite<UnicodeNodeBTreeEntry>>::read(f)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as UnicodeBTreePageReadWrite<UnicodeNodeBTreeEntry>>::write(self, f)
-    }
 }
 
 impl RootBTreeLeafPage<AnsiPstFile> for AnsiNodeBTreePage {
@@ -2228,10 +2053,6 @@ impl RootBTreeLeafPageReadWrite<AnsiPstFile> for AnsiNodeBTreePage {
 
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as AnsiBTreePageReadWrite<AnsiNodeBTreeEntry>>::read(f)
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as AnsiBTreePageReadWrite<AnsiNodeBTreeEntry>>::write(self, f)
     }
 }
 
@@ -2311,19 +2132,6 @@ where
         })
     }
 
-    fn write<W: Write + Seek>(
-        &self,
-        f: &mut W,
-        block: <Pst as PstFile>::PageRef,
-    ) -> io::Result<()> {
-        f.seek(SeekFrom::Start(block.index().index().into()))?;
-
-        match self {
-            Self::Intermediate(page, ..) => page.write(f),
-            Self::Leaf(page) => page.write(f),
-        }
-    }
-
     fn find_entry<R: PstReader>(
         &self,
         f: &mut R,
@@ -2377,14 +2185,6 @@ where
 {
     pub fn read<R: PstReader>(f: &mut R, block: <Pst as PstFile>::PageRef) -> io::Result<Self> {
         <Self as RootBTreeReadWrite>::read(f, block)
-    }
-
-    pub fn write<W: Write + Seek>(
-        &self,
-        f: &mut W,
-        block: <Pst as PstFile>::PageRef,
-    ) -> io::Result<()> {
-        <Self as RootBTreeReadWrite>::write(self, f, block)
     }
 
     pub fn find_entry<R: PstReader>(

@@ -21,7 +21,7 @@ use std::{cell::OnceCell, collections::BTreeMap, io, rc::Rc};
 
 use super::{read_write::*, store::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileCaches, UnicodePstFile,
     ltp::{
         heap::HeapNode,
         prop_context::{BinaryValue, PropertyContext, PropertyValue},
@@ -137,7 +137,7 @@ where
 
 impl<Pst> FolderInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileCaches<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,

@@ -177,16 +177,6 @@ impl RootReadWrite<UnicodePstFile> for UnicodeRoot {
     fn reserved3(&self) -> u16 {
         self.reserved3
     }
-
-    fn set_amap_status(&mut self, status: AmapStatus) {
-        self.amap_is_valid = status;
-    }
-
-    fn reset_free_size(&mut self, free_bytes: UnicodeByteIndex) -> NdbResult<()> {
-        self.amap_free_size = free_bytes;
-        self.pmap_free_size = 0.into();
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -295,15 +285,5 @@ impl RootReadWrite<AnsiPstFile> for AnsiRoot {
 
     fn reserved3(&self) -> u16 {
         self.reserved3
-    }
-
-    fn set_amap_status(&mut self, status: AmapStatus) {
-        self.amap_is_valid = status;
-    }
-
-    fn reset_free_size(&mut self, free_bytes: AnsiByteIndex) -> NdbResult<()> {
-        self.amap_free_size = free_bytes;
-        self.pmap_free_size = 0.into();
-        Ok(())
     }
 }

@@ -29,7 +29,7 @@ use std::{
 
 use super::{heap::*, prop_context::*, prop_type::*, read_write::*, tree::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileCaches, UnicodePstFile,
     messaging::{
         read_write::StoreReadWrite,
         store::{AnsiStore, UnicodeStore},
@@ -866,7 +866,7 @@ where
 
 impl<Pst, RowIndex, RowIndexTree> TableContextInner<Pst, RowIndex, RowIndexTree>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileCaches<Pst>,
     <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
     <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,

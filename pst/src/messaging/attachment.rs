@@ -21,7 +21,7 @@ use std::{collections::BTreeMap, io, rc::Rc};
 
 use super::{message::*, read_write::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileCaches, UnicodePstFile,
     ltp::{
         heap::HeapNode,
         prop_context::{BinaryValue, ObjectValue, PropertyContext, PropertyValue},
@@ -198,7 +198,7 @@ where
 
 impl<Pst> AttachmentInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileCaches<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,

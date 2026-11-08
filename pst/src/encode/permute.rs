@@ -22,6 +22,7 @@
 use super::*;
 
 /// Encode the [crate::ndb::block::DataBlock] data.
+#[cfg(test)]
 pub fn encode_block(data: &mut [u8]) {
     permute(data, key_data_r());
 }

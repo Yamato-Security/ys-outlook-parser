@@ -779,19 +779,6 @@ where
         Ok(block)
     }
 
-    pub fn write<W: Write + Seek>(
-        &self,
-        f: &mut W,
-        block: &<Pst as PstFile>::BlockBTreeEntry,
-    ) -> io::Result<()> {
-        f.seek(SeekFrom::Start(block.block().index().index().into()))?;
-
-        match self {
-            Self::Intermediate(block, ..) => block.write(f),
-            Self::Leaf(block) => block.write(f),
-        }
-    }
-
     pub fn blocks<'a, R>(
         &'a self,
         f: &mut R,
@@ -1537,19 +1524,6 @@ where
                 block.size(),
             )?;
             Ok(Self::Leaf(Box::new(block)))
-        }
-    }
-
-    pub fn write<W: Write + Seek>(
-        &self,
-        f: &mut W,
-        block: &<Pst as PstFile>::BlockBTreeEntry,
-    ) -> io::Result<()> {
-        f.seek(SeekFrom::Start(block.block().index().index().into()))?;
-
-        match self {
-            Self::Intermediate(block) => block.write(f),
-            Self::Leaf(block) => block.write(f),
         }
     }
 

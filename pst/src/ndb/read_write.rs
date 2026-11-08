@@ -21,7 +21,7 @@ use std::{
     cell::RefCell,
     cmp::Ordering,
     collections::BTreeMap,
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, Cursor, Read, SeekFrom, Write},
     rc::Rc,
 };
 
@@ -115,22 +115,6 @@ where
         root.load_reserved(reserved1, reserved2, reserved3);
         Ok(root)
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        f.write_u32::<LittleEndian>(self.reserved1())?;
-        self.file_eof_index().write(f)?;
-        self.amap_last_index().write(f)?;
-        self.amap_free_size().write(f)?;
-        self.pmap_free_size().write(f)?;
-        self.node_btree().write(f)?;
-        self.block_btree().write(f)?;
-        f.write_u8(self.amap_is_valid() as u8)?;
-        f.write_u8(self.reserved2())?;
-        f.write_u16::<LittleEndian>(self.reserved3())
-    }
-
-    fn set_amap_status(&mut self, status: AmapStatus);
-    fn reset_free_size(&mut self, free_bytes: <Pst as PstFile>::ByteIndex) -> NdbResult<()>;
 }
 
 pub trait HeaderReadWrite<Pst>: Header<Pst> + Sized
@@ -139,10 +123,6 @@ where
     <Pst as PstFile>::Root: Root<Pst> + RootReadWrite<Pst>,
 {
     fn read(f: &mut dyn Read) -> io::Result<Self>;
-    fn write(&self, f: &mut dyn Write) -> io::Result<()>;
-    fn update_unique(&mut self);
-    fn first_free_map(&mut self) -> &mut [u8];
-    fn first_free_page_map(&mut self) -> &mut [u8];
 }
 
 pub trait PageTrailerReadWrite: PageTrailer + Copy + Sized {
@@ -157,7 +137,6 @@ where
 {
     fn new(amap_bits: MapBits, trailer: Pst::PageTrailer) -> NdbResult<Self>;
     fn read(f: &mut dyn Read) -> io::Result<Self>;
-    fn write(&self, f: &mut dyn Write) -> io::Result<()>;
 }
 
 pub trait AllocationMapPageReadWrite<Pst>:
@@ -171,10 +150,6 @@ where
 
     fn read(f: &mut dyn Read) -> io::Result<Self> {
         <Self as MapPageReadWrite<Pst, { PageType::AllocationMap as u8 }>>::read(f)
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        <Self as MapPageReadWrite<Pst, { PageType::AllocationMap as u8 }>>::write(self, f)
     }
 }
 
@@ -199,10 +174,6 @@ where
     fn read(f: &mut dyn Read) -> io::Result<Self> {
         <Self as MapPageReadWrite<Pst, { PageType::AllocationPageMap as u8 }>>::read(f)
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        <Self as MapPageReadWrite<Pst, { PageType::AllocationPageMap as u8 }>>::write(self, f)
-    }
 }
 
 impl<Pst, Page> AllocationPageMapPageReadWrite<Pst> for Page
@@ -222,10 +193,6 @@ where
 
     fn read(f: &mut dyn Read) -> io::Result<Self> {
         <Self as MapPageReadWrite<Pst, { PageType::FreeMap as u8 }>>::read(f)
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        <Self as MapPageReadWrite<Pst, { PageType::FreeMap as u8 }>>::write(self, f)
     }
 }
 
@@ -247,10 +214,6 @@ where
 
     fn read(f: &mut dyn Read) -> io::Result<Self> {
         <Self as MapPageReadWrite<Pst, { PageType::FreePageMap as u8 }>>::read(f)
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        <Self as MapPageReadWrite<Pst, { PageType::FreePageMap as u8 }>>::write(self, f)
     }
 }
 
@@ -274,7 +237,6 @@ where
         trailer: <Pst as PstFile>::PageTrailer,
     ) -> NdbResult<Self>;
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self>;
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()>;
 }
 
 pub trait BTreePageKeyReadWrite: BTreeEntryKey + TryFrom<u64> {
@@ -467,52 +429,6 @@ where
             trailer,
         )?)
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut buffer = [0_u8; 496];
-
-        // rgentries
-        let entries = self.entries();
-        for (i, entry) in entries.iter().enumerate() {
-            let offset = i * usize::from(self.entry_size());
-            let end = offset + usize::from(self.entry_size());
-            let mut cursor = &mut buffer[offset..end];
-            <Self::Entry as BTreeEntryReadWrite>::write(entry, &mut cursor)?;
-        }
-
-        let mut cursor = Cursor::new(&mut buffer[UNICODE_BTREE_ENTRIES_SIZE..]);
-
-        // cEnt
-        cursor.write_u8(entries.len() as u8)?;
-
-        // cEntMax
-        cursor.write_u8(self.max_entries())?;
-
-        // cbEnt
-        cursor.write_u8(self.entry_size())?;
-
-        // cLevel
-        cursor.write_u8(self.level())?;
-
-        // dwPadding
-        cursor.write_u32::<LittleEndian>(0)?;
-
-        cursor.flush()?;
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        // pageTrailer
-        let trailer = self.trailer();
-        let trailer = UnicodePageTrailer::new(
-            trailer.page_type(),
-            trailer.signature(),
-            trailer.block_id(),
-            crc,
-        );
-
-        trailer.write(f)
-    }
 }
 
 pub const ANSI_BTREE_ENTRIES_SIZE: usize = 496;
@@ -583,48 +499,6 @@ where
             trailer,
         )?)
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut buffer = [0_u8; 500];
-
-        // rgentries
-        let entries = self.entries();
-        for (i, entry) in entries.iter().enumerate() {
-            let offset = i * usize::from(self.entry_size());
-            let end = offset + usize::from(self.entry_size());
-            let mut cursor = &mut buffer[offset..end];
-            <Self::Entry as BTreeEntryReadWrite>::write(entry, &mut cursor)?;
-        }
-
-        let mut cursor = Cursor::new(&mut buffer[ANSI_BTREE_ENTRIES_SIZE..]);
-
-        // cEnt
-        cursor.write_u8(entries.len() as u8)?;
-
-        // cEntMax
-        cursor.write_u8(self.max_entries())?;
-
-        // cbEnt
-        cursor.write_u8(self.entry_size())?;
-
-        // cLevel
-        cursor.write_u8(self.level())?;
-
-        cursor.flush()?;
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        // pageTrailer
-        let trailer = self.trailer();
-        let trailer = AnsiPageTrailer::new(
-            trailer.page_type(),
-            trailer.signature(),
-            trailer.block_id(),
-            crc,
-        );
-        trailer.write(f)
-    }
 }
 
 pub trait NodeBTreeEntryReadWrite: NodeBTreeEntry + BTreeEntryReadWrite {
@@ -682,41 +556,6 @@ where
         }
 
         Ok(Self::new(encoding, data, trailer)?)
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        let mut data = self.data().to_vec();
-        let trailer = self.trailer();
-
-        match self.encoding() {
-            NdbCryptMethod::Cyclic => {
-                let key = trailer.cyclic_key();
-                cyclic::encode_decode_block(&mut data, key);
-            }
-            NdbCryptMethod::Permute => {
-                permute::encode_block(&mut data);
-            }
-            _ => {}
-        }
-
-        let crc = compute_crc(0, &data);
-        let trailer = Self::Trailer::new(
-            data.len() as u16,
-            trailer.signature(),
-            crc,
-            trailer.block_id(),
-        )?;
-
-        f.write_all(&data)?;
-
-        let size = data.len() as u16;
-        let offset = size + Self::Trailer::SIZE;
-        let offset = i64::from(block_size(offset) - offset);
-        if offset > 0 {
-            f.seek(SeekFrom::Current(offset))?;
-        }
-
-        trailer.write(f)
     }
 }
 
@@ -786,37 +625,6 @@ where
 
         Ok(Self::new(header, entries, trailer)?)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        let mut curor = Cursor::new(vec![
-            0_u8;
-            Self::Header::HEADER_SIZE as usize
-                + self.entries().len()
-                    * Self::Entry::ENTRY_SIZE as usize
-        ]);
-
-        self.header().write(&mut curor)?;
-        for entry in self.entries() {
-            entry.write(&mut curor)?;
-        }
-
-        let data = curor.into_inner();
-        let trailer = self.trailer();
-        let crc = compute_crc(0, &data);
-        let trailer = Self::Trailer::new(
-            data.len() as u16,
-            trailer.signature(),
-            crc,
-            trailer.block_id(),
-        )?;
-
-        let offset = trailer.size() + Self::Trailer::SIZE;
-        let offset = block_size(offset) - offset;
-
-        f.write_all(&data)?;
-        f.seek(SeekFrom::Current(i64::from(offset)))?;
-        trailer.write(f)
-    }
 }
 
 type RootBTreePageReadWrite<BTree> = RootBTreePage<
@@ -852,11 +660,6 @@ where
         f: &mut R,
         block: <<Self as RootBTree>::Pst as PstFile>::PageRef,
     ) -> io::Result<RootBTreePageReadWrite<Self>>;
-    fn write<W: Write + Seek>(
-        &self,
-        f: &mut W,
-        block: <<Self as RootBTree>::Pst as PstFile>::PageRef,
-    ) -> io::Result<()>;
     fn find_entry<R: PstReader>(
         &self,
         f: &mut R,
@@ -878,7 +681,6 @@ where
     LeafPage: RootBTreeLeafPage<Pst, Entry = Entry> + RootBTreeLeafPageReadWrite<Pst>,
 {
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self>;
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()>;
 }
 
 pub trait RootBTreeLeafPageReadWrite<Pst>: RootBTreeLeafPage<Pst> + BTreePageReadWrite
@@ -894,7 +696,6 @@ where
     const BTREE_ENTRIES_SIZE: usize;
 
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self>;
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()>;
 }
 
 pub trait BlockBTreeReadWrite<Pst, Entry>: BlockBTree<Pst, Entry> + RootBTreeReadWrite

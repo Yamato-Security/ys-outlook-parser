@@ -289,7 +289,7 @@ pub trait Store {
 
 struct StoreInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst> + 'static,
+    Pst: PstFile + PstFileCaches<Pst> + 'static,
 {
     pst: Rc<Pst>,
     node_btree: PstFileReadWriteNodeBTree<Pst>,
@@ -301,7 +301,7 @@ where
 
 impl<Pst> StoreInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileCaches<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,

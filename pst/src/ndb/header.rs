@@ -17,8 +17,8 @@
 
 //! [HEADER](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/c9876f5a-664b-46a3-9887-ba63f113abf5)
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use byteorder::{LittleEndian, ReadBytesExt};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use super::{block_id::*, read_write::*, root::*, *};
 use crate::{AnsiPstFile, PstFile, UnicodePstFile, crc::compute_crc};
@@ -125,10 +125,16 @@ pub struct UnicodeHeader {
     crypt_method: NdbCryptMethod,
     next_block: UnicodeBlockId,
 
+    // Kept as read, for Debug output.
+    #[allow(dead_code)]
     reserved1: u32,
+    #[allow(dead_code)]
     reserved2: u32,
+    #[allow(dead_code)]
     unused1: u64,
+    #[allow(dead_code)]
     unused2: u64,
+    #[allow(dead_code)]
     reserved3: [u8; 36],
 }
 
@@ -150,6 +156,21 @@ impl UnicodeHeader {
             unused2: 0,
             reserved3: [0; 36],
         }
+    }
+
+    /// `rgnid`: the next free node index of each `nidType`.
+    pub fn nids(&self) -> &[u32; 32] {
+        &self.nids
+    }
+
+    /// `rgbFM`: the deprecated FMap of the first 128 AMap pages.
+    pub fn free_map(&self) -> &[u8; 128] {
+        &self.free_map
+    }
+
+    /// `rgbFP`: the deprecated FPMap of the first 128 PMap pages.
+    pub fn free_page_map(&self) -> &[u8; 128] {
+        &self.free_page_map
     }
 }
 
@@ -324,81 +345,6 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
             reserved3,
         })
     }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 516]);
-        // wMagicClient
-        cursor.write_u16::<LittleEndian>(HEADER_MAGIC_CLIENT)?;
-        // wVer
-        cursor.write_u16::<LittleEndian>(NdbVersion::Unicode as u16)?;
-        // wVerClient
-        cursor.write_u16::<LittleEndian>(NDB_CLIENT_VERSION)?;
-        // bPlatformCreate
-        cursor.write_u8(NDB_PLATFORM_CREATE)?;
-        // bPlatformAccess
-        cursor.write_u8(NDB_PLATFORM_ACCESS)?;
-        // dwReserved1
-        cursor.write_u32::<LittleEndian>(self.reserved1)?;
-        // dwReserved2
-        cursor.write_u32::<LittleEndian>(self.reserved2)?;
-        // bidUnused
-        cursor.write_u64::<LittleEndian>(self.unused1)?;
-        // bidNextP
-        self.next_page.write(&mut cursor)?;
-        // dwUnique
-        cursor.write_u32::<LittleEndian>(self.unique)?;
-        // rgnid
-        for nid in self.nids.iter() {
-            cursor.write_u32::<LittleEndian>(*nid)?;
-        }
-        // qwUnused
-        cursor.write_u64::<LittleEndian>(self.unused2)?;
-        // root
-        self.root.write(&mut cursor)?;
-        // dwAlign
-        cursor.write_u32::<LittleEndian>(0)?;
-        // rgbFM
-        cursor.write_all(&self.free_map)?;
-        // rgbFP
-        cursor.write_all(&self.free_page_map)?;
-        // bSentinel
-        cursor.write_u8(NDB_SENTINEL)?;
-        // bCryptMethod
-        cursor.write_u8(self.crypt_method as u8)?;
-        // rgbReserved
-        cursor.write_u16::<LittleEndian>(0)?;
-        // bidNextB
-        self.next_block.write(&mut cursor)?;
-
-        let crc_data = cursor.into_inner();
-        let crc_partial = compute_crc(0, &crc_data[..471]);
-        let crc_full = compute_crc(0, &crc_data);
-
-        // dwMagic
-        f.write_u32::<LittleEndian>(HEADER_MAGIC)?;
-        // dwCRCPartial
-        f.write_u32::<LittleEndian>(crc_partial)?;
-
-        f.write_all(&crc_data)?;
-
-        // dwCRCFull
-        f.write_u32::<LittleEndian>(crc_full)?;
-
-        // rgbReserved2, bReserved, rgbReserved3 (total 36 bytes)
-        f.write_all(&self.reserved3)
-    }
-
-    fn update_unique(&mut self) {
-        self.unique = self.unique.wrapping_add(1);
-    }
-
-    fn first_free_map(&mut self) -> &mut [u8] {
-        &mut self.free_map
-    }
-
-    fn first_free_page_map(&mut self) -> &mut [u8] {
-        &mut self.free_page_map
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -412,8 +358,12 @@ pub struct AnsiHeader {
     free_page_map: [u8; 128],
     crypt_method: NdbCryptMethod,
 
+    // Kept as read, for Debug output.
+    #[allow(dead_code)]
     reserved1: u32,
+    #[allow(dead_code)]
     reserved2: u32,
+    #[allow(dead_code)]
     reserved3: [u8; 36],
 }
 
@@ -432,6 +382,21 @@ impl AnsiHeader {
             reserved2: 0,
             reserved3: [0; 36],
         }
+    }
+
+    /// `rgnid`: the next free node index of each `nidType`.
+    pub fn nids(&self) -> &[u32; 32] {
+        &self.nids
+    }
+
+    /// `rgbFM`: the deprecated FMap of the first 128 AMap pages.
+    pub fn free_map(&self) -> &[u8; 128] {
+        &self.free_map
+    }
+
+    /// `rgbFP`: the deprecated FPMap of the first 128 PMap pages.
+    pub fn free_page_map(&self) -> &[u8; 128] {
+        &self.free_page_map
     }
 }
 
@@ -585,72 +550,6 @@ impl HeaderReadWrite<AnsiPstFile> for AnsiHeader {
             reserved2,
             reserved3,
         })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 504]);
-        // wMagicClient
-        cursor.write_u16::<LittleEndian>(HEADER_MAGIC_CLIENT)?;
-        // wVer
-        cursor.write_u16::<LittleEndian>(NdbVersion::Ansi as u16)?;
-        // wVerClient
-        cursor.write_u16::<LittleEndian>(NDB_CLIENT_VERSION)?;
-        // bPlatformCreate
-        cursor.write_u8(NDB_PLATFORM_CREATE)?;
-        // bPlatformAccess
-        cursor.write_u8(NDB_PLATFORM_ACCESS)?;
-        // dwReserved1
-        cursor.write_u32::<LittleEndian>(self.reserved1)?;
-        // dwReserved2
-        cursor.write_u32::<LittleEndian>(self.reserved2)?;
-        // bidNextB
-        self.next_block.write(&mut cursor)?;
-        // bidNextP
-        self.next_page.write(&mut cursor)?;
-        // dwUnique
-        cursor.write_u32::<LittleEndian>(self.unique)?;
-        // rgnid
-        for nid in self.nids.iter() {
-            cursor.write_u32::<LittleEndian>(*nid)?;
-        }
-        // root
-        self.root.write(&mut cursor)?;
-        // rgbFM
-        cursor.write_all(&self.free_map)?;
-        // rgbFP
-        cursor.write_all(&self.free_page_map)?;
-        // bSentinel
-        cursor.write_u8(NDB_SENTINEL)?;
-        // bCryptMethod
-        cursor.write_u8(self.crypt_method as u8)?;
-        // rgbReserved
-        cursor.write_u16::<LittleEndian>(0)?;
-        // ullReserved, dwReserved (total 12 bytes)
-        cursor.write_all(&[0_u8; 12])?;
-        // rgbReserved2, bReserved, rgbReserved3 (total 36 bytes)
-        cursor.write_all(&self.reserved3)?;
-
-        let crc_data = cursor.into_inner();
-        let crc_partial = compute_crc(0, &crc_data[..471]);
-
-        // dwMagic
-        f.write_u32::<LittleEndian>(HEADER_MAGIC)?;
-        // dwCRCPartial
-        f.write_u32::<LittleEndian>(crc_partial)?;
-
-        f.write_all(&crc_data)
-    }
-
-    fn update_unique(&mut self) {
-        self.unique = self.unique.wrapping_add(1);
-    }
-
-    fn first_free_map(&mut self) -> &mut [u8] {
-        &mut self.free_map
-    }
-
-    fn first_free_page_map(&mut self) -> &mut [u8] {
-        &mut self.free_page_map
     }
 }
 
