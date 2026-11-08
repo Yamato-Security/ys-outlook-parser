@@ -890,7 +890,16 @@ impl TableRowReadWrite for TableRowData {
         f.read_exact(align_1byte.as_mut_slice())?;
 
         // rgbCEB
-        let mut existence_bitmap = vec![0; existence_bitmap_size(context.columns().len())];
+        // rgCEB: sized by rgib, which holds a bit for each column of the file's TCINFO, also those
+        // a lenient read left out of the context's columns.
+        let mut existence_bitmap = vec![
+            0;
+            usize::from(
+                context
+                    .end_existence_bitmap()
+                    .saturating_sub(context.end_1byte_values())
+            )
+        ];
         f.read_exact(existence_bitmap.as_mut_slice())?;
 
         Ok(Self::new(
@@ -1355,6 +1364,57 @@ mod tests {
         let mut data = data;
         data[1] = 20;
         assert!(TableContextInfo::read(&mut data.as_slice()).is_err());
+    }
+
+    #[test]
+    fn test_left_out_column_keeps_the_row_size() {
+        // cCols 9: eight PtypInteger32 columns and one of type 0x0099; rgCEB is 2 bytes. Rows were
+        // read with a 1-byte rgCEB once the ninth column was left out, so every row after the
+        // first was misaligned (row IDs 0x100, 0x10180, 0x10280FF...).
+        let mut data = vec![HeapNodeType::Table as u8, 9];
+        for end in [40_u16, 40, 40, 42] {
+            data.extend_from_slice(&end.to_le_bytes());
+        }
+        data.extend_from_slice(&[0; 12]);
+        for i in 0..8_u16 {
+            data.extend_from_slice(&0x0003_u16.to_le_bytes());
+            data.extend_from_slice(&(0x3001 + i).to_le_bytes());
+            data.extend_from_slice(&(8 + 4 * i).to_le_bytes());
+            data.extend_from_slice(&[4, i as u8]);
+        }
+        data.extend_from_slice(&0x0099_u16.to_le_bytes());
+        data.extend_from_slice(&0x3009_u16.to_le_bytes());
+        data.extend_from_slice(&40_u16.to_le_bytes());
+        data.extend_from_slice(&[4, 8]);
+        let (_scope, _log) = crate::problems::lenient_scope();
+        let context = TableContextInfo::read(&mut data.as_slice()).unwrap();
+        assert_eq!(context.columns().len(), 8);
+
+        // Three rows of 42 bytes.
+        let mut rows = vec![];
+        for k in 0..3_u32 {
+            rows.extend_from_slice(&(0x100 + k).to_le_bytes());
+            rows.extend_from_slice(&0_u32.to_le_bytes());
+            for j in 0..8_u32 {
+                rows.extend_from_slice(&(10 * k + j).to_le_bytes());
+            }
+            rows.extend_from_slice(&[0xFF, 0x80]);
+        }
+        let mut cursor = std::io::Cursor::new(rows);
+        for k in 0..3_u32 {
+            let row = TableRowData::read(&mut cursor, &context).unwrap();
+            assert_eq!(u32::from(row.id()), 0x100 + k);
+            let columns = row.columns(&context).unwrap();
+            assert_eq!(columns.len(), 8);
+            for (j, column) in columns.into_iter().enumerate() {
+                assert!(matches!(
+                    column,
+                    Some(TableRowColumnValue::Small(PropertyValue::Integer32(value)))
+                        if value == (10 * k + j as u32) as i32
+                ));
+            }
+        }
+        assert_eq!(cursor.position(), 126);
     }
 
     #[test]
