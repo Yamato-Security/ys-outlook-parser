@@ -27,7 +27,7 @@ use std::{
 
 use super::{read_write::*, store::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileCaches, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileInternal, UnicodePstFile,
     crc::compute_crc,
     ltp::{
         heap::HeapNode,
@@ -512,7 +512,7 @@ where
 
 impl<Pst> NamedPropertyMapInner<Pst>
 where
-    Pst: PstFile + PstFileCaches<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
@@ -548,10 +548,7 @@ where
         let root = header.root();
 
         let properties = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let encoding = header.crypt_method();
@@ -583,15 +580,16 @@ where
             let prop_context = <<Pst as PstFile>::PropertyContext as PropertyContextReadWrite<
                 Pst,
             >>::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let properties =
+                read_properties(pst, node.node(), prop_context.properties()?, |record| {
+                    prop_context.read_property(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut page_cache,
+                        record,
+                    )
+                })?;
             NamedPropertyMapProperties { properties }
         };
 

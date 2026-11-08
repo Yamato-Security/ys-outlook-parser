@@ -26,7 +26,10 @@ use std::{
 };
 
 use super::{heap::*, read_write::*, *};
-use crate::{AnsiPstFile, PstFile, UnicodePstFile};
+use crate::{
+    AnsiPstFile, PstFile, UnicodePstFile,
+    problems::{self, ProblemKind},
+};
 
 /// [BTHHEADER](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/8e4ae05c-3c24-4103-b7e5-ffef6f244834)
 #[derive(Clone, Copy, Debug)]
@@ -79,20 +82,44 @@ impl HeapTreeHeader {
 }
 
 /// Read every record of a BTH page. A record that doesn't parse is an error, because stopping at
-/// it would silently drop every record after it.
+/// it would silently drop every record after it; when reading leniently it is a
+/// [`Problem`](crate::Problem) instead, and only that record is left out. So are the bytes of a
+/// page that is not a whole number of records.
 fn read_records<T: HeapNodePageReadWrite>(
     data: &[u8],
     key_size: u8,
     entry_size: u8,
 ) -> io::Result<Vec<T>> {
     let record_size = usize::from(key_size).saturating_add(usize::from(entry_size));
-    if record_size == 0 || !data.len().is_multiple_of(record_size) {
+    if record_size == 0 {
         return Err(LtpError::InvalidHeapTreeDataSize(entry_size).into());
     }
+    if !data.len().is_multiple_of(record_size) {
+        problems::check(
+            ProblemKind::HeapRecord,
+            None,
+            || {
+                format!(
+                    "BTH node of {} bytes is not a whole number of {record_size}-byte records",
+                    data.len()
+                )
+            },
+            || LtpError::InvalidHeapTreeDataSize(entry_size).into(),
+        )?;
+    }
 
-    data.chunks_exact(record_size)
-        .map(|mut record| T::read(&mut record))
-        .collect()
+    let mut records = Vec::new();
+    for (index, mut record) in data.chunks_exact(record_size).enumerate() {
+        let bytes = record;
+        match T::read(&mut record) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                let detail = format!("BTH record {index} ({bytes:02X?}): {err}");
+                problems::check(ProblemKind::HeapRecord, None, || detail, || err)?;
+            }
+        }
+    }
+    Ok(records)
 }
 
 pub trait HeapTreeEntryKey: Copy + Sized + PartialEq + PartialOrd {
@@ -493,6 +520,38 @@ mod tests {
         ]
         .concat();
         assert!(read_records::<Record>(&data, 2, 6).is_err());
+    }
+
+    #[test]
+    fn test_record_that_does_not_parse_is_a_problem_when_lenient() {
+        use crate::problems::{ProblemLog, ScopeGuard, Validation};
+        use std::rc::Rc;
+
+        let data = [
+            record(0x0E07, 0x0003, 1),
+            record(0x0E08, 0x0000, 2),
+            record(0x0E17, 0x0003, 3),
+        ]
+        .concat();
+        let log = Rc::new(ProblemLog::default());
+        let _scope = ScopeGuard::new(Validation::Lenient, log.clone(), None);
+        // The record before and the record after are kept.
+        let records = read_records::<Record>(&data, 2, 6).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.key())
+                .collect::<Vec<_>>(),
+            [0x0E07, 0x0E17]
+        );
+        let problems = log.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind(), ProblemKind::HeapRecord);
+
+        let mut data = record(0x0E07, 0x0003, 1);
+        data.extend_from_slice(&[0x08, 0x0E, 0x03]);
+        assert_eq!(read_records::<Record>(&data, 2, 6).unwrap().len(), 1);
+        assert_eq!(log.problems().len(), 2);
     }
 
     #[test]

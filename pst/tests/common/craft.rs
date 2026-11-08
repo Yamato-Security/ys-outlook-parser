@@ -104,6 +104,26 @@ impl UnicodePst {
         (self.u64_at(entry + 8), self.u64_at(entry + 16) as usize)
     }
 
+    /// Recompute the header's dwCRCPartial and dwCRCFull.
+    pub fn fix_header_crcs(&mut self) {
+        let partial = crc(&self.0[8..8 + 471]);
+        self.0[4..8].copy_from_slice(&partial.to_le_bytes());
+        let full = crc(&self.0[8..8 + 516]);
+        self.0[524..528].copy_from_slice(&full.to_le_bytes());
+    }
+
+    /// Recompute the CRC in the trailer of the block of `size` bytes at `offset`.
+    pub fn fix_block_crc(&mut self, offset: usize, size: usize) {
+        let trailer = offset + (size + 16).div_ceil(64) * 64 - 16;
+        let crc = crc(&self.0[offset..offset + size]);
+        self.0[trailer + 4..trailer + 8].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// The offset of the CRC in the trailer of the block of `size` bytes at `offset`.
+    pub fn block_crc_offset(offset: usize, size: usize) -> usize {
+        offset + (size + 16).div_ceil(64) * 64 - 16 + 4
+    }
+
     /// Recompute the CRC of the page at `page`.
     pub fn fix_page_crc(&mut self, page: usize) {
         let crc = crc(&self.0[page..page + PAGE_CRC_DATA]);

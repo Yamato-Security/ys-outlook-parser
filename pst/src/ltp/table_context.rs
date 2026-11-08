@@ -29,7 +29,7 @@ use std::{
 
 use super::{heap::*, prop_context::*, prop_type::*, read_write::*, tree::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileCaches, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileInternal, UnicodePstFile,
     messaging::{
         read_write::StoreReadWrite,
         store::{AnsiStore, UnicodeStore},
@@ -89,8 +89,45 @@ impl TableContextInfo {
         rows: Option<NodeId>,
         columns: Vec<TableColumnDescriptor>,
     ) -> LtpResult<Self> {
-        if columns.len() > 0xFF {
-            return Err(LtpError::InvalidTableContextColumnCount(columns.len()));
+        Self::check_offsets(
+            end_4byte_values,
+            end_2byte_values,
+            end_1byte_values,
+            end_existence_bitmap,
+            columns.len(),
+        )?;
+        for column in columns.iter() {
+            Self::check_column(
+                column,
+                end_4byte_values,
+                end_2byte_values,
+                end_1byte_values,
+                columns.len(),
+            )?;
+        }
+
+        Ok(Self {
+            end_4byte_values,
+            end_2byte_values,
+            end_1byte_values,
+            end_existence_bitmap,
+            row_index,
+            rows,
+            _deprecated_index: 0,
+            columns,
+        })
+    }
+
+    /// Check `rgib` for a table of `column_count` columns.
+    fn check_offsets(
+        end_4byte_values: u16,
+        end_2byte_values: u16,
+        end_1byte_values: u16,
+        end_existence_bitmap: u16,
+        column_count: usize,
+    ) -> LtpResult<()> {
+        if column_count > 0xFF {
+            return Err(LtpError::InvalidTableContextColumnCount(column_count));
         }
 
         // Every row starts with dwRowID and the 4 bytes of PidTagLtpRowVer.
@@ -108,53 +145,98 @@ impl TableContextInfo {
 
         if end_existence_bitmap
             .checked_sub(end_1byte_values)
-            .is_none_or(|size| usize::from(size) != existence_bitmap_size(columns.len()))
+            .is_none_or(|size| usize::from(size) != existence_bitmap_size(column_count))
         {
             return Err(LtpError::InvalidTableContextBitmaskOffset(
                 end_existence_bitmap,
             ));
         }
 
-        for column in columns.iter() {
-            match (column.prop_type(), column.prop_id()) {
-                (PropertyType::Integer32, LTP_ROW_ID_PROP_ID) => {
-                    match (column.offset(), column.existence_bitmap_index()) {
-                        (0, 0) => {}
-                        _ => {
-                            return Err(LtpError::InvalidTableContextRowIdColumn(
-                                column.prop_id(),
-                                column.prop_type(),
-                            ));
-                        }
-                    }
-                }
-                (PropertyType::Integer32, LTP_ROW_VERSION_PROP_ID) => {
-                    match (column.offset(), column.existence_bitmap_index()) {
-                        (4, 1) => {}
-                        _ => {
-                            return Err(LtpError::InvalidTableContextRowIdColumn(
-                                column.prop_id(),
-                                column.prop_type(),
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
+        Ok(())
+    }
 
-            match column.prop_type() {
-                PropertyType::Integer16
-                | PropertyType::Integer32
+    /// Check a column's type, offset, size and bit in a table of `column_count` columns.
+    fn check_column(
+        column: &TableColumnDescriptor,
+        end_4byte_values: u16,
+        end_2byte_values: u16,
+        end_1byte_values: u16,
+        column_count: usize,
+    ) -> LtpResult<()> {
+        match (column.prop_type(), column.prop_id()) {
+            (PropertyType::Integer32, LTP_ROW_ID_PROP_ID) => {
+                match (column.offset(), column.existence_bitmap_index()) {
+                    (0, 0) => {}
+                    _ => {
+                        return Err(LtpError::InvalidTableContextRowIdColumn(
+                            column.prop_id(),
+                            column.prop_type(),
+                        ));
+                    }
+                }
+            }
+            (PropertyType::Integer32, LTP_ROW_VERSION_PROP_ID) => {
+                match (column.offset(), column.existence_bitmap_index()) {
+                    (4, 1) => {}
+                    _ => {
+                        return Err(LtpError::InvalidTableContextRowIdColumn(
+                            column.prop_id(),
+                            column.prop_type(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        match column.prop_type() {
+            PropertyType::Integer16
+            | PropertyType::Integer32
+            | PropertyType::Floating32
+            | PropertyType::Floating64
+            | PropertyType::Currency
+            | PropertyType::FloatingTime
+            | PropertyType::ErrorCode
+            | PropertyType::Boolean
+            | PropertyType::Integer64
+            | PropertyType::String8
+            | PropertyType::Unicode
+            | PropertyType::Time
+            | PropertyType::Guid
+            | PropertyType::Binary
+            | PropertyType::Object
+            | PropertyType::MultipleInteger16
+            | PropertyType::MultipleInteger32
+            | PropertyType::MultipleFloating32
+            | PropertyType::MultipleFloating64
+            | PropertyType::MultipleCurrency
+            | PropertyType::MultipleFloatingTime
+            | PropertyType::MultipleInteger64
+            | PropertyType::MultipleString8
+            | PropertyType::MultipleUnicode
+            | PropertyType::MultipleTime
+            | PropertyType::MultipleGuid
+            | PropertyType::MultipleBinary => {}
+            prop_type => {
+                return Err(LtpError::InvalidTableColumnPropertyType(prop_type));
+            }
+        }
+
+        match (column.prop_type(), column.offset()) {
+            (PropertyType::Boolean, offset)
+                if offset >= end_2byte_values && offset < end_1byte_values => {}
+            (PropertyType::Integer16, offset)
+                if offset % 2 == 0
+                    && offset >= end_4byte_values
+                    && offset
+                        .checked_add(2)
+                        .is_some_and(|end| end <= end_2byte_values) => {}
+            (
+                PropertyType::Integer32
                 | PropertyType::Floating32
-                | PropertyType::Floating64
-                | PropertyType::Currency
-                | PropertyType::FloatingTime
                 | PropertyType::ErrorCode
-                | PropertyType::Boolean
-                | PropertyType::Integer64
                 | PropertyType::String8
                 | PropertyType::Unicode
-                | PropertyType::Time
                 | PropertyType::Guid
                 | PropertyType::Binary
                 | PropertyType::Object
@@ -169,119 +251,74 @@ impl TableContextInfo {
                 | PropertyType::MultipleUnicode
                 | PropertyType::MultipleTime
                 | PropertyType::MultipleGuid
-                | PropertyType::MultipleBinary => {}
-                prop_type => {
-                    return Err(LtpError::InvalidTableColumnPropertyType(prop_type));
-                }
-            }
-
-            match (column.prop_type(), column.offset()) {
-                (PropertyType::Boolean, offset)
-                    if offset >= end_2byte_values && offset < end_1byte_values => {}
-                (PropertyType::Integer16, offset)
-                    if offset % 2 == 0
-                        && offset >= end_4byte_values
-                        && offset
-                            .checked_add(2)
-                            .is_some_and(|end| end <= end_2byte_values) => {}
-                (
-                    PropertyType::Integer32
-                    | PropertyType::Floating32
-                    | PropertyType::ErrorCode
-                    | PropertyType::String8
-                    | PropertyType::Unicode
-                    | PropertyType::Guid
-                    | PropertyType::Binary
-                    | PropertyType::Object
-                    | PropertyType::MultipleInteger16
-                    | PropertyType::MultipleInteger32
-                    | PropertyType::MultipleFloating32
-                    | PropertyType::MultipleFloating64
-                    | PropertyType::MultipleCurrency
-                    | PropertyType::MultipleFloatingTime
-                    | PropertyType::MultipleInteger64
-                    | PropertyType::MultipleString8
-                    | PropertyType::MultipleUnicode
-                    | PropertyType::MultipleTime
-                    | PropertyType::MultipleGuid
-                    | PropertyType::MultipleBinary,
-                    offset,
-                ) if offset % 4 == 0
-                    && offset
-                        .checked_add(4)
-                        .is_some_and(|end| end <= end_4byte_values) => {}
-                (
-                    PropertyType::Floating64
-                    | PropertyType::Currency
-                    | PropertyType::FloatingTime
-                    | PropertyType::Integer64
-                    | PropertyType::Time,
-                    offset,
-                ) if offset % 4 == 0
-                    && offset
-                        .checked_add(8)
-                        .is_some_and(|end| end <= end_4byte_values) => {}
-                (_, offset) => {
-                    return Err(LtpError::InvalidTableColumnOffset(offset));
-                }
-            }
-
-            match (column.prop_type(), column.size()) {
-                (PropertyType::Boolean, 1) => {}
-                (PropertyType::Integer16, 2) => {}
-                (
-                    PropertyType::Integer32
-                    | PropertyType::Floating32
-                    | PropertyType::ErrorCode
-                    | PropertyType::String8
-                    | PropertyType::Unicode
-                    | PropertyType::Guid
-                    | PropertyType::Binary
-                    | PropertyType::Object
-                    | PropertyType::MultipleInteger16
-                    | PropertyType::MultipleInteger32
-                    | PropertyType::MultipleFloating32
-                    | PropertyType::MultipleFloating64
-                    | PropertyType::MultipleCurrency
-                    | PropertyType::MultipleFloatingTime
-                    | PropertyType::MultipleInteger64
-                    | PropertyType::MultipleString8
-                    | PropertyType::MultipleUnicode
-                    | PropertyType::MultipleTime
-                    | PropertyType::MultipleGuid
-                    | PropertyType::MultipleBinary,
-                    4,
-                ) => {}
-                (
-                    PropertyType::Floating64
-                    | PropertyType::Currency
-                    | PropertyType::FloatingTime
-                    | PropertyType::Integer64
-                    | PropertyType::Time,
-                    8,
-                ) => {}
-                (_, size) => {
-                    return Err(LtpError::InvalidTableColumnSize(size));
-                }
-            }
-
-            if usize::from(column.existence_bitmap_index()) > columns.len() {
-                return Err(LtpError::InvalidTableColumnBitmaskOffset(
-                    column.existence_bitmap_index(),
-                ));
+                | PropertyType::MultipleBinary,
+                offset,
+            ) if offset % 4 == 0
+                && offset
+                    .checked_add(4)
+                    .is_some_and(|end| end <= end_4byte_values) => {}
+            (
+                PropertyType::Floating64
+                | PropertyType::Currency
+                | PropertyType::FloatingTime
+                | PropertyType::Integer64
+                | PropertyType::Time,
+                offset,
+            ) if offset % 4 == 0
+                && offset
+                    .checked_add(8)
+                    .is_some_and(|end| end <= end_4byte_values) => {}
+            (_, offset) => {
+                return Err(LtpError::InvalidTableColumnOffset(offset));
             }
         }
 
-        Ok(Self {
-            end_4byte_values,
-            end_2byte_values,
-            end_1byte_values,
-            end_existence_bitmap,
-            row_index,
-            rows,
-            _deprecated_index: 0,
-            columns,
-        })
+        match (column.prop_type(), column.size()) {
+            (PropertyType::Boolean, 1) => {}
+            (PropertyType::Integer16, 2) => {}
+            (
+                PropertyType::Integer32
+                | PropertyType::Floating32
+                | PropertyType::ErrorCode
+                | PropertyType::String8
+                | PropertyType::Unicode
+                | PropertyType::Guid
+                | PropertyType::Binary
+                | PropertyType::Object
+                | PropertyType::MultipleInteger16
+                | PropertyType::MultipleInteger32
+                | PropertyType::MultipleFloating32
+                | PropertyType::MultipleFloating64
+                | PropertyType::MultipleCurrency
+                | PropertyType::MultipleFloatingTime
+                | PropertyType::MultipleInteger64
+                | PropertyType::MultipleString8
+                | PropertyType::MultipleUnicode
+                | PropertyType::MultipleTime
+                | PropertyType::MultipleGuid
+                | PropertyType::MultipleBinary,
+                4,
+            ) => {}
+            (
+                PropertyType::Floating64
+                | PropertyType::Currency
+                | PropertyType::FloatingTime
+                | PropertyType::Integer64
+                | PropertyType::Time,
+                8,
+            ) => {}
+            (_, size) => {
+                return Err(LtpError::InvalidTableColumnSize(size));
+            }
+        }
+
+        if usize::from(column.existence_bitmap_index()) > column_count {
+            return Err(LtpError::InvalidTableColumnBitmaskOffset(
+                column.existence_bitmap_index(),
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn end_4byte_values(&self) -> u16 {
@@ -336,23 +373,50 @@ impl TableContextInfoReadWrite for TableContextInfo {
         // hidIndex
         let _deprecated_index = f.read_u32::<LittleEndian>()?;
 
-        // rgTCOLDESC
-        let mut columns = Vec::with_capacity(usize::from(column_count));
-        for _ in 0..column_count {
-            columns.push(TableColumnDescriptor::read(f)?);
+        let count = usize::from(column_count);
+        Self::check_offsets(
+            end_4byte_values,
+            end_2byte_values,
+            end_1byte_values,
+            end_existence_bitmap,
+            count,
+        )?;
+
+        // rgTCOLDESC: a column with a type, offset, size or bit MS-PST does not allow is a problem
+        // when reading leniently, and is left out; the table's other columns are read.
+        let mut columns = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut descriptor = [0_u8; 8];
+            f.read_exact(&mut descriptor)?;
+            let column =
+                TableColumnDescriptor::read(&mut descriptor.as_slice()).and_then(|column| {
+                    Self::check_column(
+                        &column,
+                        end_4byte_values,
+                        end_2byte_values,
+                        end_1byte_values,
+                        count,
+                    )?;
+                    Ok(column)
+                });
+            match column {
+                Ok(column) => columns.push(column),
+                Err(err) => {
+                    let detail = format!("TCOLDESC {index} ({descriptor:02X?}): {err}");
+                    crate::problems::check(crate::ProblemKind::Table, None, || detail, || err)?;
+                }
+            }
         }
 
         Ok(Self {
+            end_4byte_values,
+            end_2byte_values,
+            end_1byte_values,
+            end_existence_bitmap,
+            row_index,
+            rows,
             _deprecated_index,
-            ..Self::new(
-                end_4byte_values,
-                end_2byte_values,
-                end_1byte_values,
-                end_existence_bitmap,
-                row_index,
-                rows,
-                columns,
-            )?
+            columns,
         })
     }
 
@@ -879,7 +943,7 @@ where
 
 impl<Pst, RowIndex, RowIndexTree> TableContextInner<Pst, RowIndex, RowIndexTree>
 where
-    Pst: PstFile + PstFileCaches<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
     <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
@@ -915,11 +979,7 @@ where
         store: Rc<<Pst as PstFile>::Store>,
         node: <Pst as PstFile>::NodeBTreeEntry,
     ) -> io::Result<Self> {
-        let mut file = store
-            .pst()
-            .reader()
-            .lock()
-            .map_err(|_| LtpError::FailedToLockFile)?;
+        let mut file = store.pst().lock_reader()?;
         let file = &mut *file;
 
         let header = store.pst().header();
@@ -1006,12 +1066,25 @@ where
             Default::default()
         };
 
+        // Without its row index, a table's rows are still read, but find_row finds none.
         let row_index_tree = RowIndexTree::new(heap, context.row_index);
-        let row_index = row_index_tree
-            .entries()?
-            .into_iter()
-            .map(|entry| (entry.key(), entry.data()))
-            .collect();
+        let row_index = crate::problems::isolate(
+            store.pst().validation(),
+            store.pst().problem_log(),
+            |err| {
+                crate::Problem::new(
+                    crate::ProblemKind::Table,
+                    None,
+                    Some(node.node()),
+                    format!("table row index: {err}"),
+                )
+            },
+            row_index_tree.entries(),
+        )?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| (entry.key(), entry.data()))
+        .collect();
         let heap = row_index_tree.into();
 
         Ok(Self {
@@ -1042,12 +1115,7 @@ where
                 PropertyValueReadWrite::read(&mut cursor, prop_type)
             }
             TableRowColumnValue::Node(sub_node_id) => {
-                let mut file = self
-                    .store
-                    .pst()
-                    .reader()
-                    .lock()
-                    .map_err(|_| LtpError::FailedToLockFile)?;
+                let mut file = self.store.pst().lock_reader()?;
                 let file = &mut *file;
 
                 let encoding = self.store.pst().header().crypt_method();
@@ -1244,6 +1312,49 @@ mod tests {
         let row = TableRowData::read(&mut [1, 0, 0, 0, 2, 0, 0, 0].as_slice(), &context).unwrap();
         assert_eq!(u32::from(row.id()), 1);
         assert!(TableRowData::read(&mut [1, 0, 0].as_slice(), &context).is_err());
+    }
+
+    /// A TCINFO of rgib (12, 12, 12, 13) and `columns` (type, ID, offset, size, bit).
+    fn tcinfo(columns: &[(u16, u16, u16, u8, u8)]) -> Vec<u8> {
+        let mut data = vec![HeapNodeType::Table as u8, columns.len() as u8];
+        for end in [12_u16, 12, 12, 13] {
+            data.extend_from_slice(&end.to_le_bytes());
+        }
+        data.extend_from_slice(&[0; 12]);
+        for (prop_type, prop_id, offset, size, bit) in columns {
+            data.extend_from_slice(&prop_type.to_le_bytes());
+            data.extend_from_slice(&prop_id.to_le_bytes());
+            data.extend_from_slice(&offset.to_le_bytes());
+            data.extend_from_slice(&[*size, *bit]);
+        }
+        data
+    }
+
+    #[test]
+    fn test_bad_column_is_left_out_when_lenient() {
+        // A PtypInteger32 column of 8 bytes, and a column of type 0x0099.
+        let data = tcinfo(&[
+            (0x0003, 0x3001, 8, 4, 0),
+            (0x0003, 0x3002, 8, 8, 1),
+            (0x0099, 0x3003, 8, 4, 2),
+        ]);
+        assert!(TableContextInfo::read(&mut data.as_slice()).is_err());
+
+        let (_scope, log) = crate::problems::lenient_scope();
+        let context = TableContextInfo::read(&mut data.as_slice()).unwrap();
+        assert_eq!(context.columns().len(), 1);
+        assert_eq!(context.columns()[0].prop_id(), 0x3001);
+        assert_eq!(log.problems().len(), 2);
+        assert!(
+            log.problems()
+                .iter()
+                .all(|p| p.kind() == crate::ProblemKind::Table)
+        );
+
+        // rgib that does not fit the column count is still an error.
+        let mut data = data;
+        data[1] = 20;
+        assert!(TableContextInfo::read(&mut data.as_slice()).is_err());
     }
 
     #[test]

@@ -471,7 +471,7 @@ where
 
 impl<Pst> SearchUpdateQueueInner<Pst>
 where
-    Pst: PstFile,
+    Pst: PstFile + crate::PstFileInternal<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     u64: From<Pst::BTreeKey>,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
@@ -510,10 +510,7 @@ where
         let encoding = header.crypt_method();
         let root = header.root();
 
-        let mut file = pst
-            .reader()
-            .lock()
-            .map_err(|_| MessagingError::FailedToLockFile)?;
+        let mut file = pst.lock_reader()?;
         let file = &mut *file;
 
         let node_btree = <Pst as PstFile>::NodeBTree::read(file, *root.node_btree())?;

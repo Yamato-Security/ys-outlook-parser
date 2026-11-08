@@ -17,8 +17,15 @@
 
 //! ## [Messaging Layer](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/3f1bc553-d15d-4dcf-9b80-fbf1dd6c7e79)
 
-use std::io;
+use std::{collections::BTreeMap, io};
 use thiserror::Error;
+
+use crate::{
+    PstFile, PstFileInternal,
+    ltp::prop_context::{PropertyTreeRecordValue, PropertyValue},
+    ndb::node_id::NodeId,
+    problems::{self, Problem, ProblemKind},
+};
 
 pub mod attachment;
 pub mod folder;
@@ -204,3 +211,57 @@ impl From<MessagingError> for io::Error {
 }
 
 pub type MessagingResult<T> = Result<T, MessagingError>;
+
+/// Read each property of a node's property context with `read`. A property that cannot be read is
+/// a [`Problem`] and is left out when reading leniently, else the error.
+pub(crate) fn read_properties<Pst>(
+    pst: &Pst,
+    node: NodeId,
+    records: impl IntoIterator<Item = (u16, PropertyTreeRecordValue)>,
+    mut read: impl FnMut(PropertyTreeRecordValue) -> io::Result<PropertyValue>,
+) -> io::Result<BTreeMap<u16, PropertyValue>>
+where
+    Pst: PstFile + PstFileInternal<Pst>,
+{
+    let mut properties = BTreeMap::new();
+    for (prop_id, record) in records {
+        let prop_type = record.prop_type();
+        let value = problems::isolate(
+            pst.validation(),
+            pst.problem_log(),
+            |err| {
+                Problem::new(
+                    ProblemKind::Property,
+                    None,
+                    Some(node),
+                    format!("property 0x{prop_id:04X} ({prop_type:?}): {err}"),
+                )
+            },
+            read(record),
+        )?;
+        if let Some(value) = value {
+            properties.insert(prop_id, value);
+        }
+    }
+    Ok(properties)
+}
+
+/// A part of an object that could not be read: a [`Problem`] of `kind` when reading leniently,
+/// and the part is left out (`None`), else the error.
+pub(crate) fn isolate_part<Pst, T>(
+    pst: &Pst,
+    kind: ProblemKind,
+    node: NodeId,
+    what: &str,
+    result: io::Result<T>,
+) -> io::Result<Option<T>>
+where
+    Pst: PstFile + PstFileInternal<Pst>,
+{
+    problems::isolate(
+        pst.validation(),
+        pst.problem_log(),
+        |err| Problem::new(kind, None, Some(node), format!("{what}: {err}")),
+        result,
+    )
+}

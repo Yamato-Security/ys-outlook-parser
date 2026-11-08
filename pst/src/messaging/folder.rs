@@ -26,7 +26,7 @@ use std::{
 
 use super::{read_write::*, store::*, *};
 use crate::{
-    AnsiPstFile, PstFile, PstFileCaches, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileInternal, UnicodePstFile,
     ltp::{
         heap::HeapNode,
         prop_context::{BinaryValue, PropertyContext, PropertyValue},
@@ -220,7 +220,7 @@ where
 
 impl<Pst> FolderInner<Pst>
 where
-    Pst: PstFile + PstFileCaches<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
@@ -269,10 +269,7 @@ where
         let root = header.root();
 
         let properties = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let encoding = header.crypt_method();
@@ -309,19 +306,18 @@ where
                 1
             };
             let entry_id = entry_id.try_into()?;
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut block_page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .chain([
-                    Ok((0x0FFF, PropertyValue::Binary(BinaryValue::new(entry_id)))),
-                    Ok((0x3601, PropertyValue::Integer32(folder_type))),
-                ])
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let mut properties =
+                read_properties(pst, node.node(), prop_context.properties()?, |record| {
+                    prop_context.read_property(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut block_page_cache,
+                        record,
+                    )
+                })?;
+            properties.insert(0x0FFF, PropertyValue::Binary(BinaryValue::new(entry_id)));
+            properties.insert(0x3601, PropertyValue::Integer32(folder_type));
 
             FolderProperties {
                 node_id,
@@ -338,16 +334,30 @@ where
         })
     }
 
+    /// [`Self::read_table`], with a table that cannot be read a [`Problem`](crate::Problem),
+    /// whatever the validation: the folder's table methods return an `Option`.
+    fn read_table_or_problem(&self, node_id_type: NodeIdType) -> Option<Rc<dyn TableContext>> {
+        match self.read_table(node_id_type) {
+            Ok(table) => table,
+            Err(err) => {
+                self.store.pst().problem_log().record(crate::Problem::new(
+                    crate::ProblemKind::Table,
+                    None,
+                    Some(self.properties.node_id),
+                    format!("{node_id_type:?}: {err}"),
+                ));
+                None
+            }
+        }
+    }
+
     fn read_table(&self, node_id_type: NodeIdType) -> io::Result<Option<Rc<dyn TableContext>>> {
         let pst = self.store.pst();
         let header = pst.header();
         let root = header.root();
 
         let node = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let node_btree = <<Pst as PstFile>::NodeBTree as RootBTreeReadWrite>::read(
@@ -359,10 +369,12 @@ where
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
             let mut node_page_cache = pst.node_cache()?;
 
-            let Ok(node) = node_btree.find_entry(file, node_key, &mut node_page_cache) else {
-                return Ok(None);
-            };
-            node
+            match node_btree.find_entry(file, node_key, &mut node_page_cache) {
+                Ok(node) => node,
+                // The folder has no such table.
+                Err(err) if crate::ndb::is_not_found(&err) => return Ok(None),
+                Err(err) => return Err(err),
+            }
         };
 
         Ok(Some(
@@ -375,19 +387,19 @@ where
 
     fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.hierarchy_table
-            .get_or_init(|| self.read_table(NodeIdType::HierarchyTable).ok()?)
+            .get_or_init(|| self.read_table_or_problem(NodeIdType::HierarchyTable))
             .as_ref()
     }
 
     fn contents_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.contents_table
-            .get_or_init(|| self.read_table(NodeIdType::ContentsTable).ok()?)
+            .get_or_init(|| self.read_table_or_problem(NodeIdType::ContentsTable))
             .as_ref()
     }
 
     fn associated_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.associated_table
-            .get_or_init(|| self.read_table(NodeIdType::AssociatedContentsTable).ok()?)
+            .get_or_init(|| self.read_table_or_problem(NodeIdType::AssociatedContentsTable))
             .as_ref()
     }
 }

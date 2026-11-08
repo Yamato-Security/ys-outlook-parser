@@ -28,6 +28,7 @@ use std::{
 
 use super::{folder::*, message::*, read_write::*, *};
 use crate::{
+    Validation,
     ltp::{
         heap::HeapNode,
         prop_context::{PropertyContext, PropertyValue},
@@ -43,6 +44,7 @@ use crate::{
         read_write::*,
         root::Root,
     },
+    problems::{Problem, ProblemKind},
     *,
 };
 
@@ -175,6 +177,9 @@ impl TryFrom<&EntryId> for Vec<u8> {
 #[derive(Default, Debug)]
 pub struct StoreProperties {
     properties: BTreeMap<u16, PropertyValue>,
+    /// The record key of entry IDs when the store has no usable `PidTagRecordKey` and is read
+    /// leniently: zeros.
+    fallback_record_key: Option<StoreRecordKey>,
 }
 
 impl StoreProperties {
@@ -188,6 +193,7 @@ impl StoreProperties {
                     record_key.to_vec(),
                 )),
             )]),
+            fallback_record_key: None,
         }
     }
 
@@ -213,14 +219,25 @@ impl StoreProperties {
         }
     }
 
+    /// An entry ID for a node of this store. A store read leniently without a usable
+    /// `PidTagRecordKey` makes entry IDs with a record key of zeros, so its folders and messages
+    /// still open by node ID.
     pub fn make_entry_id(&self, node_id: NodeId) -> io::Result<EntryId> {
-        let record_key = self.record_key()?;
+        let record_key = match (self.record_key(), self.fallback_record_key) {
+            (Ok(record_key), _) | (Err(_), Some(record_key)) => record_key,
+            (Err(err), None) => return Err(err),
+        };
         Ok(EntryId::new(record_key, node_id))
     }
 
+    /// Whether an entry ID is of this store. Any is, for a store read leniently without a usable
+    /// `PidTagRecordKey`.
     pub fn matches_record_key(&self, entry_id: &EntryId) -> io::Result<bool> {
-        let store_record_key = self.record_key()?;
-        Ok(store_record_key == entry_id.record_key)
+        match (self.record_key(), self.fallback_record_key) {
+            (Ok(record_key), _) => Ok(record_key == entry_id.record_key),
+            (Err(_), Some(_)) => Ok(true),
+            (Err(err), None) => Err(err),
+        }
     }
 
     pub fn display_name(&self) -> io::Result<String> {
@@ -298,7 +315,7 @@ pub trait Store {
 
 struct StoreInner<Pst>
 where
-    Pst: PstFile + PstFileCaches<Pst> + 'static,
+    Pst: PstFile + PstFileInternal<Pst> + 'static,
 {
     pst: Rc<Pst>,
     node_btree: PstFileReadWriteNodeBTree<Pst>,
@@ -310,7 +327,7 @@ where
 
 impl<Pst> StoreInner<Pst>
 where
-    Pst: PstFile + PstFileCaches<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
@@ -349,10 +366,7 @@ where
         let root = header.root();
 
         let (node_btree, block_btree, properties) = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let encoding = header.crypt_method();
@@ -382,16 +396,35 @@ where
 
             let tree = <Pst as PstFile>::PropertyTree::new(heap, header.user_root());
             let prop_context = <Pst as PstFile>::PropertyContext::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
-            let properties = StoreProperties { properties };
+            let properties = read_properties(
+                pst.as_ref(),
+                node.node(),
+                prop_context.properties()?,
+                |record| {
+                    prop_context.read_property(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut page_cache,
+                        record,
+                    )
+                },
+            )?;
+            let mut properties = StoreProperties {
+                properties,
+                fallback_record_key: None,
+            };
+            if let Err(err) = properties.record_key()
+                && pst.validation() == Validation::Lenient
+            {
+                pst.problem_log().record(Problem::new(
+                    ProblemKind::StoreRecordKey,
+                    None,
+                    Some(NID_MESSAGE_STORE),
+                    format!("{err}: entry IDs are made with a record key of zeros"),
+                ));
+                properties.fallback_record_key = Some(StoreRecordKey::new([0; 16]));
+            }
 
             (node_btree, block_btree, properties)
         };
@@ -417,11 +450,7 @@ where
                             "Store has been dropped".to_string(),
                         ))?;
                 let node = {
-                    let mut file = self
-                        .pst
-                        .reader()
-                        .lock()
-                        .map_err(|_| MessagingError::FailedToLockFile)?;
+                    let mut file = self.pst.lock_reader()?;
 
                     let file = &mut *file;
                     let node_id = NodeId::new(NodeIdType::HierarchyTable, NID_ROOT_FOLDER.index())?;

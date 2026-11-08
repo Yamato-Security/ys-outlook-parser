@@ -37,15 +37,19 @@ use std::{
     fmt::Debug,
     fs::File,
     io::{self, Read, Seek},
+    ops::{Deref, DerefMut},
     path::Path,
     rc::Rc,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard, TryLockError},
 };
 use thiserror::Error;
 
 pub mod ltp;
 pub mod messaging;
 pub mod ndb;
+pub mod problems;
+
+pub use problems::{Problem, ProblemKind, Validation};
 
 mod block_sig;
 mod crc;
@@ -95,17 +99,41 @@ impl From<&io::Error> for PstError {
     }
 }
 
-/// Crate-internal access to a file's B-tree page caches. Each is borrowed by one reader at a time;
-/// a second borrow is an error, not a panic.
-trait PstFileCaches<Pst>
+/// Crate-internal access to a file: its reader and B-tree page caches, each used by one reader at
+/// a time (a second use is an error, not a panic or a deadlock), and its problem log.
+trait PstFileInternal<Pst>
 where
     Pst: PstFile,
 {
+    /// Lock the file's reader, with the file's [`Validation`] in force while it is locked.
+    fn lock_reader(&self) -> io::Result<ReaderGuard<'_>>;
+    fn problem_log(&self) -> &problems::ProblemLog;
+
     fn block_cache(
         &self,
     ) -> io::Result<RefMut<'_, RootBTreePageCache<<Pst as PstFile>::BlockBTree>>>;
     fn node_cache(&self)
     -> io::Result<RefMut<'_, RootBTreePageCache<<Pst as PstFile>::NodeBTree>>>;
+}
+
+/// A file's locked reader: see [`PstFileInternal::lock_reader`].
+struct ReaderGuard<'a> {
+    reader: MutexGuard<'a, Box<dyn PstReader>>,
+    _scope: problems::ScopeGuard,
+}
+
+impl Deref for ReaderGuard<'_> {
+    type Target = Box<dyn PstReader>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reader
+    }
+}
+
+impl DerefMut for ReaderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.reader
+    }
 }
 
 /// Borrow a page cache, or fail with [`PstError::LockError`] if it is already borrowed.
@@ -170,7 +198,13 @@ pub trait PstFile: Sized {
 
     fn header(&self) -> &Self::Header;
     fn density_list(&self) -> Result<&dyn DensityListPage<Self>, &io::Error>;
+    /// The file's reader. Structures read through it directly are read strictly, whatever the
+    /// file's [`Validation`], and their problems are not recorded.
     fn reader(&self) -> &Mutex<Box<dyn PstReader>>;
+    /// How strictly the file is checked: see [`problems`].
+    fn validation(&self) -> Validation;
+    /// The problems found in the file so far, each once, in the order found: see [`problems`].
+    fn problems(&self) -> Vec<Problem>;
 
     fn read_node(&self, node: NodeId) -> io::Result<Self::NodeBTreeEntry>;
     fn read_block(&self, block: Self::BlockId) -> io::Result<Vec<u8>>;
@@ -181,6 +215,10 @@ where
     Pst: PstFile,
 {
     reader: Mutex<Box<dyn PstReader>>,
+    validation: Validation,
+    problems: Rc<problems::ProblemLog>,
+    /// Whether the file has the 4 KiB pages of Outlook 2013 and later OSTs.
+    large_pages: bool,
     header: Pst::Header,
     density_list: io::Result<Pst::DensityListPage>,
     node_cache: NodeBTreePageCache<Pst>,
@@ -192,18 +230,38 @@ pub struct UnicodePstFile {
 }
 
 impl UnicodePstFile {
+    /// Read a file from `reader`, leniently ([`Validation::Lenient`]).
     pub fn read_from(reader: Box<dyn PstReader>) -> io::Result<Self> {
-        let inner = PstFileInner::read_from(reader)?;
+        Self::read_from_with(reader, Validation::default())
+    }
+
+    /// Read a file from `reader` with the given [`Validation`].
+    pub fn read_from_with(reader: Box<dyn PstReader>, validation: Validation) -> io::Result<Self> {
+        let inner = PstFileInner::read_from(reader, validation)?;
         Ok(Self { inner })
     }
 
+    /// Open the file at `path` read-only, leniently ([`Validation::Lenient`]).
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let inner = PstFileInner::open(path)?;
+        Self::open_with(path, Validation::default())
+    }
+
+    /// Open the file at `path` read-only with the given [`Validation`].
+    pub fn open_with(path: impl AsRef<Path>, validation: Validation) -> io::Result<Self> {
+        let inner = PstFileInner::open(path, validation)?;
         Ok(Self { inner })
     }
 }
 
-impl PstFileCaches<UnicodePstFile> for UnicodePstFile {
+impl PstFileInternal<UnicodePstFile> for UnicodePstFile {
+    fn lock_reader(&self) -> io::Result<ReaderGuard<'_>> {
+        self.inner.lock_reader()
+    }
+
+    fn problem_log(&self) -> &problems::ProblemLog {
+        &self.inner.problems
+    }
+
     fn block_cache(
         &self,
     ) -> io::Result<RefMut<'_, RootBTreePageCache<<Self as PstFile>::BlockBTree>>> {
@@ -265,6 +323,14 @@ impl PstFile for UnicodePstFile {
         &self.inner.reader
     }
 
+    fn validation(&self) -> Validation {
+        self.inner.validation
+    }
+
+    fn problems(&self) -> Vec<Problem> {
+        self.inner.problems.problems()
+    }
+
     fn read_node(&self, node: NodeId) -> io::Result<UnicodeNodeBTreeEntry> {
         self.inner.read_node(node)
     }
@@ -279,18 +345,38 @@ pub struct AnsiPstFile {
 }
 
 impl AnsiPstFile {
+    /// Read a file from `reader`, leniently ([`Validation::Lenient`]).
     pub fn read_from(reader: Box<dyn PstReader>) -> io::Result<Self> {
-        let inner = PstFileInner::read_from(reader)?;
+        Self::read_from_with(reader, Validation::default())
+    }
+
+    /// Read a file from `reader` with the given [`Validation`].
+    pub fn read_from_with(reader: Box<dyn PstReader>, validation: Validation) -> io::Result<Self> {
+        let inner = PstFileInner::read_from(reader, validation)?;
         Ok(Self { inner })
     }
 
+    /// Open the file at `path` read-only, leniently ([`Validation::Lenient`]).
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let inner = PstFileInner::open(path)?;
+        Self::open_with(path, Validation::default())
+    }
+
+    /// Open the file at `path` read-only with the given [`Validation`].
+    pub fn open_with(path: impl AsRef<Path>, validation: Validation) -> io::Result<Self> {
+        let inner = PstFileInner::open(path, validation)?;
         Ok(Self { inner })
     }
 }
 
-impl PstFileCaches<AnsiPstFile> for AnsiPstFile {
+impl PstFileInternal<AnsiPstFile> for AnsiPstFile {
+    fn lock_reader(&self) -> io::Result<ReaderGuard<'_>> {
+        self.inner.lock_reader()
+    }
+
+    fn problem_log(&self) -> &problems::ProblemLog {
+        &self.inner.problems
+    }
+
     fn block_cache(
         &self,
     ) -> io::Result<RefMut<'_, RootBTreePageCache<<Self as PstFile>::BlockBTree>>> {
@@ -352,6 +438,14 @@ impl PstFile for AnsiPstFile {
         &self.inner.reader
     }
 
+    fn validation(&self) -> Validation {
+        self.inner.validation
+    }
+
+    fn problems(&self) -> Vec<Problem> {
+        self.inner.problems.problems()
+    }
+
     fn read_node(&self, node: NodeId) -> io::Result<AnsiNodeBTreeEntry> {
         self.inner.read_node(node)
     }
@@ -374,7 +468,7 @@ type PstFileReadWriteBlockBTree<Pst> = PstFileReadWriteBTree<Pst, <Pst as PstFil
 
 impl<Pst> PstFileInner<Pst>
 where
-    Pst: PstFile + PstFileCaches<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey>
         + From<<<Pst as PstFile>::ByteIndex as ByteIndex>::Index>
         + Debug,
@@ -427,12 +521,26 @@ where
     <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
         IntermediateTreeEntryReadWrite,
 {
-    fn read_from(mut reader: Box<dyn PstReader>) -> io::Result<Self> {
-        let header = <<Pst as PstFile>::Header as HeaderReadWrite<Pst>>::read(&mut reader)?;
-        let density_list =
-            <<Pst as PstFile>::DensityListPage as DensityListPageReadWrite<Pst>>::read(&mut reader);
+    fn read_from(mut reader: Box<dyn PstReader>, validation: Validation) -> io::Result<Self> {
+        let problems = Rc::new(problems::ProblemLog::default());
+        let header = {
+            let _scope = problems::ScopeGuard::new(validation, problems.clone(), None);
+            <<Pst as PstFile>::Header as HeaderReadWrite<Pst>>::read(&mut reader)?
+        };
+        let large_pages = header.version() == NdbVersion::Unicode4k;
+        // The density list of the 512-byte layout; the 4 KiB layout keeps another structure there.
+        // Nothing is read through it, so it is read strictly and is not a problem: a density list
+        // that does not read is an error from density_list(), as it always was.
+        let density_list = if large_pages {
+            Err(io::ErrorKind::Unsupported.into())
+        } else {
+            <<Pst as PstFile>::DensityListPage as DensityListPageReadWrite<Pst>>::read(&mut reader)
+        };
         Ok(Self {
             reader: Mutex::new(Box::new(reader)),
+            validation,
+            problems,
+            large_pages,
             header,
             density_list,
             node_cache: Default::default(),
@@ -441,13 +549,29 @@ where
     }
 
     /// Open the file at `path` read-only: this crate never writes to the file it reads.
-    fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::read_from(Box::new(File::open(path)?))
+    fn open(path: impl AsRef<Path>, validation: Validation) -> io::Result<Self> {
+        Self::read_from(Box::new(File::open(path)?), validation)
+    }
+
+    fn lock_reader(&self) -> io::Result<ReaderGuard<'_>> {
+        // A file is used by one thread, so a lock that is held is held by this thread: waiting
+        // for it would never end.
+        let reader = self.reader.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock | TryLockError::Poisoned(_) => PstError::LockError,
+        })?;
+        Ok(ReaderGuard {
+            reader,
+            _scope: problems::ScopeGuard::new(
+                self.validation,
+                self.problems.clone(),
+                Some(self.large_pages),
+            ),
+        })
     }
 
     fn read_node(&self, node: NodeId) -> io::Result<<Pst as PstFile>::NodeBTreeEntry> {
         let node_btree = *self.header.root().node_btree();
-        let mut reader = self.reader.lock().map_err(|_| PstError::LockError)?;
+        let mut reader = self.lock_reader()?;
         let reader = &mut *reader;
         let node_btree =
             <<Pst as PstFile>::NodeBTree as RootBTreeReadWrite>::read(reader, node_btree)?;
@@ -460,7 +584,7 @@ where
     fn read_block(&self, block: <Pst as PstFile>::BlockId) -> io::Result<Vec<u8>> {
         let encoding = self.header.crypt_method();
         let block_btree = *self.header.root().block_btree();
-        let mut reader = self.reader.lock().map_err(|_| PstError::LockError)?;
+        let mut reader = self.lock_reader()?;
         let reader = &mut *reader;
         let block_btree =
             <<Pst as PstFile>::BlockBTree as RootBTreeReadWrite>::read(reader, block_btree)?;
@@ -482,11 +606,22 @@ where
     }
 }
 
+/// Open the store of the Unicode or ANSI PST or OST at `path`, read-only and leniently
+/// ([`Validation::Lenient`]).
 pub fn open_store(path: impl AsRef<Path>) -> io::Result<Rc<dyn Store>> {
-    Ok(match UnicodePstFile::open(path.as_ref()) {
+    open_store_with(path, Validation::default())
+}
+
+/// Open the store of the Unicode or ANSI PST or OST at `path`, read-only, with the given
+/// [`Validation`].
+pub fn open_store_with(
+    path: impl AsRef<Path>,
+    validation: Validation,
+) -> io::Result<Rc<dyn Store>> {
+    Ok(match UnicodePstFile::open_with(path.as_ref(), validation) {
         Ok(pst_file) => UnicodeStore::read(Rc::new(pst_file))?,
         _ => {
-            let pst_file = AnsiPstFile::open(path.as_ref())?;
+            let pst_file = AnsiPstFile::open_with(path.as_ref(), validation)?;
             AnsiStore::read(Rc::new(pst_file))?
         }
     })

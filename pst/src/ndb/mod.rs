@@ -108,6 +108,8 @@ pub enum NdbError {
     BTreePageNotFound(u64),
     #[error("BTree page at 0x{0:X} is on its own lookup path: a loop or a corrupt page")]
     BTreePageLoop(u64),
+    #[error("BTree page at 0x{0:X} has cLevel {1}, not below its parent's {2}")]
+    InvalidBTreeChildPageLevel(u64, u8, u8),
     #[error("BTree lookup deeper than MAX_BTREE_DEPTH, at the page at 0x{0:X}")]
     BTreeTooDeep(u64),
     #[error("Invalid NBTENTRY nid: 0x{0:X}")]
@@ -140,6 +142,13 @@ pub enum NdbError {
     BlockTreeTooLarge(u64),
     #[error("Data or sub-node tree deeper than MAX_BLOCK_TREE_DEPTH, at block 0x{0:X}")]
     BlockTreeTooDeep(u64),
+}
+
+/// Whether `err` is a BTree lookup that found no entry for its key.
+pub(crate) fn is_not_found(err: &io::Error) -> bool {
+    err.get_ref()
+        .and_then(|err| err.downcast_ref::<NdbError>())
+        .is_some_and(|err| matches!(err, NdbError::BTreePageNotFound(_)))
 }
 
 impl From<NdbError> for io::Error {

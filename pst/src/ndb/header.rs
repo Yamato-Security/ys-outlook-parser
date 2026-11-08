@@ -21,7 +21,35 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use super::{block_id::*, read_write::*, root::*, *};
-use crate::{AnsiPstFile, PstFile, UnicodePstFile, crc::compute_crc};
+use crate::{
+    AnsiPstFile, PstFile, UnicodePstFile,
+    crc::compute_crc,
+    problems::{self, ProblemKind},
+};
+
+/// A header field with a value MS-PST does not allow: a problem when reading leniently, else
+/// `error`.
+fn check_field(
+    valid: bool,
+    field: &str,
+    value: impl std::fmt::Debug,
+    error: impl FnOnce() -> NdbError,
+) -> io::Result<()> {
+    if valid {
+        return Ok(());
+    }
+    problems::check(
+        ProblemKind::HeaderField,
+        Some(0),
+        || format!("{field} is {value:?}"),
+        || error().into(),
+    )
+}
+
+/// The client versions in wVerClient: 19 (MS-PST), and 12, which Outlook writes in OSTs.
+fn valid_client_version(version: u16) -> bool {
+    version == NDB_CLIENT_VERSION || version == NDB_CLIENT_VERSION_OST
+}
 
 /// `dwMagic`
 ///
@@ -62,6 +90,8 @@ impl TryFrom<u16> for NdbVersion {
 }
 
 const NDB_CLIENT_VERSION: u16 = 19;
+/// `wVerClient` in OSTs written by Outlook, in both the 512-byte and the 4 KiB layout.
+const NDB_CLIENT_VERSION_OST: u16 = 12;
 const NDB_PLATFORM_CREATE: u8 = 0x01;
 const NDB_PLATFORM_ACCESS: u8 = 0x01;
 const NDB_DEFAULT_NIDS: [u32; 32] = [
@@ -216,18 +246,27 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
         let crc_partial = f.read_u32::<LittleEndian>()?;
 
         let mut crc_data = [0_u8; 516];
-        f.read_exact(&mut crc_data[..471])?;
-        if crc_partial != compute_crc(0, &crc_data[..471]) {
-            return Err(NdbError::InvalidNdbHeaderPartialCrc(crc_partial).into());
-        }
+        let (partial, rest) = crc_data.split_at_mut(471);
+        f.read_exact(partial)?;
+        problems::check_crc(
+            ProblemKind::HeaderCrc,
+            Some(0),
+            "HEADER dwCRCPartial",
+            crc_partial,
+            compute_crc(0, partial),
+            || NdbError::InvalidNdbHeaderPartialCrc(crc_partial).into(),
+        )?;
 
-        let mut cursor = Cursor::new(crc_data);
+        let mut cursor = Cursor::new(&*partial);
 
         // wMagicClient
         let magic = cursor.read_u16::<LittleEndian>()?;
-        if magic != HEADER_MAGIC_CLIENT && magic != HEADER_MAGIC_CLIENT_OST {
-            return Err(NdbError::InvalidNdbHeaderMagicClientValue(magic).into());
-        }
+        check_field(
+            magic == HEADER_MAGIC_CLIENT || magic == HEADER_MAGIC_CLIENT_OST,
+            "HEADER wMagicClient",
+            magic,
+            || NdbError::InvalidNdbHeaderMagicClientValue(magic),
+        )?;
 
         // wVer
         let ndb_version = NdbVersion::try_from(cursor.read_u16::<LittleEndian>()?)?;
@@ -235,35 +274,48 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
             return Err(NdbError::AnsiPstVersion(ndb_version as u16).into());
         }
 
-        let mut crc_data = cursor.into_inner();
-        f.read_exact(&mut crc_data[471..])?;
+        f.read_exact(rest)?;
 
         // dwCRCFull
         let crc_full = f.read_u32::<LittleEndian>()?;
-        if crc_full != compute_crc(0, &crc_data) {
-            return Err(NdbError::InvalidNdbHeaderFullCrc(crc_full).into());
-        }
+        problems::check_crc(
+            ProblemKind::HeaderCrc,
+            Some(0),
+            "HEADER dwCRCFull",
+            crc_full,
+            compute_crc(0, &crc_data),
+            || NdbError::InvalidNdbHeaderFullCrc(crc_full).into(),
+        )?;
 
         let mut cursor = Cursor::new(crc_data);
         cursor.seek(SeekFrom::Start(4))?;
 
-        // wVerClient: Outlook 2013 and later write 12 in the 4 KiB layout.
+        // wVerClient: 12 in OSTs.
         let version = cursor.read_u16::<LittleEndian>()?;
-        if version != NDB_CLIENT_VERSION && ndb_version != NdbVersion::Unicode4k {
-            return Err(NdbError::InvalidNdbHeaderClientVersion(version).into());
-        }
+        check_field(
+            valid_client_version(version),
+            "HEADER wVerClient",
+            version,
+            || NdbError::InvalidNdbHeaderClientVersion(version),
+        )?;
 
         // bPlatformCreate
         let platform_create = cursor.read_u8()?;
-        if platform_create != NDB_PLATFORM_CREATE {
-            return Err(NdbError::InvalidNdbHeaderPlatformCreate(platform_create).into());
-        }
+        check_field(
+            platform_create == NDB_PLATFORM_CREATE,
+            "HEADER bPlatformCreate",
+            platform_create,
+            || NdbError::InvalidNdbHeaderPlatformCreate(platform_create),
+        )?;
 
         // bPlatformAccess
         let platform_access = cursor.read_u8()?;
-        if platform_access != NDB_PLATFORM_ACCESS {
-            return Err(NdbError::InvalidNdbHeaderPlatformAccess(platform_access).into());
-        }
+        check_field(
+            platform_access == NDB_PLATFORM_ACCESS,
+            "HEADER bPlatformAccess",
+            platform_access,
+            || NdbError::InvalidNdbHeaderPlatformAccess(platform_access),
+        )?;
 
         // dwReserved1
         let reserved1 = cursor.read_u32::<LittleEndian>()?;
@@ -294,9 +346,9 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
 
         // dwAlign
         let align = cursor.read_u32::<LittleEndian>()?;
-        if align != 0 {
-            return Err(NdbError::InvalidNdbHeaderAlignValue(align).into());
-        }
+        check_field(align == 0, "HEADER dwAlign", align, || {
+            NdbError::InvalidNdbHeaderAlignValue(align)
+        })?;
 
         // rgbFM
         let mut free_map = [0; 128];
@@ -308,18 +360,21 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
 
         // bSentinel
         let sentinel = cursor.read_u8()?;
-        if sentinel != NDB_SENTINEL {
-            return Err(NdbError::InvalidNdbHeaderSentinelValue(sentinel).into());
-        }
+        check_field(
+            sentinel == NDB_SENTINEL,
+            "HEADER bSentinel",
+            sentinel,
+            || NdbError::InvalidNdbHeaderSentinelValue(sentinel),
+        )?;
 
         // bCryptMethod
         let crypt_method = NdbCryptMethod::try_from(cursor.read_u8()?)?;
 
         // rgbReserved
         let reserved = cursor.read_u16::<LittleEndian>()?;
-        if reserved != 0 {
-            return Err(NdbError::InvalidNdbHeaderReservedValue(reserved).into());
-        }
+        check_field(reserved == 0, "HEADER rgbReserved", reserved, || {
+            NdbError::InvalidNdbHeaderReservedValue(reserved)
+        })?;
 
         // bidNextB
         let next_block = UnicodeBlockId::read(&mut cursor)?;
@@ -443,17 +498,26 @@ impl HeaderReadWrite<AnsiPstFile> for AnsiHeader {
 
         let mut crc_data = [0_u8; 504];
         f.read_exact(&mut crc_data)?;
-        if crc_partial != compute_crc(0, &crc_data[..471]) {
-            return Err(NdbError::InvalidNdbHeaderPartialCrc(crc_partial).into());
-        }
+        let (partial, _) = crc_data.split_at(471);
+        problems::check_crc(
+            ProblemKind::HeaderCrc,
+            Some(0),
+            "HEADER dwCRCPartial",
+            crc_partial,
+            compute_crc(0, partial),
+            || NdbError::InvalidNdbHeaderPartialCrc(crc_partial).into(),
+        )?;
 
         let mut cursor = Cursor::new(crc_data);
 
         // wMagicClient
         let magic = cursor.read_u16::<LittleEndian>()?;
-        if magic != HEADER_MAGIC_CLIENT && magic != HEADER_MAGIC_CLIENT_OST {
-            return Err(NdbError::InvalidNdbHeaderMagicClientValue(magic).into());
-        }
+        check_field(
+            magic == HEADER_MAGIC_CLIENT || magic == HEADER_MAGIC_CLIENT_OST,
+            "HEADER wMagicClient",
+            magic,
+            || NdbError::InvalidNdbHeaderMagicClientValue(magic),
+        )?;
 
         // wVer
         let version = NdbVersion::try_from(cursor.read_u16::<LittleEndian>()?)?;
@@ -463,21 +527,30 @@ impl HeaderReadWrite<AnsiPstFile> for AnsiHeader {
 
         // wVerClient
         let version = cursor.read_u16::<LittleEndian>()?;
-        if version != NDB_CLIENT_VERSION {
-            return Err(NdbError::InvalidNdbHeaderClientVersion(version).into());
-        }
+        check_field(
+            valid_client_version(version),
+            "HEADER wVerClient",
+            version,
+            || NdbError::InvalidNdbHeaderClientVersion(version),
+        )?;
 
         // bPlatformCreate
         let platform_create = cursor.read_u8()?;
-        if platform_create != NDB_PLATFORM_CREATE {
-            return Err(NdbError::InvalidNdbHeaderPlatformCreate(platform_create).into());
-        }
+        check_field(
+            platform_create == NDB_PLATFORM_CREATE,
+            "HEADER bPlatformCreate",
+            platform_create,
+            || NdbError::InvalidNdbHeaderPlatformCreate(platform_create),
+        )?;
 
         // bPlatformAccess
         let platform_access = cursor.read_u8()?;
-        if platform_access != NDB_PLATFORM_ACCESS {
-            return Err(NdbError::InvalidNdbHeaderPlatformAccess(platform_access).into());
-        }
+        check_field(
+            platform_access == NDB_PLATFORM_ACCESS,
+            "HEADER bPlatformAccess",
+            platform_access,
+            || NdbError::InvalidNdbHeaderPlatformAccess(platform_access),
+        )?;
 
         // dwReserved1
         let reserved1 = cursor.read_u32::<LittleEndian>()?;
@@ -513,25 +586,31 @@ impl HeaderReadWrite<AnsiPstFile> for AnsiHeader {
 
         // bSentinel
         let sentinel = cursor.read_u8()?;
-        if sentinel != NDB_SENTINEL {
-            return Err(NdbError::InvalidNdbHeaderSentinelValue(sentinel).into());
-        }
+        check_field(
+            sentinel == NDB_SENTINEL,
+            "HEADER bSentinel",
+            sentinel,
+            || NdbError::InvalidNdbHeaderSentinelValue(sentinel),
+        )?;
 
         // bCryptMethod
         let crypt_method = NdbCryptMethod::try_from(cursor.read_u8()?)?;
 
         // rgbReserved
         let reserved = cursor.read_u16::<LittleEndian>()?;
-        if reserved != 0 {
-            return Err(NdbError::InvalidNdbHeaderReservedValue(reserved).into());
-        }
+        check_field(reserved == 0, "HEADER rgbReserved", reserved, || {
+            NdbError::InvalidNdbHeaderReservedValue(reserved)
+        })?;
 
         // ullReserved, dwReserved (total 12 bytes)
         let mut reserved = [0_u8; 12];
         cursor.read_exact(&mut reserved)?;
-        if reserved != [0; 12] {
-            return Err(NdbError::InvalidNdbHeaderAnsiReservedBytes.into());
-        }
+        check_field(
+            reserved == [0; 12],
+            "HEADER ullReserved and dwReserved",
+            reserved,
+            || NdbError::InvalidNdbHeaderAnsiReservedBytes,
+        )?;
 
         // rgbReserved2, bReserved, rgbReserved3 (total 36 bytes)
         let mut reserved3 = [0_u8; 36];

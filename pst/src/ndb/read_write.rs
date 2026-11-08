@@ -354,8 +354,8 @@ fn read_btree_entries<Entry: BTreeEntryReadWrite>(
 }
 
 /// Read a Unicode BTree page, in either layout: 512-byte pages, or the 4 KiB pages of Outlook
-/// 2013 and later OSTs, told apart by where a trailer with a matching CRC sits. Returns the page's
-/// bytes and whether it is a 4 KiB page.
+/// 2013 and later OSTs, told apart by where a trailer with a matching CRC sits, or, when neither
+/// matches, by the file's header. Returns the page's bytes and whether it is a 4 KiB page.
 pub(crate) fn read_unicode_btree_page(f: &mut dyn Read) -> io::Result<(Vec<u8>, bool)> {
     let mut page = vec![0_u8; PAGE_SIZE];
     f.read_exact(&mut page)?;
@@ -365,11 +365,14 @@ pub(crate) fn read_unicode_btree_page(f: &mut dyn Read) -> io::Result<(Vec<u8>, 
     let mut rest = vec![0_u8; UNICODE_4K_PAGE_SIZE.saturating_sub(PAGE_SIZE)];
     if f.read_exact(&mut rest).is_ok() {
         page.extend_from_slice(&rest);
-        if is_btree_page(&page, UNICODE_4K_PAGE_TRAILER_OFFSET) {
+        // Neither CRC matches: the file's header tells which layout it has.
+        if is_btree_page(&page, UNICODE_4K_PAGE_TRAILER_OFFSET)
+            || crate::problems::large_pages() == Some(true)
+        {
             return Ok((page, true));
         }
     }
-    // Neither: parse it as a 512-byte page, to report what is wrong with it.
+    // Parse it as a 512-byte page, to report what is wrong with it.
     page.truncate(PAGE_SIZE);
     Ok((page, false))
 }
@@ -427,7 +430,12 @@ where
         if !large {
             let padding = cursor.read_u32::<LittleEndian>()?;
             if padding != 0 {
-                return Err(NdbError::InvalidBTreePagePadding(padding).into());
+                crate::problems::check(
+                    crate::problems::ProblemKind::PageField,
+                    None,
+                    || format!("BTPAGE dwPadding is 0x{padding:08X}"),
+                    || NdbError::InvalidBTreePagePadding(padding).into(),
+                )?;
             }
         }
 
@@ -439,9 +447,14 @@ where
         }
 
         let crc = compute_crc(0, buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         // rgentries
         let entries = read_btree_entries(
@@ -516,9 +529,14 @@ where
         }
 
         let crc = compute_crc(0, buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         // rgentries
         let entries = read_btree_entries(entries_data, entry_count, entry_size, false)?;
@@ -571,9 +589,14 @@ where
         }
         trailer.verify_block_id(false)?;
         let crc = compute_crc(0, &data);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidBlockCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::BlockCrc,
+            None,
+            &format!("block 0x{:X}", trailer.block_id().into_u64()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidBlockCrc(crc).into(),
+        )?;
 
         match encoding {
             NdbCryptMethod::Cyclic => {
@@ -665,9 +688,14 @@ where
         trailer.verify_block_id(true)?;
 
         let crc = compute_crc(0, &data);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidBlockCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::BlockCrc,
+            None,
+            &format!("block 0x{:X}", trailer.block_id().into_u64()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidBlockCrc(crc).into(),
+        )?;
 
         Ok(Self::new(header, entries, trailer)?)
     }

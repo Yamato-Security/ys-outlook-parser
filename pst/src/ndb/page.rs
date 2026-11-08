@@ -332,9 +332,14 @@ impl<const PAGE_TYPE: u8> MapPageReadWrite<UnicodePstFile, PAGE_TYPE>
         }
 
         let crc = compute_crc(0, &map_bits);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self { map_bits, trailer })
     }
@@ -394,9 +399,14 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::AllocationMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
@@ -438,9 +448,14 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::AllocationPageMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
@@ -482,9 +497,14 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::FreeMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
@@ -526,9 +546,14 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::FreePageMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
@@ -699,9 +724,14 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             backfill_complete,
@@ -825,9 +855,14 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             backfill_complete,
@@ -2021,30 +2056,8 @@ where
     <Self as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
 {
     fn read<R: PstReader>(f: &mut R, block: <Pst as PstFile>::PageRef) -> io::Result<Self> {
-        f.seek(SeekFrom::Start(block.index().index().into()))?;
-
-        // A Unicode page may be a 4 KiB page, whose cEnt and cEntMax are two bytes each.
-        let (buffer, level_offset) = if LeafPage::BTREE_ENTRIES_SIZE == UNICODE_BTREE_ENTRIES_SIZE {
-            match read_unicode_btree_page(f)? {
-                (page, true) => (page, UNICODE_4K_BTREE_ENTRIES_SIZE + 5),
-                (page, false) => (page, UNICODE_BTREE_ENTRIES_SIZE + 3),
-            }
-        } else {
-            let mut buffer = vec![0_u8; PAGE_SIZE];
-            f.read_exact(&mut buffer)?;
-            (buffer, LeafPage::BTREE_ENTRIES_SIZE.saturating_add(3))
-        };
-        let mut cursor = Cursor::new(buffer);
-
-        cursor.seek(SeekFrom::Start(level_offset as u64))?;
-        let level = cursor.read_u8()?;
-
-        cursor.seek(SeekFrom::Start(0))?;
-        Ok(if level == 0 {
-            Self::Leaf(Box::new(LeafPage::read(&mut cursor)?))
-        } else {
-            Self::Intermediate(Box::new(IntermediatePage::read(&mut cursor)?), PhantomData)
-        })
+        let offset: u64 = block.index().index().into();
+        crate::problems::at_offset(offset, || Self::read_at(f, offset))
     }
 
     fn find_entry<R: PstReader>(
@@ -2076,11 +2089,40 @@ where
     <Self as RootBTree>::IntermediatePage: RootBTreeIntermediatePageReadWrite<Pst, Entry, LeafPage>,
     <Self as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
 {
+    /// [`RootBTreeReadWrite::read`] of the page at `offset`.
+    fn read_at<R: PstReader>(f: &mut R, offset: u64) -> io::Result<Self> {
+        f.seek(SeekFrom::Start(offset))?;
+
+        // A Unicode page may be a 4 KiB page, whose cEnt and cEntMax are two bytes each.
+        let (buffer, level_offset) = if LeafPage::BTREE_ENTRIES_SIZE == UNICODE_BTREE_ENTRIES_SIZE {
+            match read_unicode_btree_page(f)? {
+                (page, true) => (page, UNICODE_4K_BTREE_ENTRIES_SIZE + 5),
+                (page, false) => (page, UNICODE_BTREE_ENTRIES_SIZE + 3),
+            }
+        } else {
+            let mut buffer = vec![0_u8; PAGE_SIZE];
+            f.read_exact(&mut buffer)?;
+            (buffer, LeafPage::BTREE_ENTRIES_SIZE.saturating_add(3))
+        };
+        let mut cursor = Cursor::new(buffer);
+
+        cursor.seek(SeekFrom::Start(level_offset as u64))?;
+        let level = cursor.read_u8()?;
+
+        cursor.seek(SeekFrom::Start(0))?;
+        Ok(if level == 0 {
+            Self::Leaf(Box::new(LeafPage::read(&mut cursor)?))
+        } else {
+            Self::Intermediate(Box::new(IntermediatePage::read(&mut cursor)?), PhantomData)
+        })
+    }
+
     /// Look `key` up below this page. `path` holds the file offsets of the pages the lookup went
     /// through: a page that is already on it (a page that refers to itself or to a page above it)
     /// ends the lookup with an error, and so does a path longer than [`MAX_BTREE_DEPTH`]. A page
-    /// whose `cLevel` is not below its parent's is followed: files written by some tools hold such
-    /// stale references, and the path check is what guarantees the lookup ends.
+    /// whose `cLevel` is not below its parent's is a [`Problem`](crate::Problem) (an error when
+    /// reading strictly) and is followed: files written by some tools hold such stale references,
+    /// and the path check is what guarantees the lookup ends.
     fn find_entry_on_path<R: PstReader>(
         &self,
         f: &mut R,
@@ -2110,6 +2152,19 @@ where
                     Some(page) => page,
                     None => <Self as RootBTreeReadWrite>::read(f, block)?,
                 };
+                if page.level() >= self.level() {
+                    let (child, parent) = (page.level(), self.level());
+                    let checked = crate::problems::check(
+                        crate::problems::ProblemKind::PageField,
+                        Some(offset),
+                        || format!("BTPAGE cLevel {child} under a page of cLevel {parent}"),
+                        || NdbError::InvalidBTreeChildPageLevel(offset, child, parent).into(),
+                    );
+                    if let Err(err) = checked {
+                        page_cache.insert(block.block(), page);
+                        return Err(err);
+                    }
+                }
                 path.push(offset);
                 let entry = page.find_entry_on_path(f, key, page_cache, path);
                 path.pop();
@@ -2272,6 +2327,9 @@ mod tests {
     fn test_btree_page_that_points_at_itself() {
         let mut file = Vec::new();
         put_page(&mut file, 0x400, 1, Some(0x400));
+        // Strictly, the page is not below itself; leniently, it is on its own path.
+        assert!(find(&file, 0x400).is_err());
+        let (_scope, _log) = crate::problems::lenient_scope();
         let err = find(&file, 0x400).unwrap_err();
         assert!(err.to_string().contains("lookup path"), "{err}");
     }
@@ -2284,7 +2342,14 @@ mod tests {
         put_page(&mut file, 0x400, 1, Some(0x600));
         put_page(&mut file, 0x600, 2, Some(0x800));
         put_page(&mut file, 0x800, 0, None);
+        let err = find(&file, 0x400).unwrap_err();
+        assert!(err.to_string().contains("cLevel"), "{err}");
+        let (_scope, log) = crate::problems::lenient_scope();
         assert!(find(&file, 0x400).is_ok());
+        let problems = log.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind(), crate::ProblemKind::PageField);
+        assert_eq!(problems[0].offset(), Some(0x600));
     }
 
     #[test]
@@ -2296,6 +2361,8 @@ mod tests {
             put_page(&mut file, 0x400 * (i + 1), 1, Some(0x400 * (i + 2)));
         }
         put_page(&mut file, 0x400 * (depth + 1), 0, None);
+        assert!(find(&file, 0x400).is_err());
+        let (_scope, _log) = crate::problems::lenient_scope();
         let err = find(&file, 0x400).unwrap_err();
         assert!(err.to_string().contains("deeper"), "{err}");
     }

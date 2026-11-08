@@ -81,9 +81,14 @@ where
         .get(..size)
         .ok_or(NdbError::InvalidBlockSize(stored_size))?;
     let stored_crc = compute_crc(0, stored);
-    if stored_crc != crc {
-        return Err(NdbError::InvalidBlockCrc(stored_crc).into());
-    }
+    crate::problems::check_crc(
+        crate::problems::ProblemKind::BlockCrc,
+        Some(block.block().index().index().into()),
+        &format!("block 0x{:X}", block.block().block().into_u64()),
+        crc,
+        stored_crc,
+        || NdbError::InvalidBlockCrc(stored_crc).into(),
+    )?;
 
     let data = if inflated_size == block.size() {
         stored.to_vec()
@@ -730,6 +735,20 @@ impl IntermediateTreeBlockReadWrite for AnsiDataTreeBlock {
 
 pub type DataBlockCache<Pst> = BTreeMap<<Pst as PstFile>::BlockId, DataTree<Pst>>;
 
+/// An intermediate block of `level` under one of `parent_level`: a problem when its level is not
+/// below its parent's (an error when reading strictly). The walk's limits end the walk either way.
+fn check_child_level(level: u8, parent_level: u8, offset: u64) -> io::Result<()> {
+    if level < parent_level {
+        return Ok(());
+    }
+    crate::problems::check(
+        crate::problems::ProblemKind::BlockField,
+        Some(offset),
+        || format!("intermediate block of cLevel {level} under one of cLevel {parent_level}"),
+        || NdbError::InvalidInternalBlockLevel(level).into(),
+    )
+}
+
 /// The most levels of intermediate blocks a data tree or sub-node tree is walked through below
 /// its root: MS-PST has at most 2 (an XXBLOCK over XBLOCKs) and 1 (an SIBLOCK over SLBLOCKs).
 pub const MAX_BLOCK_TREE_DEPTH: usize = 8;
@@ -811,6 +830,19 @@ where
     <Pst as PstFile>::DataBlock: BlockReadWrite,
 {
     pub fn read<R>(
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block: &<Pst as PstFile>::BlockBTreeEntry,
+    ) -> io::Result<Self>
+    where
+        R: PstReader,
+    {
+        crate::problems::at_offset(block.block().index().index().into(), || {
+            Self::read_at(f, encoding, block)
+        })
+    }
+
+    fn read_at<R>(
         f: &mut R,
         encoding: NdbCryptMethod,
         block: &<Pst as PstFile>::BlockBTreeEntry,
@@ -930,6 +962,7 @@ where
         walk: &mut TreeWalk,
         entry: <Pst as PstFile>::BlockId,
         depth: usize,
+        parent_level: u8,
     ) -> io::Result<Self>
     where
         R: PstReader,
@@ -954,10 +987,21 @@ where
         if depth > MAX_BLOCK_TREE_DEPTH {
             return Err(NdbError::BlockTreeTooDeep(entry.search_key().into()).into());
         }
-        Ok(match block_cache.remove(&entry) {
+        let data_tree = match block_cache.remove(&entry) {
             Some(data_tree) => data_tree,
             None => Self::read(&mut *f, encoding, &data_block)?,
-        })
+        };
+        if let Self::Intermediate(_) = &data_tree
+            && let Err(err) = check_child_level(
+                data_tree.level(),
+                parent_level,
+                data_block.block().index().index().into(),
+            )
+        {
+            block_cache.insert(entry, data_tree);
+            return Err(err);
+        }
+        Ok(data_tree)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1004,6 +1048,7 @@ where
                         walk,
                         entry.block(),
                         depth,
+                        block.header().level(),
                     )?;
                     let result = data_tree.collect_blocks(
                         f,
@@ -1209,6 +1254,7 @@ where
                     walk,
                     entry.block(),
                     depth,
+                    block.header().level(),
                 )?;
                 let result = data_tree.collect_sub_entries(
                     f,
@@ -1407,7 +1453,12 @@ impl IntermediateTreeHeaderReadWrite for UnicodeSubNodeTreeBlockHeader {
 
         let padding = f.read_u32::<LittleEndian>()?;
         if padding != 0 {
-            return Err(NdbError::InvalidSubNodeBlockPadding(padding).into());
+            crate::problems::check(
+                crate::problems::ProblemKind::BlockField,
+                None,
+                || format!("SIBLOCK or SLBLOCK dwPadding is 0x{padding:08X}"),
+                || NdbError::InvalidSubNodeBlockPadding(padding).into(),
+            )?;
         }
 
         Ok(Self::new(level, entry_count))
@@ -1729,6 +1780,15 @@ where
         f: &mut R,
         block: &<Pst as PstFile>::BlockBTreeEntry,
     ) -> io::Result<Self> {
+        crate::problems::at_offset(block.block().index().index().into(), || {
+            Self::read_at(f, block)
+        })
+    }
+
+    fn read_at<R: PstReader>(
+        f: &mut R,
+        block: &<Pst as PstFile>::BlockBTreeEntry,
+    ) -> io::Result<Self> {
         if let Some(inflated_size) = block.inflated_size() {
             let (data, trailer) = read_4k_block::<Pst, R>(f, block, inflated_size)?;
             let header =
@@ -1840,8 +1900,15 @@ where
                         NdbError::BlockTreeTooDeep(entry.block().search_key().into()).into(),
                     );
                 }
-                let block = block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
-                let page = Self::read(f, &block)?;
+                let child = block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
+                let page = Self::read(f, &child)?;
+                if let Self::Intermediate(_) = &page {
+                    check_child_level(
+                        page.level(),
+                        block.header().level(),
+                        child.block().index().index().into(),
+                    )?;
+                }
                 page.find_entry_at(f, block_btree, node, page_cache, depth.saturating_add(1))
             }
             Self::Leaf(block) => {
@@ -1929,6 +1996,7 @@ where
         match self {
             Self::Intermediate(block) => {
                 let depth = depth.saturating_add(1);
+                let level = block.header().level();
                 for entry in block.entries() {
                     let block =
                         block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
@@ -1939,6 +2007,13 @@ where
                         );
                     }
                     let sub_nodes = Self::read(f, &block)?;
+                    if let Self::Intermediate(_) = &sub_nodes {
+                        check_child_level(
+                            sub_nodes.level(),
+                            level,
+                            block.block().index().index().into(),
+                        )?;
+                    }
                     sub_nodes.collect_entries(f, block_btree, page_cache, walk, entries, depth)?;
                 }
                 Ok(())
@@ -2114,9 +2189,18 @@ mod tests {
         let mut blocks = Blocks::default();
         blocks.put(0x000, 0x102, &xblock(2, &[0x106]));
         blocks.put(0x040, 0x106, &xblock(2, &[0x102]));
+        // Strictly, the second XXBLOCK is not below the first.
+        let err = all_blocks(&blocks, 0x102).unwrap_err();
+        assert!(err.to_string().contains("cLevel"), "{err}");
+        // Leniently that is a problem, and the loop back to the first is the error.
+        let (_scope, log) = crate::problems::lenient_scope();
         let err = all_blocks(&blocks, 0x102).unwrap_err();
         assert!(err.to_string().contains("twice"), "{err}");
         assert!(read_all(&blocks, 0x102).is_err());
+        assert_eq!(
+            log.problems()[0].kind(),
+            crate::problems::ProblemKind::BlockField
+        );
     }
 
     #[test]
@@ -2132,11 +2216,14 @@ mod tests {
             blocks.put(0x40 * (i as usize + 1), bid, &xblock(1, &[child]));
             child = bid;
         }
+        // Strictly, an XBLOCK under an XBLOCK is the error.
+        assert!(all_blocks(&blocks, child).is_err());
+        let (_scope, _log) = crate::problems::lenient_scope();
         let err = all_blocks(&blocks, child).unwrap_err();
         assert!(err.to_string().contains("deeper"), "{err}");
         assert!(read_all(&blocks, child).is_err());
 
-        // The same chain within the limit reads.
+        // The same chain within the limit reads, leniently.
         let mut blocks = Blocks::default();
         blocks.put(0x000, 0x104, b"data");
         blocks.put(0x040, 0x202, &xblock(1, &[0x104]));
