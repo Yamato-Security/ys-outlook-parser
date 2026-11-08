@@ -1,0 +1,24 @@
+# Yamato Security's reader for Outlook .msg and .oft files ([MS-OXMSG]), read-only, for
+# forensics: not published.
+[package]
+name = "ys-outlook-parser-msg"
+description = "Outlook .msg and .oft files (MS-OXMSG) for forensics"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords = ["outlook", "msg", "oft", "forensics", "mapi"]
+categories.workspace = true
+
+[lib]
+name = "outlook_msg"
+
+[dependencies]
+cfb.workspace = true
+compressed-rtf.workspace = true
+encoding_rs.workspace = true
+thiserror.workspace = true

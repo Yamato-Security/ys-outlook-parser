@@ -1,5 +1,5 @@
 [workspace]
-members = ["compressed-rtf", "pst"]
+members = ["compressed-rtf", "msg", "pst"]
 resolver = "3"
 
 [workspace.package]
@@ -13,9 +13,11 @@ keywords = ["outlook", "pst", "ost", "forensics", "mapi"]
 categories = ["parser-implementations"]
 
 [workspace.dependencies]
-compressed-rtf = { package = "ys-outlook-parser-rtf", path = "compressed-rtf" }
+compressed-rtf = { package = "ys-outlook-parser-rtf", version = "1.0.0", path = "compressed-rtf" }
 
 byteorder = "1"
+cfb = "0.16"
+encoding_rs = "0.8"
 flate2 = "1"
 thiserror = "2"
 tracing = "0.1"
