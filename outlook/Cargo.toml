@@ -1,0 +1,20 @@
+[package]
+name = "ys-outlook-parser"
+description = "Outlook artifacts for forensics: PST and OST stores, MSG and OFT items"
+publish = false
+authors = ["Zach Mathis (@yamatosecurity)"]
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "outlook"
+
+[dependencies]
+compressed-rtf.workspace = true
+outlook-pst = { package = "ys-outlook-parser-pst", path = "../pst" }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["compressed-rtf", "msg", "pst"]
+members = ["compressed-rtf", "msg", "outlook", "pst"]
 resolver = "3"
 
 [workspace.package]

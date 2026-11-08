@@ -414,6 +414,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ys-outlook-parser"
+version = "1.0.0"
+dependencies = [
+ "ys-outlook-parser-pst",
+ "ys-outlook-parser-rtf",
+]
+
+[[package]]
 name = "ys-outlook-parser-msg"
 version = "1.0.0"
 dependencies = [
