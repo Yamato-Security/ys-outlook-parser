@@ -18,7 +18,10 @@
 //! ## [HN (Heap-on-Node)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/77ce49a3-3772-4d8d-bb2c-2f7520a238a6)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::{
+    cell::OnceCell,
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+};
 
 use super::{read_write::*, *};
 use crate::{
@@ -524,6 +527,20 @@ where
     Pst: PstFile,
 {
     data: Vec<<Pst as PstFile>::DataBlock>,
+    /// Each block's page map (HNPAGEMAP), parsed on its first lookup and kept: an object with
+    /// many properties looks a block up once for each, and a page map holds up to 65,535
+    /// allocations. A page map that does not parse keeps its error's description.
+    page_maps: Vec<OnceCell<Result<HeapNodePageMap, String>>>,
+}
+
+impl<Pst> HeapNodeInner<Pst>
+where
+    Pst: PstFile,
+{
+    fn new(data: Vec<<Pst as PstFile>::DataBlock>) -> Self {
+        let page_maps = data.iter().map(|_| OnceCell::new()).collect();
+        Self { data, page_maps }
+    }
 }
 
 impl<Pst> HeapNodeInner<Pst>
@@ -569,27 +586,11 @@ where
             )?
             .collect();
 
-        Ok(Self { data })
+        Ok(Self::new(data))
     }
 
-    fn header(&self) -> io::Result<HeapNodeHeader> {
-        let data = self.data.first().ok_or(io::ErrorKind::UnexpectedEof)?;
-        let mut cursor = Cursor::new(data.data());
-        let header = HeapNodeHeader::read(&mut cursor)?;
-        Ok(header)
-    }
-
-    fn find_entry<'a>(&'a self, heap_id: HeapId) -> io::Result<&'a [u8]>
-    where
-        <Pst as PstFile>::DataBlock: 'a,
-    {
-        let block_index = heap_id.block_index();
-        let block = self
-            .data
-            .get(block_index as usize)
-            .ok_or(LtpError::HeapBlockIndexNotFound(block_index))?
-            .data();
-
+    /// The page map (HNPAGEMAP) of block `block_index` of the heap, `block`.
+    fn page_map(block_index: u16, block: &[u8]) -> io::Result<HeapNodePageMap> {
         let mut cursor = Cursor::new(block);
 
         let page_map_offset = match block_index {
@@ -608,7 +609,34 @@ where
         };
 
         cursor.seek(SeekFrom::Start(u64::from(page_map_offset)))?;
-        let page_map = HeapNodePageMap::read(&mut cursor)?;
+        HeapNodePageMap::read(&mut cursor)
+    }
+
+    fn header(&self) -> io::Result<HeapNodeHeader> {
+        let data = self.data.first().ok_or(io::ErrorKind::UnexpectedEof)?;
+        let mut cursor = Cursor::new(data.data());
+        let header = HeapNodeHeader::read(&mut cursor)?;
+        Ok(header)
+    }
+
+    fn find_entry<'a>(&'a self, heap_id: HeapId) -> io::Result<&'a [u8]>
+    where
+        <Pst as PstFile>::DataBlock: 'a,
+    {
+        let block_index = heap_id.block_index();
+        let not_found = || LtpError::HeapBlockIndexNotFound(block_index);
+        let block = self
+            .data
+            .get(usize::from(block_index))
+            .ok_or_else(not_found)?
+            .data();
+        let page_map = self
+            .page_maps
+            .get(usize::from(block_index))
+            .ok_or_else(not_found)?
+            .get_or_init(|| Self::page_map(block_index, block).map_err(|err| err.to_string()))
+            .as_ref()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.clone()))?;
         let allocations = page_map.allocations();
 
         let index = heap_id.index()?;
@@ -677,7 +705,7 @@ impl UnicodeHeapNode {
             UnicodeBlockTrailer::new(data.len() as u16, 0, 0, UnicodeBlockId::from(4)).unwrap();
         let block = UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer).unwrap();
         Self {
-            inner: HeapNodeInner { data: vec![block] },
+            inner: HeapNodeInner::new(vec![block]),
         }
     }
 }
@@ -734,7 +762,7 @@ mod tests {
         let trailer =
             UnicodeBlockTrailer::new(block_len as u16, 0, 0, UnicodeBlockId::from(4)).unwrap();
         let block = UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer).unwrap();
-        HeapNodeInner { data: vec![block] }
+        HeapNodeInner::new(vec![block])
     }
 
     #[test]
@@ -764,6 +792,28 @@ mod tests {
         // Offsets that go down.
         let heap = heap_node(64, &[20, 12, 30]);
         assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_page_map_is_parsed_once() {
+        // 30,000 empty allocations and 60,000 lookups, as an object with many properties makes:
+        // the page map was parsed on every lookup (65,535 lookups of 32,000 allocations took
+        // 14.5 s in a release build).
+        let heap = heap_node(12 + 4 + 2 * 30_001, &[12; 30_001]);
+        let start = std::time::Instant::now();
+        for i in 0..60_000_u16 {
+            let entry = heap.find_entry(HeapId::new(1 + i % 2047, 0).unwrap());
+            assert_eq!(entry.unwrap().len(), 0);
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert!(heap.page_maps[0].get().is_some_and(|map| map.is_ok()));
+
+        // A page map that does not parse is an error on every lookup.
+        let heap = heap_node(64, &[20, 12, 30]);
+        for _ in 0..2 {
+            assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_err());
+        }
+        assert!(heap.page_maps[0].get().is_some_and(|map| map.is_err()));
     }
 
     #[test]
