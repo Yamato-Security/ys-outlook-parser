@@ -58,6 +58,8 @@ pub enum LtpError {
     InvalidHeapTreeKeySize(u8),
     #[error("Invalid BTHHEADER cbEnt: 0x{0:02X}")]
     InvalidHeapTreeDataSize(u8),
+    #[error("BTH node 0x{0:08X} is in its tree twice: a loop or a corrupt heap")]
+    HeapTreeLoop(u32),
     #[error("Missing HID hidBlockIndex: {0}")]
     HeapBlockIndexNotFound(u16),
     #[error("Missing HID hidIndex: {0}")]

@@ -149,6 +149,10 @@ impl MessageProperties {
     }
 }
 
+/// The most levels of messages embedded in messages that are read: a message attached to a
+/// message in a folder is 1 level down. An attachment loop in a corrupt file ends here.
+pub const MAX_EMBEDDED_MESSAGE_DEPTH: usize = 64;
+
 pub trait Message {
     fn store(&self) -> Rc<dyn Store>;
     fn properties(&self) -> &MessageProperties;
@@ -165,6 +169,7 @@ where
     sub_nodes: MessageSubNodes<Pst>,
     recipient_table: Option<Rc<dyn TableContext>>,
     attachment_table: Option<Rc<dyn TableContext>>,
+    depth: usize,
 }
 
 impl<Pst> MessageInner<Pst>
@@ -245,14 +250,19 @@ where
             node_btree.find_entry(file, node_key, &mut page_cache)?
         };
 
-        Self::read_embedded(store, node, prop_ids)
+        Self::read_embedded(store, node, prop_ids, 0)
     }
 
     fn read_embedded(
         store: Rc<<Pst as PstFile>::Store>,
         node: <Pst as PstFile>::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        depth: usize,
     ) -> io::Result<Self> {
+        if depth > MAX_EMBEDDED_MESSAGE_DEPTH {
+            return Err(MessagingError::EmbeddedMessageTooDeep(depth).into());
+        }
+
         let pst = store.pst();
         let header = pst.header();
         let root = header.root();
@@ -374,6 +384,7 @@ where
             sub_nodes,
             recipient_table,
             attachment_table,
+            depth,
         })
     }
 }
@@ -428,9 +439,14 @@ impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
         store: Rc<UnicodeStore>,
         node: UnicodeNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        depth: usize,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids)?;
+        let inner = MessageInner::read_embedded(store, node, prop_ids, depth)?;
         Ok(Rc::new(Self { inner }))
+    }
+
+    fn embedded_depth(&self) -> usize {
+        self.inner.depth
     }
 
     fn pst_store(&self) -> &Rc<UnicodeStore> {
@@ -488,9 +504,14 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
         store: Rc<AnsiStore>,
         node: AnsiNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        depth: usize,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids)?;
+        let inner = MessageInner::read_embedded(store, node, prop_ids, depth)?;
         Ok(Rc::new(Self { inner }))
+    }
+
+    fn embedded_depth(&self) -> usize {
+        self.inner.depth
     }
 
     fn pst_store(&self) -> &Rc<AnsiStore> {
@@ -499,5 +520,28 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
 
     fn sub_nodes(&self) -> &AnsiMessageSubNodes {
         &self.inner.sub_nodes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ndb::node_id::NID_ROOT_FOLDER;
+
+    #[test]
+    fn test_embedded_message_depth_limit() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Empty.pst");
+        let store =
+            UnicodeStore::read(Rc::new(crate::UnicodePstFile::open(path).unwrap())).unwrap();
+        let node = store.pst().read_node(NID_ROOT_FOLDER).unwrap();
+        let err = <UnicodeMessage as MessageReadWrite<UnicodePstFile>>::read_embedded(
+            store,
+            node,
+            None,
+            MAX_EMBEDDED_MESSAGE_DEPTH + 1,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("levels down"), "{err}");
     }
 }

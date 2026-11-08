@@ -2053,31 +2053,92 @@ where
         key: <Pst as PstFile>::BTreeKey,
         page_cache: &mut RootBTreePageCache<Self>,
     ) -> io::Result<Entry> {
+        self.find_entry_on_path(f, key, page_cache, &mut Vec::new())
+    }
+}
+
+/// The most pages a BTree lookup goes through below the root page: MS-PST allows 8 levels.
+pub const MAX_BTREE_DEPTH: usize = 16;
+
+impl<Pst, Entry, IntermediatePage, LeafPage> RootBTreePage<Pst, Entry, IntermediatePage, LeafPage>
+where
+    Pst: PstFile,
+    <Pst as PstFile>::BlockId: BlockIdReadWrite,
+    <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
+    <Pst as PstFile>::BlockRef: BlockRefReadWrite,
+    <Pst as PstFile>::PageRef: BlockRefReadWrite,
+    <Pst as PstFile>::PageTrailer: PageTrailerReadWrite,
+    <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite + Into<u64>,
+    Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey> + BTreeEntryReadWrite,
+    IntermediatePage: RootBTreeIntermediatePage<Pst, Entry, LeafPage>,
+    LeafPage: RootBTreeLeafPage<Pst, Entry = Entry>,
+    <Self as RootBTree>::Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey> + BTreeEntryReadWrite,
+    <Self as RootBTree>::IntermediatePage: RootBTreeIntermediatePageReadWrite<Pst, Entry, LeafPage>,
+    <Self as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
+{
+    /// Look `key` up below this page. `path` holds the file offsets of the pages the lookup went
+    /// through: a page that is already on it (a page that refers to itself or to a page above it)
+    /// ends the lookup with an error, and so does a path longer than [`MAX_BTREE_DEPTH`]. A page
+    /// whose `cLevel` is not below its parent's is followed: files written by some tools hold such
+    /// stale references, and the path check is what guarantees the lookup ends.
+    fn find_entry_on_path<R: PstReader>(
+        &self,
+        f: &mut R,
+        key: <Pst as PstFile>::BTreeKey,
+        page_cache: &mut RootBTreePageCache<Self>,
+        path: &mut Vec<u64>,
+    ) -> io::Result<Entry> {
         let search_key: u64 = key.into();
         match self {
             Self::Intermediate(page, ..) => {
-                let entries = <Self::IntermediatePage as BTreePage>::entries(page);
-                let index = entries.partition_point(|entry| entry.key().into() <= search_key);
+                let entries = <IntermediatePage as BTreePage>::entries(page);
+                let index =
+                    entries.partition_point(|entry| Into::<u64>::into(entry.key()) <= search_key);
                 let entry = index
                     .checked_sub(1)
                     .and_then(|index| entries.get(index))
                     .ok_or(NdbError::BTreePageNotFound(search_key))?;
                 let block = entry.block();
+                let offset: u64 = block.index().index().into();
+                if path.contains(&offset) {
+                    return Err(NdbError::BTreePageLoop(offset).into());
+                }
+                if path.len() >= MAX_BTREE_DEPTH {
+                    return Err(NdbError::BTreeTooDeep(offset).into());
+                }
                 let page = match page_cache.remove(&block.block()) {
                     Some(page) => page,
                     None => <Self as RootBTreeReadWrite>::read(f, block)?,
                 };
-                let entry = page.find_entry(f, key, page_cache);
+                path.push(offset);
+                let entry = page.find_entry_on_path(f, key, page_cache, path);
+                path.pop();
                 page_cache.insert(block.block(), page);
                 entry
             }
             Self::Leaf(page) => {
-                let entry = <Self::LeafPage as BTreePage>::entries(page)
+                let entry = <LeafPage as BTreePage>::entries(page)
                     .iter()
-                    .find(|entry| entry.key().into() == search_key)
+                    .find(|entry| Into::<u64>::into(entry.key()) == search_key)
                     .ok_or(NdbError::BTreePageNotFound(search_key))?;
                 Ok(*entry)
             }
+        }
+    }
+}
+
+impl<Pst, Entry, IntermediatePage, LeafPage> RootBTreePage<Pst, Entry, IntermediatePage, LeafPage>
+where
+    Pst: PstFile,
+    Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>,
+    IntermediatePage: RootBTreeIntermediatePage<Pst, Entry, LeafPage>,
+    LeafPage: RootBTreeLeafPage<Pst, Entry = Entry>,
+{
+    /// The page's `cLevel`: 0 for a leaf page, 1 to 8 for an intermediate page.
+    pub fn level(&self) -> u8 {
+        match self {
+            Self::Intermediate(page, ..) => page.level(),
+            Self::Leaf(_) => 0,
         }
     }
 }
@@ -2155,3 +2216,87 @@ impl NodeBTreeReadWrite<UnicodePstFile, UnicodeNodeBTreeEntry> for UnicodeNodeBT
 pub type AnsiNodeBTree = AnsiBTree<AnsiNodeBTreeEntry, AnsiNodeBTreePage>;
 impl NodeBTree<AnsiPstFile, AnsiNodeBTreeEntry> for AnsiNodeBTree {}
 impl NodeBTreeReadWrite<AnsiPstFile, AnsiNodeBTreeEntry> for AnsiNodeBTree {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A 512-byte Unicode node BTree page at `offset` of `file`, with a valid CRC: an
+    /// intermediate page of `level` whose one entry leads to the page at `child`, or a leaf page
+    /// (`child` of `None`) with one entry for NID 0x21.
+    fn put_page(file: &mut Vec<u8>, offset: usize, level: u8, child: Option<usize>) {
+        if file.len() < offset + PAGE_SIZE {
+            file.resize(offset + PAGE_SIZE, 0);
+        }
+        let page = &mut file[offset..offset + PAGE_SIZE];
+        page.fill(0);
+        match child {
+            Some(child) => {
+                page[8..16].copy_from_slice(&(child as u64).to_le_bytes());
+                page[16..24].copy_from_slice(&(child as u64).to_le_bytes());
+                page[488..492].copy_from_slice(&[1, 20, 24, level]);
+            }
+            None => {
+                page[0..8].copy_from_slice(&0x21_u64.to_le_bytes());
+                page[488..492].copy_from_slice(&[1, 15, 32, 0]);
+            }
+        }
+        let crc = compute_crc(0, &page[..496]);
+        page[496] = PageType::NodeBTree as u8;
+        page[497] = PageType::NodeBTree as u8;
+        page[500..504].copy_from_slice(&crc.to_le_bytes());
+        page[504..512].copy_from_slice(&(offset as u64).to_le_bytes());
+    }
+
+    fn find(file: &[u8], root: usize) -> io::Result<UnicodeNodeBTreeEntry> {
+        let mut f = Cursor::new(file.to_vec());
+        let root = UnicodePageRef::new(
+            UnicodePageId::from(root as u64),
+            UnicodeByteIndex::new(root as u64),
+        );
+        let btree = UnicodeNodeBTree::read(&mut f, root)?;
+        btree.find_entry(&mut f, 0x21, &mut Default::default())
+    }
+
+    #[test]
+    fn test_btree_lookup() {
+        let mut file = Vec::new();
+        put_page(&mut file, 0x400, 2, Some(0x600));
+        put_page(&mut file, 0x600, 1, Some(0x800));
+        put_page(&mut file, 0x800, 0, None);
+        assert_eq!(u32::from(find(&file, 0x400).unwrap().node()), 0x21);
+    }
+
+    #[test]
+    fn test_btree_page_that_points_at_itself() {
+        let mut file = Vec::new();
+        put_page(&mut file, 0x400, 1, Some(0x400));
+        let err = find(&file, 0x400).unwrap_err();
+        assert!(err.to_string().contains("lookup path"), "{err}");
+    }
+
+    #[test]
+    fn test_btree_level_that_goes_up() {
+        // A level-1 page over a level-2 page over a leaf: a stale reference some writers leave,
+        // followed because the path is finite.
+        let mut file = Vec::new();
+        put_page(&mut file, 0x400, 1, Some(0x600));
+        put_page(&mut file, 0x600, 2, Some(0x800));
+        put_page(&mut file, 0x800, 0, None);
+        assert!(find(&file, 0x400).is_ok());
+    }
+
+    #[test]
+    fn test_btree_deeper_than_the_limit() {
+        // Distinct pages, each the only child of the one before: deeper than any BTree.
+        let mut file = Vec::new();
+        let depth = MAX_BTREE_DEPTH + 4;
+        for i in 0..depth {
+            put_page(&mut file, 0x400 * (i + 1), 1, Some(0x400 * (i + 2)));
+        }
+        put_page(&mut file, 0x400 * (depth + 1), 0, None);
+        let err = find(&file, 0x400).unwrap_err();
+        assert!(err.to_string().contains("deeper"), "{err}");
+    }
+}

@@ -20,6 +20,7 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use core::mem;
 use std::{
+    collections::BTreeSet,
     io::{self, Cursor, Read, Write},
     marker::PhantomData,
 };
@@ -273,7 +274,18 @@ where
             return Ok(Default::default());
         }
 
-        let mut next_level = vec![header.root()];
+        // Each heap allocation at most once: a record that points back at its own node or at a
+        // node above it is an error, and the walk reads no more than the heap holds, whatever
+        // bIdxLevels says.
+        let mut visited = BTreeSet::from([u32::from(self.user_root)]);
+        let mut visit = |heap_id: HeapId| {
+            if visited.insert(u32::from(heap_id)) {
+                Ok(heap_id)
+            } else {
+                Err(LtpError::HeapTreeLoop(u32::from(heap_id)))
+            }
+        };
+        let mut next_level = vec![visit(header.root())?];
 
         for _ in 0..header.levels() {
             for heap_id in mem::take(&mut next_level).into_iter() {
@@ -283,7 +295,9 @@ where
                     // An intermediate record's value is an HID.
                     4,
                 )?;
-                next_level.extend(rows.into_iter().map(|row| row.next_level()));
+                for row in rows {
+                    next_level.push(visit(row.next_level())?);
+                }
             }
         }
 
@@ -412,6 +426,7 @@ where
 mod tests {
     use super::super::prop_context::{PropertyTreeRecordKey, PropertyTreeRecordValue};
     use super::*;
+    use crate::ltp::read_write::HeapTreeReadWrite;
 
     type Record = HeapTreeLeafEntry<PropertyTreeRecordKey, PropertyTreeRecordValue>;
 
@@ -420,6 +435,45 @@ mod tests {
         bytes.extend_from_slice(&prop_type.to_le_bytes());
         bytes.extend_from_slice(&value.to_le_bytes());
         bytes
+    }
+
+    /// A BTH header (BTHHEADER) for property records.
+    fn bth_header(levels: u8, root: u32) -> Vec<u8> {
+        let mut header = vec![HeapNodeType::Tree as u8, 2, 6, levels];
+        header.extend_from_slice(&root.to_le_bytes());
+        header
+    }
+
+    fn heap_tree(
+        allocations: &[Vec<u8>],
+    ) -> UnicodeHeapTree<PropertyTreeRecordKey, PropertyTreeRecordValue> {
+        let heap = UnicodeHeapNode::for_test(allocations);
+        <UnicodeHeapTree<_, _> as HeapTreeReadWrite<UnicodePstFile>>::new(heap, HeapId::from(0x20))
+    }
+
+    #[test]
+    fn test_bth_levels() {
+        // One index level over a leaf of two records.
+        let leaf = [record(0x0E07, 0x0003, 1), record(0x0E08, 0x0003, 2)].concat();
+        let index = [0x07_u8, 0x0E, 0x60, 0, 0, 0].to_vec();
+        let tree = heap_tree(&[bth_header(1, 0x40), index, leaf]);
+        assert_eq!(tree.entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_bth_index_record_that_points_at_itself() {
+        // An index record whose HID is its own node: before, each level re-read it, and a
+        // bIdxLevels of 255 multiplied the records 255 times over.
+        let index = [0x07_u8, 0x0E, 0x40, 0, 0, 0].to_vec();
+        let tree = heap_tree(&[bth_header(255, 0x40), index]);
+        let err = tree.entries().unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
+
+        // Two index records for the same node below.
+        let leaf = record(0x0E07, 0x0003, 1);
+        let index = [0x07_u8, 0x0E, 0x60, 0, 0, 0, 0x08, 0x0E, 0x60, 0, 0, 0].to_vec();
+        let tree = heap_tree(&[bth_header(1, 0x40), index, leaf]);
+        assert!(tree.entries().is_err());
     }
 
     #[test]

@@ -17,7 +17,12 @@
 
 //! ## [Folders](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/dee5b9d0-5513-4c5e-94aa-8bd28a9350b2)
 
-use std::{cell::OnceCell, collections::BTreeMap, io, rc::Rc};
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet},
+    io,
+    rc::Rc,
+};
 
 use super::{read_write::*, store::*, *};
 use crate::{
@@ -122,6 +127,84 @@ pub trait Folder {
     fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn contents_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn associated_table(&self) -> Option<&Rc<dyn TableContext>>;
+}
+
+/// The most levels of sub-folders [`walk_folders`] goes down from the root folder.
+pub const MAX_FOLDER_DEPTH: usize = 256;
+
+/// A folder [`walk_folders`] reached.
+pub struct FolderWalkEntry {
+    /// The folder's node ID.
+    pub node_id: NodeId,
+    /// The folder whose hierarchy table lists it: `None` for the root folder.
+    pub parent: Option<NodeId>,
+    /// How many levels below the root folder it is.
+    pub depth: usize,
+    /// The folder, or why it could not be opened.
+    pub folder: io::Result<Rc<dyn Folder>>,
+}
+
+/// Every folder reachable from the root folder ([`NID_ROOT_FOLDER`]) through the hierarchy
+/// tables, depth first and in table order: see [`walk_folders`].
+pub struct FolderWalk<'a> {
+    store: &'a dyn Store,
+    stack: Vec<(NodeId, Option<NodeId>, usize)>,
+    visited: BTreeSet<u32>,
+}
+
+/// Walk every folder reachable from the root folder through the hierarchy tables, depth first
+/// and in table order.
+///
+/// Each folder comes once, even when hierarchy tables list it more than once or a corrupt table
+/// lists a folder above it (a loop). A folder that cannot be opened comes with its error, and its
+/// sub-folders are not walked; neither are those of a folder [`MAX_FOLDER_DEPTH`] levels down.
+pub fn walk_folders(store: &dyn Store) -> FolderWalk<'_> {
+    FolderWalk {
+        store,
+        stack: vec![(NID_ROOT_FOLDER, None, 0)],
+        visited: Default::default(),
+    }
+}
+
+impl Iterator for FolderWalk<'_> {
+    type Item = FolderWalkEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((node_id, parent, depth)) = self.stack.pop() {
+            if !self.visited.insert(u32::from(node_id)) {
+                continue;
+            }
+            let folder = self
+                .store
+                .properties()
+                .make_entry_id(node_id)
+                .and_then(|entry_id| self.store.open_folder(&entry_id));
+            if let Ok(folder) = &folder
+                && depth < MAX_FOLDER_DEPTH
+                && let Some(table) = folder.hierarchy_table()
+            {
+                let children: Vec<_> = table
+                    .rows_matrix()
+                    .map(|row| NodeId::from(u32::from(row.id())))
+                    .filter(|child| !self.visited.contains(&u32::from(*child)))
+                    .collect();
+                let depth = depth.saturating_add(1);
+                self.stack.extend(
+                    children
+                        .into_iter()
+                        .rev()
+                        .map(|child| (child, Some(node_id), depth)),
+                );
+            }
+            return Some(FolderWalkEntry {
+                node_id,
+                parent,
+                depth,
+                folder,
+            });
+        }
+        None
+    }
 }
 
 struct FolderInner<Pst>
@@ -384,5 +467,212 @@ impl FolderReadWrite<AnsiPstFile> for AnsiFolder {
     fn read(store: Rc<AnsiStore>, entry_id: &EntryId) -> io::Result<Rc<Self>> {
         let inner = FolderInner::read(store, entry_id)?;
         Ok(Rc::new(Self { inner }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ltp::{
+        heap::HeapId,
+        table_context::{TableContextInfo, TableRowColumnValue, TableRowData, TableRowId},
+    };
+    use crate::messaging::{
+        message::Message, named_prop::NamedPropertyMap, search::SearchUpdateQueue,
+    };
+
+    /// A store whose folders are only node IDs and hierarchy tables.
+    struct MockStore {
+        properties: StoreProperties,
+        children: BTreeMap<u32, Vec<u32>>,
+    }
+
+    struct MockFolder {
+        properties: FolderProperties,
+        hierarchy_table: Option<Rc<dyn TableContext>>,
+    }
+
+    struct MockTable {
+        context: TableContextInfo,
+        rows: Vec<TableRowData>,
+    }
+
+    impl TableContext for MockTable {
+        fn context(&self) -> &TableContextInfo {
+            &self.context
+        }
+
+        fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a TableRowData>> {
+            Box::new(self.rows.iter())
+        }
+
+        fn find_row(&self, id: TableRowId) -> crate::ltp::LtpResult<&TableRowData> {
+            Err(crate::ltp::LtpError::TableRowIdNotFound(u32::from(id)))
+        }
+
+        fn read_column(
+            &self,
+            _value: &TableRowColumnValue,
+            _prop_type: PropertyType,
+        ) -> io::Result<PropertyValue> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    impl Folder for MockFolder {
+        fn store(&self) -> Rc<dyn Store> {
+            unimplemented!()
+        }
+
+        fn properties(&self) -> &FolderProperties {
+            &self.properties
+        }
+
+        fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>> {
+            self.hierarchy_table.as_ref()
+        }
+
+        fn contents_table(&self) -> Option<&Rc<dyn TableContext>> {
+            None
+        }
+
+        fn associated_table(&self) -> Option<&Rc<dyn TableContext>> {
+            None
+        }
+    }
+
+    impl Store for MockStore {
+        fn properties(&self) -> &StoreProperties {
+            &self.properties
+        }
+
+        fn root_hierarchy_table(&self) -> io::Result<Rc<dyn TableContext>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        fn unique_value(&self) -> u32 {
+            0
+        }
+
+        fn open_folder(&self, entry_id: &EntryId) -> io::Result<Rc<dyn Folder>> {
+            let node_id = u32::from(entry_id.node_id());
+            let children = self
+                .children
+                .get(&node_id)
+                .ok_or(io::Error::from(io::ErrorKind::NotFound))?;
+            let rows = children
+                .iter()
+                .map(|child| {
+                    TableRowData::new(TableRowId::new(*child), 0, vec![], vec![], vec![], vec![])
+                })
+                .collect();
+            let context = TableContextInfo::new(8, 8, 8, 8, HeapId::from(0), None, vec![]).unwrap();
+            Ok(Rc::new(MockFolder {
+                properties: FolderProperties {
+                    node_id: entry_id.node_id(),
+                    properties: Default::default(),
+                },
+                hierarchy_table: Some(Rc::new(MockTable { context, rows })),
+            }))
+        }
+
+        fn open_message(
+            &self,
+            _entry_id: &EntryId,
+            _prop_ids: Option<&[u16]>,
+        ) -> io::Result<Rc<dyn Message>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        fn named_property_map(&self) -> io::Result<Rc<dyn NamedPropertyMap>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        fn search_update_queue(&self) -> io::Result<Rc<dyn SearchUpdateQueue>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    fn mock_store(children: &[(u32, &[u32])]) -> MockStore {
+        MockStore {
+            properties: StoreProperties::for_test([7; 16]),
+            children: children
+                .iter()
+                .map(|(folder, children)| (*folder, children.to_vec()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_walk_folders_with_a_loop() {
+        // The root lists 0x8022 twice; 0x8022 lists 0x8042, itself and the root; 0x8042 lists
+        // 0x8022 again and a folder that cannot be opened.
+        let store = mock_store(&[
+            (0x122, &[0x8022, 0x8022]),
+            (0x8022, &[0x8042, 0x8022, 0x122]),
+            (0x8042, &[0x8022, 0x8062]),
+        ]);
+        let folders: Vec<_> = walk_folders(&store)
+            .map(|entry| {
+                (
+                    u32::from(entry.node_id),
+                    entry.parent.map(u32::from),
+                    entry.depth,
+                    entry.folder.is_ok(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            folders,
+            [
+                (0x122, None, 0, true),
+                (0x8022, Some(0x122), 1, true),
+                (0x8042, Some(0x8022), 2, true),
+                (0x8062, Some(0x8042), 3, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_walk_folders_depth_limit() {
+        // A chain of folders deeper than MAX_FOLDER_DEPTH.
+        let chain: Vec<(u32, Vec<u32>)> = (0..MAX_FOLDER_DEPTH as u32 + 10)
+            .map(|i| {
+                let folder = if i == 0 { 0x122 } else { 0x8002 + 0x20 * i };
+                (folder, vec![0x8002 + 0x20 * (i + 1)])
+            })
+            .collect();
+        let children: Vec<(u32, &[u32])> = chain
+            .iter()
+            .map(|(folder, children)| (*folder, children.as_slice()))
+            .collect();
+        let store = mock_store(&children);
+        let depths: Vec<_> = walk_folders(&store).map(|entry| entry.depth).collect();
+        assert_eq!(depths.len(), MAX_FOLDER_DEPTH + 1);
+        assert_eq!(depths.last(), Some(&MAX_FOLDER_DEPTH));
+    }
+
+    #[test]
+    fn test_walk_folders() {
+        let store = crate::open_store(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Empty.pst"
+        ))
+        .unwrap();
+        let folders: Vec<_> = walk_folders(store.as_ref()).collect();
+        assert_eq!(folders.len(), 6);
+        assert_eq!(folders[0].node_id, NID_ROOT_FOLDER);
+        assert_eq!((folders[0].parent, folders[0].depth), (None, 0));
+        for entry in &folders[1..] {
+            assert!(entry.folder.is_ok());
+            assert!(entry.parent.is_some() && entry.depth > 0);
+        }
+        let mut ids: Vec<_> = folders
+            .iter()
+            .map(|entry| u32::from(entry.node_id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 6);
     }
 }

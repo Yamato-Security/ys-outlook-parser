@@ -16,6 +16,8 @@
 
 #![allow(dead_code)]
 
+pub mod craft;
+
 use outlook_pst::{
     UnicodePstFile,
     messaging::{attachment::*, message::*, store::*},

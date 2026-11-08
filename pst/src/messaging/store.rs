@@ -178,6 +178,19 @@ pub struct StoreProperties {
 }
 
 impl StoreProperties {
+    /// Store properties with only a PidTagRecordKey, for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(record_key: [u8; 16]) -> Self {
+        Self {
+            properties: BTreeMap::from([(
+                0x0FF9,
+                PropertyValue::Binary(crate::ltp::prop_context::BinaryValue::new(
+                    record_key.to_vec(),
+                )),
+            )]),
+        }
+    }
+
     pub fn get(&self, id: u16) -> Option<&PropertyValue> {
         self.properties.get(&id)
     }

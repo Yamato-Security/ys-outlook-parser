@@ -378,6 +378,7 @@ where
                     store.clone(),
                     node,
                     prop_ids,
+                    message.embedded_depth().saturating_add(1),
                 )?,
             )),
             None => data,

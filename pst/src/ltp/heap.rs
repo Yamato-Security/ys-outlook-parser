@@ -650,6 +650,38 @@ impl HeapNodeReadWrite<UnicodePstFile> for UnicodeHeapNode {
     }
 }
 
+#[cfg(test)]
+impl UnicodeHeapNode {
+    /// A heap node of one block holding `allocations`, at HIDs 0x20, 0x40 and so on, with the
+    /// first as its user root.
+    pub(crate) fn for_test(allocations: &[Vec<u8>]) -> Self {
+        use crate::ndb::{block::UnicodeBlockTrailer, block_id::UnicodeBlockId};
+
+        let mut data = vec![0_u8; 12];
+        data[2] = 0xEC;
+        data[3] = HeapNodeType::Properties as u8;
+        data[4..8].copy_from_slice(&0x20_u32.to_le_bytes());
+        let mut offsets = vec![data.len() as u16];
+        for allocation in allocations {
+            data.extend_from_slice(allocation);
+            offsets.push(data.len() as u16);
+        }
+        let page_map = data.len() as u16;
+        data[0..2].copy_from_slice(&page_map.to_le_bytes());
+        data.extend_from_slice(&(allocations.len() as u16).to_le_bytes());
+        data.extend_from_slice(&0_u16.to_le_bytes());
+        for offset in offsets {
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+        let trailer =
+            UnicodeBlockTrailer::new(data.len() as u16, 0, 0, UnicodeBlockId::from(4)).unwrap();
+        let block = UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer).unwrap();
+        Self {
+            inner: HeapNodeInner { data: vec![block] },
+        }
+    }
+}
+
 pub struct AnsiHeapNode {
     inner: HeapNodeInner<AnsiPstFile>,
 }

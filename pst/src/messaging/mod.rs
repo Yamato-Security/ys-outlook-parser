@@ -143,6 +143,8 @@ pub enum MessagingError {
     UnknownAttachmentMethod(i32),
     #[error("Missing attachment Sub-Node on message: {0:?}")]
     AttachmentSubNodeNotFound(crate::ndb::node_id::NodeId),
+    #[error("Embedded message {0} levels down, more than MAX_EMBEDDED_MESSAGE_DEPTH")]
+    EmbeddedMessageTooDeep(usize),
     #[error("Missing PidTagAttachDataObject on afEmbeddedMessage attachment")]
     AttachmentMessageObjectDataNotFound,
     #[error("Invalid PidTagAttachDataObject on afEmbeddedMessage attachment: {0:?}")]

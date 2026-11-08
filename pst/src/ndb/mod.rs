@@ -106,6 +106,10 @@ pub enum NdbError {
     InvalidBTreePagePadding(u32),
     #[error("BTENTRY not found: 0x{0:X}")]
     BTreePageNotFound(u64),
+    #[error("BTree page at 0x{0:X} is on its own lookup path: a loop or a corrupt page")]
+    BTreePageLoop(u64),
+    #[error("BTree lookup deeper than MAX_BTREE_DEPTH, at the page at 0x{0:X}")]
+    BTreeTooDeep(u64),
     #[error("Invalid NBTENTRY nid: 0x{0:X}")]
     InvalidNodeBTreeEntryNodeId(u64),
     #[error("Invalid BLOCKTRAILER cb: 0x{0:X}")]
@@ -130,6 +134,12 @@ pub enum NdbError {
     InvalidSubNodeBlockPadding(u32),
     #[error("Sub-node not found: {0:?}")]
     SubNodeNotFound(NodeId),
+    #[error("Block 0x{0:X} is in its data or sub-node tree twice: a loop or a corrupt block")]
+    BlockTreeLoop(u64),
+    #[error("Data or sub-node tree holds more than the file, at block 0x{0:X}")]
+    BlockTreeTooLarge(u64),
+    #[error("Data or sub-node tree deeper than MAX_BLOCK_TREE_DEPTH, at block 0x{0:X}")]
+    BlockTreeTooDeep(u64),
 }
 
 impl From<NdbError> for io::Error {
