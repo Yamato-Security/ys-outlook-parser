@@ -35,6 +35,17 @@
 //! println!("{:?} {:?}", msg.item.subject, msg.item.attachments.len());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! A value that cannot be read cleanly is a [`Value::Damaged`]: its bytes as stored, why it is
+//! damaged, and what could be recovered of it: text with an invalid UTF-16 code unit, for
+//! example, is recovered with U+FFFD in its place, and text with an odd number of bytes without
+//! its last byte. The `as_` methods of [`Value`] and [`Value::best_effort`] read the recovered
+//! value.
+//!
+//! When a property is stored more than once (a `.msg` file can hold it both as Unicode and as
+//! ANSI text), an item's fields take a clean value before a damaged one, then Unicode before
+//! ANSI; the HTML body takes binary `PidTagHtml` first, then Unicode, then ANSI. Every stored
+//! version stays in the item's properties.
 
 // It reads what the readers give, from untrusted files: no unchecked indexing or arithmetic,
 // and no unwrap, expect or panic.

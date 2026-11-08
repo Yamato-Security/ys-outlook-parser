@@ -69,18 +69,6 @@ against panics on damaged input. So the fork:
 No Rust reader of `.msg` files we found was usable as it is, so `msg/` is written from the open
 specifications.
 
-## Reading recovered values
-
-An item's text fields prefer clean Unicode over ANSI fallbacks. Its HTML body prefers the
-binary representation, then Unicode, then ANSI; a clean value takes precedence over a damaged
-one. The source properties remain available regardless of which representation is displayed.
-
-Malformed Unicode is a `Value::Damaged` containing the recovered text, original invalid bytes
-and a reason. Use the `Value::as_str`, `as_bytes`, `as_multiple` and other `as_` methods, or
-`Value::best_effort`, to inspect recovered values, including nested recovery records. For
-low-level PST/OST Unicode values, `UnicodeValue::trailing_byte()` exposes an unmatched final byte
-of an unterminated string. Bytes after a string terminator remain padding.
-
 ## Validation
 
 **PST and OST, against libpff** (pypff 20260926, used only as an external oracle): 66 PST and OST
