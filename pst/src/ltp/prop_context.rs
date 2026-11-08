@@ -711,14 +711,17 @@ impl PropertyValueReadWrite for PropertyValue {
             }
 
             PropertyType::MultipleGuid => {
-                let count = f.read_u32::<LittleEndian>()? as usize;
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let data1 = f.read_u32::<LittleEndian>()?;
-                    let data2 = f.read_u16::<LittleEndian>()?;
-                    let data3 = f.read_u16::<LittleEndian>()?;
+                // markdown-extract: like the other fixed-size multi-valued types (and as `write`
+                // stores it), the GUIDs are concatenated, with no count in front.
+                let mut values = Vec::new();
+                let mut guid = [0_u8; 16];
+                while f.read_exact(&mut guid).is_ok() {
+                    let mut cursor = guid.as_slice();
+                    let data1 = cursor.read_u32::<LittleEndian>()?;
+                    let data2 = cursor.read_u16::<LittleEndian>()?;
+                    let data3 = cursor.read_u16::<LittleEndian>()?;
                     let mut data4 = [0; 8];
-                    f.read_exact(&mut data4)?;
+                    cursor.read_exact(&mut data4)?;
                     values.push(GuidValue {
                         data1,
                         data2,

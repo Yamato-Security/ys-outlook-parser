@@ -1343,6 +1343,13 @@ pub trait BlockBTreeEntry: BTreeEntry {
     fn block(&self) -> Self::Block;
     fn size(&self) -> u16;
     fn ref_count(&self) -> u16;
+
+    /// For an entry from a page in the 4 KiB layout of Outlook 2013 and later OSTs, the block's
+    /// size once inflated. Such a block sits in a 512-byte aligned slot with a 24-byte trailer,
+    /// and is zlib-compressed when this differs from [`BlockBTreeEntry::size`].
+    fn inflated_size(&self) -> Option<u16> {
+        None
+    }
 }
 
 #[derive(Copy, Clone, Default, Debug)]
@@ -1351,6 +1358,8 @@ pub struct UnicodeBlockBTreeEntry {
     size: u16,
     ref_count: u16,
     padding: u32,
+    /// The block's size once inflated, for an entry from a page in the 4 KiB layout.
+    inflated_size: Option<u16>,
 }
 
 impl UnicodeBlockBTreeEntry {
@@ -1386,6 +1395,7 @@ impl BTreeEntryReadWrite for UnicodeBlockBTreeEntry {
             size,
             ref_count,
             padding,
+            inflated_size: None,
         })
     }
 
@@ -1394,6 +1404,24 @@ impl BTreeEntryReadWrite for UnicodeBlockBTreeEntry {
         f.write_u16::<LittleEndian>(self.size)?;
         f.write_u16::<LittleEndian>(self.ref_count)?;
         f.write_u32::<LittleEndian>(self.padding)
+    }
+
+    /// In the 4 KiB layout the entry is `BREF`, `cb`, the inflated size, `cRef` and two bytes of
+    /// padding.
+    fn read_4k(f: &mut dyn Read) -> io::Result<Self> {
+        let block = UnicodeBlockRef::read(f)?;
+        let size = f.read_u16::<LittleEndian>()?;
+        let inflated_size = f.read_u16::<LittleEndian>()?;
+        let ref_count = f.read_u16::<LittleEndian>()?;
+        let padding = u32::from(f.read_u16::<LittleEndian>()?);
+
+        Ok(Self {
+            block,
+            size,
+            ref_count,
+            padding,
+            inflated_size: Some(inflated_size),
+        })
     }
 }
 
@@ -1410,6 +1438,10 @@ impl BlockBTreeEntry for UnicodeBlockBTreeEntry {
 
     fn ref_count(&self) -> u16 {
         self.ref_count
+    }
+
+    fn inflated_size(&self) -> Option<u16> {
+        self.inflated_size
     }
 }
 
@@ -2235,11 +2267,20 @@ where
     fn read<R: PstReader>(f: &mut R, block: <Pst as PstFile>::PageRef) -> io::Result<Self> {
         f.seek(SeekFrom::Start(block.index().index().into()))?;
 
-        let mut buffer = [0_u8; PAGE_SIZE];
-        f.read_exact(&mut buffer)?;
+        // A Unicode page may be a 4 KiB page, whose cEnt and cEntMax are two bytes each.
+        let (buffer, level_offset) = if LeafPage::BTREE_ENTRIES_SIZE == UNICODE_BTREE_ENTRIES_SIZE {
+            match read_unicode_btree_page(f)? {
+                (page, true) => (page, UNICODE_4K_BTREE_ENTRIES_SIZE + 5),
+                (page, false) => (page, UNICODE_BTREE_ENTRIES_SIZE + 3),
+            }
+        } else {
+            let mut buffer = vec![0_u8; PAGE_SIZE];
+            f.read_exact(&mut buffer)?;
+            (buffer, LeafPage::BTREE_ENTRIES_SIZE + 3)
+        };
         let mut cursor = Cursor::new(buffer);
 
-        cursor.seek(SeekFrom::Start(LeafPage::BTREE_ENTRIES_SIZE as u64 + 3))?;
+        cursor.seek(SeekFrom::Start(level_offset as u64))?;
         let level = cursor.read_u8()?;
 
         cursor.seek(SeekFrom::Start(0))?;

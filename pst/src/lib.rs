@@ -545,6 +545,12 @@ where
     ///
     /// See also [Transactional Semantics](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/bc5a92df-7fc1-4dc2-9c7c-5677237dd73a).
     fn start_write(&mut self) -> io::Result<()> {
+        if self.header.version() == NdbVersion::Unicode4k {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "files with 4 KiB pages (Outlook 2013 OST) are read-only",
+            ));
+        }
         self.rebuild_allocation_map()?;
         self.ensure_density_list()?;
 

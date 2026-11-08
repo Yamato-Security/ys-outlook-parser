@@ -407,9 +407,11 @@ impl HeapNodePageMap {
             return Err(LtpError::InvalidHeapPageAllocCount(alloc_count));
         }
 
-        if free_count != page_map.free_count {
-            return Err(LtpError::InvalidHeapPageFreeCount(free_count));
-        }
+        // markdown-extract: cFree only counts freed allocations, which a reader
+        // never needs, and writers leave it stale (the EDRM Enron PSTs have
+        // freed items with cFree = 0). Trust the allocation table instead of
+        // refusing the whole heap node.
+        let _ = free_count;
 
         Ok(page_map)
     }

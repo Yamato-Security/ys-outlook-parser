@@ -9,9 +9,118 @@ use std::{
 use tracing::error;
 
 use super::{block_id::*, block_ref::*, byte_index::*, node_id::*, page::*, read_write::*, *};
-use crate::{AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile};
+use crate::{
+    crc::compute_crc,
+    encode::{cyclic, permute},
+    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
+};
 
 pub const MAX_BLOCK_SIZE: u16 = 8192;
+
+/// The size of a block trailer in the 4 KiB layout of Outlook 2013 and later OSTs: the 16 bytes of
+/// [`UnicodeBlockTrailer`], two bytes, the inflated size and four bytes of padding.
+pub const UNICODE_4K_BLOCK_TRAILER_SIZE: usize = 24;
+
+/// Blocks in the 4 KiB layout start on, and fill, slots of a multiple of this size.
+pub const UNICODE_4K_BLOCK_ALIGNMENT: usize = 512;
+
+/// The most data a block holds in the 4 KiB layout, once inflated.
+pub const MAX_UNICODE_4K_BLOCK_DATA_SIZE: u16 = (65536 - UNICODE_4K_BLOCK_TRAILER_SIZE) as u16;
+
+/// Read a block in the 4 KiB layout: check its trailer and CRC, and inflate it if it is
+/// compressed. Returns the (still encoded) data and a trailer describing it as inflated.
+fn read_4k_block<Pst, R>(
+    f: &mut R,
+    block: &<Pst as PstFile>::BlockBTreeEntry,
+    inflated_size: u16,
+) -> io::Result<(Vec<u8>, <Pst as PstFile>::BlockTrailer)>
+where
+    Pst: PstFile,
+    <Pst as PstFile>::BlockId: BlockIdReadWrite,
+    <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
+    R: PstReader,
+{
+    let size = usize::from(block.size());
+    let slot = (size + UNICODE_4K_BLOCK_TRAILER_SIZE).div_ceil(UNICODE_4K_BLOCK_ALIGNMENT)
+        * UNICODE_4K_BLOCK_ALIGNMENT;
+    f.seek(SeekFrom::Start(block.block().index().index().into()))?;
+    let mut buffer = vec![0; slot];
+    f.read_exact(&mut buffer)?;
+
+    let mut trailer = &buffer[slot - UNICODE_4K_BLOCK_TRAILER_SIZE..];
+    let stored_size = trailer.read_u16::<LittleEndian>()?;
+    let signature = trailer.read_u16::<LittleEndian>()?;
+    let crc = trailer.read_u32::<LittleEndian>()?;
+    let block_id = <Pst as PstFile>::BlockId::read(&mut trailer)?;
+    if usize::from(stored_size) != size {
+        return Err(NdbError::InvalidBlockSize(stored_size).into());
+    }
+
+    let stored = &buffer[..size];
+    let stored_crc = compute_crc(0, stored);
+    if stored_crc != crc {
+        return Err(NdbError::InvalidBlockCrc(stored_crc).into());
+    }
+
+    let data = if inflated_size == block.size() {
+        stored.to_vec()
+    } else {
+        let mut data = Vec::with_capacity(usize::from(inflated_size));
+        flate2::read::ZlibDecoder::new(stored)
+            .take(u64::from(inflated_size) + 1)
+            .read_to_end(&mut data)?;
+        if data.len() != usize::from(inflated_size) {
+            return Err(NdbError::InvalidBlockSize(data.len() as u16).into());
+        }
+        data
+    };
+
+    let trailer = <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::new(
+        inflated_size,
+        signature,
+        compute_crc(0, &data),
+        block_id,
+    )?;
+    trailer.verify_block_id(block.block().block().is_internal())?;
+    Ok((data, trailer))
+}
+
+/// Decode a data block's bytes as [`BlockReadWrite::read`] does.
+fn decode_block<Trailer: BlockTrailer>(
+    encoding: NdbCryptMethod,
+    data: &mut [u8],
+    trailer: &Trailer,
+) {
+    match encoding {
+        NdbCryptMethod::Cyclic => cyclic::encode_decode_block(data, trailer.cyclic_key()),
+        NdbCryptMethod::Permute => permute::decode_block(data),
+        _ => {}
+    }
+}
+
+/// An intermediate block (XBLOCK, XXBLOCK, SIBLOCK, SLBLOCK) from its inflated data.
+fn intermediate_block<Block>(
+    data: &[u8],
+    header: Block::Header,
+    trailer: Block::Trailer,
+) -> io::Result<Block>
+where
+    Block: IntermediateTreeBlockReadWrite,
+    Block::Header: IntermediateTreeHeaderReadWrite,
+    Block::Entry: IntermediateTreeEntryReadWrite,
+    Block::Trailer: BlockTrailerReadWrite,
+{
+    let header_size = usize::from(Block::Header::HEADER_SIZE);
+    let entry_count = header.entry_count();
+    if header_size + usize::from(entry_count) * usize::from(Block::Entry::ENTRY_SIZE) > data.len() {
+        return Err(NdbError::InvalidInternalBlockEntryCount(entry_count).into());
+    }
+    let mut cursor = &data[header_size..];
+    let entries = (0..entry_count)
+        .map(|_| Block::Entry::read(&mut cursor))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(Block::new(header, entries, trailer)?)
+}
 
 pub const fn block_size(size: u16) -> u16 {
     assert!(size > 0);
@@ -41,7 +150,8 @@ pub struct UnicodeBlockTrailer {
 
 impl UnicodeBlockTrailer {
     pub fn new(size: u16, signature: u16, crc: u32, block_id: UnicodeBlockId) -> NdbResult<Self> {
-        if !(1..=(MAX_BLOCK_SIZE - Self::SIZE)).contains(&size) {
+        // Blocks in the 4 KiB layout hold up to MAX_UNICODE_4K_BLOCK_DATA_SIZE bytes inflated.
+        if !(1..=MAX_UNICODE_4K_BLOCK_DATA_SIZE).contains(&size) {
             return Err(NdbError::InvalidBlockSize(size));
         }
 
@@ -609,6 +719,19 @@ where
     where
         R: PstReader,
     {
+        if let Some(inflated_size) = block.inflated_size() {
+            let (mut data, trailer) = read_4k_block::<Pst, R>(f, block, inflated_size)?;
+            return Ok(if block.block().block().is_internal() {
+                let header = DataTreeBlockHeader::read(&mut data.as_slice())?;
+                Self::Intermediate(Box::new(intermediate_block(&data, header, trailer)?))
+            } else {
+                decode_block(encoding, &mut data, &trailer);
+                Self::Leaf(Box::new(
+                    <<Pst as PstFile>::DataBlock as BlockReadWrite>::new(encoding, data, trailer)?,
+                ))
+            });
+        }
+
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
         let block_size = block_size(
@@ -1355,6 +1478,19 @@ where
         f: &mut R,
         block: &<Pst as PstFile>::BlockBTreeEntry,
     ) -> io::Result<Self> {
+        if let Some(inflated_size) = block.inflated_size() {
+            let (data, trailer) = read_4k_block::<Pst, R>(f, block, inflated_size)?;
+            let header =
+                <<Pst as PstFile>::SubNodeTreeBlockHeader as IntermediateTreeHeaderReadWrite>::read(
+                    &mut data.as_slice(),
+                )?;
+            return Ok(if header.level() > 0 {
+                Self::Intermediate(Box::new(intermediate_block(&data, header, trailer)?))
+            } else {
+                Self::Leaf(Box::new(intermediate_block(&data, header, trailer)?))
+            });
+        }
+
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
         let block_size = block_size(

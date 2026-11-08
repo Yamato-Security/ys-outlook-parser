@@ -270,6 +270,12 @@ pub trait BTreeEntryReadWrite: BTreeEntry + Copy + Sized + Default {
 
     fn read(f: &mut dyn Read) -> io::Result<Self>;
     fn write(&self, f: &mut dyn Write) -> io::Result<()>;
+
+    /// Read an entry from a page in the 4 KiB layout ([`NdbVersion::Unicode4k`]), where it may
+    /// differ: a block BTree entry carries the block's inflated size.
+    fn read_4k(f: &mut dyn Read) -> io::Result<Self> {
+        Self::read(f)
+    }
 }
 
 pub trait BlockBTreeEntryReadWrite: BlockBTreeEntry + BTreeEntryReadWrite {
@@ -312,23 +318,77 @@ pub trait BTreePageReadWrite: BTreePage + Sized {
 
 pub const UNICODE_BTREE_ENTRIES_SIZE: usize = 488;
 
+/// The size of a page in the 4 KiB layout ([`NdbVersion::Unicode4k`]).
+pub const UNICODE_4K_PAGE_SIZE: usize = 4096;
+
+/// The space for entries in a BTree page of the 4 KiB layout.
+pub const UNICODE_4K_BTREE_ENTRIES_SIZE: usize = 4056;
+
+/// The page trailer's offset in a page of the 4 KiB layout. The trailer is 24 bytes: the 16 of
+/// [`UnicodePageTrailer`] and 8 more.
+pub const UNICODE_4K_PAGE_TRAILER_OFFSET: usize = 4072;
+
+/// Whether `page` holds a BTree page trailer at `offset` whose CRC matches the bytes before it.
+fn is_btree_page(page: &[u8], offset: usize) -> bool {
+    let Some(trailer) = page.get(offset..offset + 8) else {
+        return false;
+    };
+    let page_type = trailer[0];
+    let crc = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+    page_type == trailer[1]
+        && (page_type == PageType::BlockBTree as u8 || page_type == PageType::NodeBTree as u8)
+        && compute_crc(0, &page[..offset]) == crc
+}
+
+/// Read a Unicode BTree page, in either layout: 512-byte pages, or the 4 KiB pages of Outlook
+/// 2013 and later OSTs, told apart by where a trailer with a matching CRC sits. Returns the page's
+/// bytes and whether it is a 4 KiB page.
+pub(crate) fn read_unicode_btree_page(f: &mut dyn Read) -> io::Result<(Vec<u8>, bool)> {
+    let mut page = vec![0_u8; PAGE_SIZE];
+    f.read_exact(&mut page)?;
+    if is_btree_page(&page, UNICODE_BTREE_ENTRIES_SIZE + 8) {
+        return Ok((page, false));
+    }
+    page.resize(UNICODE_4K_PAGE_SIZE, 0);
+    if f.read_exact(&mut page[PAGE_SIZE..]).is_ok()
+        && is_btree_page(&page, UNICODE_4K_PAGE_TRAILER_OFFSET)
+    {
+        return Ok((page, true));
+    }
+    // Neither: parse it as a 512-byte page, to report what is wrong with it.
+    page.truncate(PAGE_SIZE);
+    Ok((page, false))
+}
+
 pub trait UnicodeBTreePageReadWrite<Entry>:
     BTreePageReadWrite<Entry = Entry, Trailer = UnicodePageTrailer> + Sized
 where
     Entry: BTreeEntryReadWrite,
 {
     fn read(f: &mut dyn Read) -> io::Result<Self> {
-        let mut buffer = [0_u8; 496];
-        f.read_exact(&mut buffer)?;
-        let buffer = buffer.as_slice();
+        let (page, large) = read_unicode_btree_page(f)?;
+        let (entries_size, trailer_offset) = if large {
+            (
+                UNICODE_4K_BTREE_ENTRIES_SIZE,
+                UNICODE_4K_PAGE_TRAILER_OFFSET,
+            )
+        } else {
+            (UNICODE_BTREE_ENTRIES_SIZE, UNICODE_BTREE_ENTRIES_SIZE + 8)
+        };
+        let buffer = &page[..trailer_offset];
 
-        let mut cursor = Cursor::new(&buffer[UNICODE_BTREE_ENTRIES_SIZE..]);
+        let mut cursor = Cursor::new(&buffer[entries_size..]);
 
-        // cEnt
-        let entry_count = usize::from(cursor.read_u8()?);
-
-        // cEntMax
-        let max_entries = cursor.read_u8()?;
+        // cEnt, cEntMax: one byte each in 512-byte pages, two in 4 KiB pages.
+        let (entry_count, max_entries) = if large {
+            let entry_count = usize::from(cursor.read_u16::<LittleEndian>()?);
+            let max_entries = cursor.read_u16::<LittleEndian>()?;
+            let max_entries = u8::try_from(max_entries)
+                .map_err(|_| NdbError::InvalidBTreeEntryMaxCount(u8::MAX))?;
+            (entry_count, max_entries)
+        } else {
+            (usize::from(cursor.read_u8()?), cursor.read_u8()?)
+        };
 
         // cbEnt
         let entry_size = cursor.read_u8()?;
@@ -339,7 +399,7 @@ where
         if usize::from(entry_size) < Entry::ENTRY_SIZE {
             return Err(NdbError::InvalidBTreeEntrySize(entry_size).into());
         }
-        if usize::from(max_entries) > UNICODE_BTREE_ENTRIES_SIZE / usize::from(entry_size) {
+        if usize::from(max_entries) > entries_size / usize::from(entry_size) {
             return Err(NdbError::InvalidBTreeEntryMaxCount(max_entries).into());
         }
 
@@ -349,14 +409,16 @@ where
             return Err(NdbError::InvalidBTreePageLevel(level).into());
         }
 
-        // dwPadding
-        let padding = cursor.read_u32::<LittleEndian>()?;
-        if padding != 0 {
-            return Err(NdbError::InvalidBTreePagePadding(padding).into());
+        // dwPadding (10 bytes of padding in 4 KiB pages, not checked)
+        if !large {
+            let padding = cursor.read_u32::<LittleEndian>()?;
+            if padding != 0 {
+                return Err(NdbError::InvalidBTreePagePadding(padding).into());
+            }
         }
 
         // pageTrailer
-        let trailer = UnicodePageTrailer::read(f)?;
+        let trailer = UnicodePageTrailer::read(&mut &page[trailer_offset..])?;
         if trailer.page_type() != PageType::BlockBTree && trailer.page_type() != PageType::NodeBTree
         {
             return Err(NdbError::UnexpectedPageType(trailer.page_type()).into());
@@ -373,7 +435,11 @@ where
             let offset = i * usize::from(entry_size);
             let end = offset + usize::from(entry_size);
             let mut cursor = &buffer[offset..end];
-            entries.push(<Self::Entry as BTreeEntryReadWrite>::read(&mut cursor)?);
+            entries.push(if large {
+                <Self::Entry as BTreeEntryReadWrite>::read_4k(&mut cursor)?
+            } else {
+                <Self::Entry as BTreeEntryReadWrite>::read(&mut cursor)?
+            });
         }
 
         Ok(<Self as BTreePageReadWrite>::new(

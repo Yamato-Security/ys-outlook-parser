@@ -13,6 +13,8 @@ use crate::{crc::compute_crc, AnsiPstFile, PstFile, UnicodePstFile};
 const HEADER_MAGIC: u32 = u32::from_be_bytes(*b"NDB!");
 
 const HEADER_MAGIC_CLIENT: u16 = u16::from_be_bytes(*b"MS");
+/// `wMagicClient` of an OST file.
+const HEADER_MAGIC_CLIENT_OST: u16 = u16::from_be_bytes(*b"OS");
 
 /// `wVer`
 ///
@@ -24,6 +26,9 @@ pub enum NdbVersion {
     Ansi = 15,
     #[default]
     Unicode = 23,
+    /// The Unicode layout with 4 KiB pages, 512-byte block alignment, 24-byte block trailers and
+    /// zlib-compressed blocks, which Outlook 2013 and later use for OST files. Read-only.
+    Unicode4k = 36,
 }
 
 impl TryFrom<u16> for NdbVersion {
@@ -33,6 +38,7 @@ impl TryFrom<u16> for NdbVersion {
         match value {
             14..=15 => Ok(NdbVersion::Ansi),
             23 => Ok(NdbVersion::Unicode),
+            36 => Ok(NdbVersion::Unicode4k),
             _ => Err(NdbError::InvalidNdbVersion(value)),
         }
     }
@@ -92,6 +98,7 @@ where
 
 #[derive(Clone, Debug)]
 pub struct UnicodeHeader {
+    version: NdbVersion,
     next_page: UnicodePageId,
     unique: u32,
     nids: [u32; 32],
@@ -111,6 +118,7 @@ pub struct UnicodeHeader {
 impl UnicodeHeader {
     pub fn new(root: UnicodeRoot, crypt_method: NdbCryptMethod) -> Self {
         Self {
+            version: NdbVersion::Unicode,
             next_page: UnicodePageId::from(1),
             unique: 0,
             nids: NDB_DEFAULT_NIDS,
@@ -130,7 +138,7 @@ impl UnicodeHeader {
 
 impl Header<UnicodePstFile> for UnicodeHeader {
     fn version(&self) -> NdbVersion {
-        NdbVersion::Unicode
+        self.version
     }
 
     fn crypt_method(&self) -> NdbCryptMethod {
@@ -179,14 +187,14 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
 
         // wMagicClient
         let magic = cursor.read_u16::<LittleEndian>()?;
-        if magic != HEADER_MAGIC_CLIENT {
+        if magic != HEADER_MAGIC_CLIENT && magic != HEADER_MAGIC_CLIENT_OST {
             return Err(NdbError::InvalidNdbHeaderMagicClientValue(magic).into());
         }
 
         // wVer
-        let version = NdbVersion::try_from(cursor.read_u16::<LittleEndian>()?)?;
-        if version != NdbVersion::Unicode {
-            return Err(NdbError::AnsiPstVersion(version as u16).into());
+        let ndb_version = NdbVersion::try_from(cursor.read_u16::<LittleEndian>()?)?;
+        if ndb_version == NdbVersion::Ansi {
+            return Err(NdbError::AnsiPstVersion(ndb_version as u16).into());
         }
 
         let mut crc_data = cursor.into_inner();
@@ -201,9 +209,9 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
         let mut cursor = Cursor::new(crc_data);
         cursor.seek(SeekFrom::Start(4))?;
 
-        // wVerClient
+        // wVerClient: Outlook 2013 and later write 12 in the 4 KiB layout.
         let version = cursor.read_u16::<LittleEndian>()?;
-        if version != NDB_CLIENT_VERSION {
+        if version != NDB_CLIENT_VERSION && ndb_version != NdbVersion::Unicode4k {
             return Err(NdbError::InvalidNdbHeaderClientVersion(version).into());
         }
 
@@ -283,6 +291,7 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
         f.read_exact(&mut reserved3)?;
 
         Ok(Self {
+            version: ndb_version,
             next_page,
             unique,
             nids,
@@ -460,7 +469,7 @@ impl HeaderReadWrite<AnsiPstFile> for AnsiHeader {
 
         // wMagicClient
         let magic = cursor.read_u16::<LittleEndian>()?;
-        if magic != HEADER_MAGIC_CLIENT {
+        if magic != HEADER_MAGIC_CLIENT && magic != HEADER_MAGIC_CLIENT_OST {
             return Err(NdbError::InvalidNdbHeaderMagicClientValue(magic).into());
         }
 
