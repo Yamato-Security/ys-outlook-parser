@@ -6,11 +6,12 @@ description = "Outlook .msg and .oft files (MS-OXMSG) for forensics"
 publish = false
 
 version.workspace = true
-authors.workspace = true
+authors = ["Zach Mathis (@yamatosecurity)"]
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-license.workspace = true
+# Our own code, so the RPL only (the rtf crate it uses is under the RPL and MIT)
+license = "RPL-1.5"
 keywords = ["outlook", "msg", "oft", "forensics", "mapi"]
 categories.workspace = true
 
