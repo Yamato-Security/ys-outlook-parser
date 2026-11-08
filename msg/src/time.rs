@@ -42,13 +42,16 @@ pub fn format_filetime(ticks: i64) -> String {
     )
 }
 
-/// An OLE automation date (`PtypFloatingTime`: days since 1899-12-30, the fraction is the time
-/// of day) as FILETIME ticks, rounded to the nearest tick; `None` if not finite or out of the
-/// FILETIME range.
+/// An OLE automation date (`PtypFloatingTime`: days since 1899-12-30, the absolute fraction is
+/// the time of day) as FILETIME ticks, rounded to the nearest tick; `None` if not finite or out
+/// of the FILETIME range.
 pub fn floating_time_to_filetime(days: f64) -> Option<i64> {
     // 1899-12-30 is 109205 days after 1601-01-01.
     const OLE_EPOCH_TICKS: f64 = 109_205.0 * 864_000_000_000.0;
-    let ticks = (days * 864_000_000_000.0 + OLE_EPOCH_TICKS).round();
+    // DATE uses a signed day number but an unsigned time of day ([MS-OAUT] 2.2.25).
+    // Treating it as a continuous count of days moves negative fractional dates backwards.
+    let date = days.trunc() + days.fract().abs();
+    let ticks = (date * 864_000_000_000.0 + OLE_EPOCH_TICKS).round();
     (ticks.is_finite() && ticks >= i64::MIN as f64 && ticks < i64::MAX as f64)
         .then_some(ticks as i64)
 }
@@ -71,6 +74,37 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_times_use_the_absolute_fraction_for_the_time_of_day() {
+        // [MS-OAUT] DATE: the integer selects the day and the absolute fractional part
+        // selects the time. In particular, -0.5 and +0.5 are the same instant.
+        for (days, expected) in [
+            (-0.5, "1899-12-30T12:00:00.0000000Z"),
+            (0.5, "1899-12-30T12:00:00.0000000Z"),
+            (-1.25, "1899-12-29T06:00:00.0000000Z"),
+            (-2.5, "1899-12-28T12:00:00.0000000Z"),
+            (-1.0, "1899-12-29T00:00:00.0000000Z"),
+            (-0.0, "1899-12-30T00:00:00.0000000Z"),
+        ] {
+            assert_eq!(
+                floating_time_to_filetime(days)
+                    .map(format_filetime)
+                    .as_deref(),
+                Some(expected),
+                "OLE DATE {days}"
+            );
+        }
+        for days in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            assert_eq!(floating_time_to_filetime(days), None);
+        }
+    }
 
     #[test]
     fn filetimes() {

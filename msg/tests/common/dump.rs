@@ -171,10 +171,7 @@ impl Out<'_> {
         self.properties(object, &m.properties);
         if let Some(rtf) = &m.rtf {
             match &rtf.rtf {
-                Some(bytes) => {
-                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    self.emit(object, "rtf", sha(&bytes[..end]));
-                }
+                Some(bytes) => self.emit(object, "rtf", sha(bytes)),
                 None => self.emit(object, "rtf", "ERROR:not decompressed"),
             }
         }

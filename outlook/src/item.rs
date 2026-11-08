@@ -222,11 +222,13 @@ impl Attachment {
 pub struct Body {
     /// `PidTagBody`: plain text.
     pub text: Option<String>,
-    /// `PidTagHtml`: HTML, as its bytes (in the message's Internet code page).
+    /// `PidTagHtml`: binary and String8 values keep their bytes (in the message's Internet
+    /// code page); Unicode values are represented as UTF-8. The original property's type
+    /// and value remain in [`Item::properties`].
     pub html: Option<Vec<u8>>,
     /// `PidTagRtfCompressed`: the compressed RTF as stored.
     pub rtf_compressed: Option<Vec<u8>>,
-    /// The RTF it decompresses to, when it does.
+    /// The RTF it decompresses to, when it does, including zero bytes and any padding.
     pub rtf: Option<Vec<u8>>,
 }
 
@@ -429,7 +431,7 @@ impl Item {
             );
             rtf.rtf
         });
-        let html = match p.get(tags::HTML) {
+        let html = match p.get(tags::HTML).and_then(Value::best_effort) {
             Some(Value::String(text)) => Some(text.as_bytes().to_vec()),
             Some(value) => value.as_bytes().map(<[u8]>::to_vec),
             None => None,
@@ -734,6 +736,27 @@ mod tests {
         assert_eq!(subject("\u{1}\u{5}RE: Test".into()), "RE: Test");
         assert_eq!(subject("Test".into()), "Test");
         assert_eq!(subject("\u{1}".into()), "\u{1}");
+    }
+
+    #[test]
+    fn recovered_unicode_html_is_kept_in_the_item_body() {
+        let html = "<p>Recovered 日本語 body</p>";
+        let properties = vec![Property::new(
+            tags::HTML,
+            types::STRING,
+            Value::Damaged {
+                recovered: Some(Box::new(Value::String(html.into()))),
+                raw: html
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .chain([0xFF])
+                    .collect(),
+                reason: "odd UTF-16 byte length".into(),
+            },
+        )];
+        let item = Item::build(properties, Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(item.body.html.as_deref(), Some(html.as_bytes()));
+        assert!(matches!(item.properties[0].value, Value::Damaged { .. }));
     }
 
     #[test]

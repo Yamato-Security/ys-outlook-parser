@@ -52,8 +52,9 @@ Keys and values:
   stream), `none` (extract-msg found the property but gave no value), `ERROR:<exception>`.
 - `r:TAG`: `LEN:SHA` of the raw `__substg1.0_TAG` stream.
 - `att:kind` (attachment objects): `binary`, `message`, `storage` or `none`.
-- `rtf` (message objects with PidTagRtfCompressed): `LEN:SHA` of the decompressed RTF up to its
-  first NUL, decompressed by the `compressed_rtf` Python package (extract-msg's dependency).
+- `rtf` (message objects with PidTagRtfCompressed): `LEN:SHA` of every decompressed RTF byte,
+  including embedded NULs and padding, using the `compressed_rtf` Python package
+  (extract-msg's dependency).
 """
 
 import datetime
@@ -236,7 +237,7 @@ def dump_message(file, obj, msg, storage, ole_streams, ole_storages, depth):
     if any("/".join(p).lower() == rtf_path.lower() for p in ole_streams):
         try:
             rtf = compressed_rtf.decompress(msg.getStream(rtf_path, False) or b"")
-            emit(file, obj, "rtf", sha(rtf.split(b"\0", 1)[0]))
+            emit(file, obj, "rtf", sha(rtf))
         except Exception as e:
             emit(file, obj, "rtf", f"ERROR:{type(e).__name__}")
 

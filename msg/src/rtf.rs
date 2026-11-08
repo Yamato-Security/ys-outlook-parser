@@ -107,9 +107,9 @@ impl fmt::Display for RtfFlag {
 pub struct Rtf {
     /// The header, if the value is at least 16 bytes long.
     pub header: Option<RtfHeader>,
-    /// The decompressed RTF, if it could be decompressed. RTF is 7-bit text with escapes, so
-    /// this is bytes. `compressed_rtf` ends it at the first NUL: writers often pad the RTF
-    /// after its final `}` with a NUL and a few bytes, which are left out.
+    /// The decompressed RTF, if it could be decompressed. Bytes are preserved, including
+    /// zeroes in binary payloads and any padding after the final `}`. Decoding it as a
+    /// NUL-terminated string would lose binary data and the text that follows it.
     pub rtf: Option<Vec<u8>>,
     /// The length of the whole decompressed data, NULs and what follows them included, as the
     /// compressed data gives it (see [`RtfFlag::RawSizeMismatch`]).
@@ -284,10 +284,9 @@ pub fn decompress_rtf(data: &[u8]) -> Rtf {
                 }
             }
         }
-        UNCOMPRESSED => (
-            Cow::Borrowed(body),
-            u64::from(header.raw_size).min(body.len() as u64),
-        ),
+        // [MS-OXRTFCP] 2.2.3.1: read to the end regardless of RAWSIZE. Report the
+        // length we actually recover, including when the declared size is too small.
+        UNCOMPRESSED => (Cow::Borrowed(body), body.len() as u64),
         other => {
             flags.push(RtfFlag::UnknownCompressionType(other));
             return Rtf {
@@ -341,6 +340,45 @@ pub fn decompress_rtf(data: &[u8]) -> Rtf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_rtf_is_preserved_by_the_lenient_reader() {
+        let body = "{\\rtf1\\ansi\\bin3 A\0B tail}";
+        for encoded in [
+            compressed_rtf::compress_rtf(body).unwrap(),
+            compressed_rtf::encode_rtf(body).unwrap(),
+        ] {
+            let rtf = decompress_rtf(&encoded);
+            assert_eq!(rtf.rtf.as_deref(), Some(body.as_bytes()));
+            assert_eq!(rtf.decompressed_len, Some(body.len() as u64));
+            assert!(rtf.flags.is_empty(), "{:?}", rtf.flags);
+        }
+    }
+
+    #[test]
+    fn uncompressed_rtf_reports_the_length_actually_recovered() {
+        let body = r"{\rtf1\ansi body after the declared size}";
+        for declared in [0, 1, body.len() as u32, body.len() as u32 + 1, u32::MAX] {
+            let mut encoded = compressed_rtf::encode_rtf(body).unwrap();
+            encoded[4..8].copy_from_slice(&declared.to_le_bytes());
+            let rtf = decompress_rtf(&encoded);
+            // [MS-OXRTFCP] 2.2.3.1 permits reading MELA to the end regardless of RAWSIZE.
+            // Our lenient reader keeps those bytes; its diagnostics must describe them.
+            assert_eq!(rtf.rtf.as_deref(), Some(body.as_bytes()));
+            assert_eq!(rtf.decompressed_len, Some(body.len() as u64));
+            if declared == body.len() as u32 {
+                assert!(rtf.flags.is_empty(), "{:?}", rtf.flags);
+            } else {
+                assert_eq!(
+                    rtf.flags,
+                    [RtfFlag::RawSizeMismatch {
+                        declared,
+                        actual: body.len() as u64,
+                    }]
+                );
+            }
+        }
+    }
 
     #[test]
     fn crc_matches_compressed_rtf() {

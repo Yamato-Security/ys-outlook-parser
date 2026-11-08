@@ -134,12 +134,9 @@ pub fn decompress_rtf(data: &[u8]) -> Result<String> {
 }
 
 fn string_from_ascii(data: &[u8]) -> String {
-    let data: Vec<_> = data
-        .iter()
-        .copied()
-        .take_while(|b| *b != 0)
-        .map(u16::from)
-        .collect();
+    // RTF can contain binary payloads (\binN), including zero bytes. Its length is
+    // determined by the compression stream, not a string terminator.
+    let data: Vec<_> = data.iter().copied().map(u16::from).collect();
     String::from_utf16_lossy(&data)
 }
 
@@ -258,6 +255,21 @@ mod tests {
     ];
 
     const UNCOMPRESSED_SIMPLE_RTF: &str = "{\\rtf1\\ansi\\ansicpg1252\\pard hello world}\r\n";
+
+    #[test]
+    fn binary_rtf_preserves_zero_bytes_and_the_following_text() {
+        // The \bin payload is bytes, not a NUL-terminated string.
+        let rtf = "{\\rtf1\\ansi\\bin3 A\0B tail}";
+        for encoded in [compress_rtf(rtf).unwrap(), encode_rtf(rtf).unwrap()] {
+            assert_eq!(decompress_rtf(&encoded).unwrap(), rtf);
+        }
+        // Exercise every byte, including dictionary references crossing embedded zeroes.
+        let bytes: String = (0..=255).map(char::from).collect();
+        let rtf = format!("{{\\rtf1\\ansi\\bin512 {bytes}{bytes} tail}}");
+        for encoded in [compress_rtf(&rtf).unwrap(), encode_rtf(&rtf).unwrap()] {
+            assert_eq!(decompress_rtf(&encoded).unwrap(), rtf);
+        }
+    }
 
     /// [Example 1: Simple Compressed RTF](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxrtfcp/029bff74-8c00-402e-ac2b-0210a5f57371)
     #[test]

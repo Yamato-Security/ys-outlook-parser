@@ -97,6 +97,11 @@ libpff's committed output.
 files, 2,404 messages, recipients and attachments, 41,002 properties. 110,114 facts are the same and
 791 differ, each explained (`msg/tests/oracle/`): 601 are extract-msg's errors with FILETIMEs, 35 are
 ANSI files it decodes in the wrong code page, and the others are what it leaves out or adds.
+The RTF comparison covers every decompressed byte, including embedded zeroes and padding.
+
+The unified item model also has regression tests for recovered Unicode HTML. The date helpers
+cover negative fractional OLE Automation dates, and RTF tests exercise binary payloads in both
+LZFu and MELA, plus mismatched declared lengths.
 
 **Damaged input**: crafted files and seeded mutations of the fixtures for each crate (more than
 260,000 mutated `.msg` files and 160,000 mutated PSTs), without a panic, an abort or an unbounded

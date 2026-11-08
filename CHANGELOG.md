@@ -48,3 +48,12 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
   attachment's, so it was never read. (@YamatoSecurity)
 - The store kept its root hierarchy table, which holds the store, so every store leaked.
   (@YamatoSecurity)
+- RTF bodies stopped at the first zero byte, losing binary payloads and any following text.
+  Both LZFu and MELA now preserve all recovered bytes, and the external-oracle comparison
+  checks the whole body, including zeroes and padding. (@YamatoSecurity)
+- A MELA RTF stream with a declared raw size smaller than its payload reported the declared
+  length instead of the recovered length and did not flag the mismatch. (@YamatoSecurity)
+- Negative fractional OLE Automation dates used the fraction as a negative duration instead
+  of an absolute time of day. (@YamatoSecurity)
+- Partially recovered Unicode HTML was kept in the properties but omitted from the unified
+  item body's HTML field. (@YamatoSecurity)
