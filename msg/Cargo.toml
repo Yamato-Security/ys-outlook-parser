@@ -22,3 +22,7 @@ cfb.workspace = true
 compressed-rtf.workspace = true
 encoding_rs.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+sha2.workspace = true

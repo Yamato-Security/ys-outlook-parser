@@ -15,6 +15,8 @@
 
 #![allow(dead_code)]
 
+pub mod dump;
+
 use std::path::{Path, PathBuf};
 
 /// `tests/fixtures`.

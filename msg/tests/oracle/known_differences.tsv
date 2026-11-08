@@ -1,0 +1,10 @@
+# Differences between extract-msg 0.58.2 and outlook_msg that were checked and explained, for
+# compare.py: file, object, key, reason (shell-style patterns). Files are relative to the data
+# root of the comparison (/home/user/outlook-compare/data, or tests/fixtures for the fixtures).
+apache-poi/files/test-data/hsmf/clusterfuzz-testcase-minimized-POIHSMFFuzzer-4735011465854976.msg	file	open	fuzzed file: cfb rejects its FAT (and, read with the missing sectors as zeros, a directory entry name of 6218 bytes)
+apache-poi/files/test-data/hsmf/clusterfuzz-testcase-minimized-POIHSMFFuzzer-5336473854148608.msg	file	open	fuzzed file: cfb rejects a directory entry name of 65535 bytes
+apache-poi/files/test-data/poifs/unknown_properties.msg	file	open	cfb rejects a directory entry name of 70 bytes (the limit is 64)
+*cyclicDirTree.msg	file	open	cfb rejects the cyclic directory tree (intended: malformed CFB test case)
+*cyclicFatRing.msg	file	open	cfb rejects the cyclic directory sector chain (intended: malformed CFB test case)
+msgviewer/files/MSGViewer/src/test/resources/issue127/test.msg	m/a0	*37050003	the attachment has no PidTagAttachMethod: extract-msg adds one (afByValue) to its property store
+*/MSG file with RTF Formatting.msg	m/a0	att:kind	an OLE storage attachment (afStorage): extract-msg has no handler for it (UnsupportedAttachment)
