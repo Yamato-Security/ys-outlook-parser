@@ -625,7 +625,7 @@ impl<F: Read + Seek> Context<'_, F> {
         code_page: u32,
         problems: &mut Problems,
     ) -> (Properties, Option<Child>) {
-        let children = match self.reader.children(path) {
+        let children = match self.reader.children(path, problems) {
             Ok(c) => c,
             Err(e) => {
                 problems.push(path, ProblemKind::Storage, format!("cannot list: {e}"));
@@ -687,7 +687,7 @@ impl<F: Read + Seek> Context<'_, F> {
         let content = match object {
             Some(object) => {
                 let opath = join(&path, &object.name);
-                match self.reader.children(&opath) {
+                match self.reader.children(&opath, problems) {
                     Err(e) => {
                         problems.push(&opath, ProblemKind::Storage, format!("cannot list: {e}"));
                         AttachmentContent::None
@@ -776,7 +776,7 @@ impl<F: Read + Seek> Context<'_, F> {
                     format!("storage nested deeper than {MAX_STORAGE_DEPTH} levels: not read"),
                 );
             } else {
-                let storage = match self.reader.children(&cpath) {
+                let storage = match self.reader.children(&cpath, problems) {
                     Ok(grand) => self.read_storage(&cpath, child.clsid, grand, problems),
                     Err(e) => {
                         problems.push(&cpath, ProblemKind::Storage, format!("cannot list: {e}"));

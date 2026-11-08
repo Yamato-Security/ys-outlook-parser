@@ -519,6 +519,140 @@ fn property_streams_with_the_wrong_header_size_are_read() {
     );
 }
 
+/// Renames every directory entry called `from`; returns how many.
+fn rename_all(data: &mut [u8], from: &str, to: &str) -> usize {
+    let mut n = 0;
+    let from16: Vec<u8> = from.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    while directory_entries(data).into_iter().any(|e| {
+        u16::from_le_bytes([data[e + 64], data[e + 65]]) as usize == from16.len() + 2
+            && data[e..e + from16.len()] == from16[..]
+    }) {
+        rename_entry(data, from, to);
+        n += 1;
+    }
+    n
+}
+
+fn attachment_properties(method: u8) -> Vec<u8> {
+    let mut props = vec![0; 8];
+    props.extend_from_slice(&0x3705_0003u32.to_le_bytes());
+    props.extend_from_slice(&[6, 0, 0, 0, method, 0, 0, 0, 0, 0, 0, 0]);
+    props
+}
+
+fn storage_entries(s: &Storage) -> usize {
+    s.entries
+        .iter()
+        .map(|e| match e {
+            StorageEntry::Storage { storage, .. } => 1 + storage_entries(storage),
+            StorageEntry::Stream { .. } => 1,
+        })
+        .sum()
+}
+
+#[test]
+fn names_equal_ignoring_case_are_read_once() {
+    // cfb checks the order of names only between neighbours, so a storage can hold "CC" and
+    // "cc"; both lead to the same entry, and following both at each of 14 levels would read
+    // 2^14 storages.
+    let att = "/__attach_version1.0_#00000000";
+    let object = format!("{att}/__substg1.0_3701000D");
+    let mut storages = vec![att.to_owned(), object.clone()];
+    let mut path = object.clone();
+    for _ in 0..14 {
+        for name in ["AA", "BB", "DD", "CC"] {
+            storages.push(format!("{path}/{name}"));
+        }
+        path = format!("{path}/CC");
+    }
+    let streams = vec![
+        ("/__properties_version1.0".to_owned(), vec![0; 32]),
+        (
+            format!("{att}/__properties_version1.0"),
+            attachment_properties(6),
+        ),
+    ];
+    let mut data = write_tree(&streams, &storages);
+    assert!(rename_all(&mut data, "BB", "cc") >= 14);
+    let file = MsgFile::from_bytes(&data).unwrap();
+    let AttachmentContent::Storage(storage) = &file.message.attachments[0].content else {
+        panic!("{:?}", file.message.attachments[0].content)
+    };
+    assert!(
+        storage_entries(storage) <= 4 * 14,
+        "{}",
+        storage_entries(storage)
+    );
+    assert!(
+        file.all_problems()
+            .iter()
+            .any(|p| p.detail.contains("same name (ignoring case)"))
+    );
+
+    // The same with attachment storages holding embedded messages.
+    let mut storages = Vec::new();
+    let mut streams = vec![("/__properties_version1.0".to_owned(), vec![0; 32])];
+    let mut message = String::new();
+    for _ in 0..14 {
+        for i in [0, 1, 3, 2] {
+            storages.push(format!("{message}/__attach_version1.0_#0000000{i}"));
+        }
+        let a = format!("{message}/__attach_version1.0_#00000002");
+        streams.push((
+            format!("{a}/__properties_version1.0"),
+            attachment_properties(5),
+        ));
+        message = format!("{a}/__substg1.0_3701000D");
+        storages.push(message.clone());
+        streams.push((format!("{message}/__properties_version1.0"), vec![0; 24]));
+    }
+    let mut data = write_tree(&streams, &storages);
+    rename_all(
+        &mut data,
+        "__attach_version1.0_#00000002",
+        "__ATTACH_version1.0_#00000001",
+    );
+    let file = MsgFile::from_bytes(&data).unwrap();
+    assert!(file.message.embedded_messages().len() <= 14);
+    assert!(
+        file.all_problems()
+            .iter()
+            .any(|p| p.detail.contains("same name (ignoring case)"))
+    );
+}
+
+#[test]
+fn declared_stream_lengths_do_not_reserve_memory() {
+    // Streams that declare 2 GiB and hold nothing.
+    let mut streams = vec![("/__properties_version1.0".to_owned(), vec![0; 32])];
+    for i in 0..300 {
+        streams.push((format!("/__substg1.0_{:04X}0102", 0x8000 + i), vec![7]));
+    }
+    let mut data = write_tree(&streams, &[]);
+    let name: Vec<u8> = "__substg1.0_"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    for e in directory_entries(&data) {
+        if data[e..e + name.len()] == name[..] && data[e + 66] == 2 {
+            data[e + 116..e + 120].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+            data[e + 120..e + 124].copy_from_slice(&0x7FFF_FFF0u32.to_le_bytes());
+        }
+    }
+    let file = MsgFile::from_bytes(&data).unwrap();
+    let reserved: usize = file
+        .message
+        .properties
+        .iter()
+        .map(|p| match &p.value {
+            PropertyValue::Damaged { raw, .. } | PropertyValue::Unsupported(raw) => raw.capacity(),
+            PropertyValue::Ok(Value::Binary(b)) => b.capacity(),
+            _ => 0,
+        })
+        .sum();
+    assert!(reserved <= data.len(), "{reserved} bytes reserved");
+}
+
 #[test]
 fn corpus_does_not_panic() {
     let Some(dir) = std::env::var_os("OUTLOOK_MSG_CORPUS") else {

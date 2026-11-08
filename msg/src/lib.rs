@@ -176,7 +176,8 @@ impl MsgFile {
                             "the file is {file_len} bytes but its FAT describes {padded_len}: read the rest as zeros (first error: {error})"
                         ),
                     };
-                    return read_compound(cfb, padded_len, options, vec![problem]);
+                    // The limits stay those of the real file.
+                    return read_compound(cfb, file_len, options, vec![problem]);
                 }
                 Err(again) if again.to_string() != error.to_string() => {
                     return Err(Error::Cfb(io::Error::new(
@@ -225,7 +226,8 @@ fn read_compound<F: Read + Seek>(
         cfb::Version::V4 => 4,
     };
     let mut reader = Reader::new(cfb, file_len);
-    let root = reader.children("/").map_err(Error::Cfb)?;
+    let mut problems = Problems(problems);
+    let root = reader.children("/", &mut problems).map_err(Error::Cfb)?;
     let looks_like_message = root.iter().any(|c| {
         let name = c.name.to_ascii_lowercase();
         name == PROPERTIES_STREAM
@@ -236,7 +238,6 @@ fn read_compound<F: Read + Seek>(
     if !looks_like_message {
         return Err(Error::NotMessage);
     }
-    let mut problems = Problems(problems);
     let named_properties = read_named_properties(&mut reader, &root, &mut problems);
     let message = Context {
         reader: &mut reader,
@@ -336,7 +337,7 @@ fn read_named_properties<F: Read + Seek>(
         return NamedProperties::default();
     };
     let path = join("/", &storage.name);
-    let children = match reader.children(&path) {
+    let children = match reader.children(&path, problems) {
         Ok(c) => c,
         Err(e) => {
             problems.push(&path, ProblemKind::Storage, format!("cannot list: {e}"));

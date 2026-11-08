@@ -16,6 +16,7 @@
 use crate::guid::Guid;
 use crate::problem::{ProblemKind, Problems};
 use cfb::CompoundFile;
+use std::collections::HashSet;
 use std::io::{self, Read, Seek};
 
 /// An entry of a storage.
@@ -29,10 +30,12 @@ pub(crate) struct Child {
 /// The compound file being read.
 pub(crate) struct Reader<F> {
     cfb: CompoundFile<F>,
-    file_len: u64,
     /// Bytes that may still be read. Every byte of a well-formed file belongs to at most one
     /// stream, but directory entries can share a sector chain, so the total is capped.
     budget: u64,
+    /// Directory entries that may still be listed. Each entry takes 128 bytes of the file and
+    /// is listed once when its storage is read, so a file cannot need more.
+    entries: u64,
 }
 
 /// The path of `name` in the storage at `parent`.
@@ -64,22 +67,53 @@ impl<F: Read + Seek> Reader<F> {
     pub(crate) fn new(cfb: CompoundFile<F>, file_len: u64) -> Self {
         Self {
             cfb,
-            file_len,
             budget: file_len.saturating_mul(2).saturating_add(64 << 10),
+            entries: file_len / 128 + 16,
         }
     }
 
     /// The entries of the storage at `path`.
-    pub(crate) fn children(&self, path: &str) -> io::Result<Vec<Child>> {
-        Ok(self
-            .cfb
-            .read_storage(path)?
-            .map(|e| Child {
+    ///
+    /// `cfb` checks the order of directory entry names only against their direct neighbours
+    /// in the tree, so a storage can hold two entries whose names are equal ignoring case; as
+    /// paths, both lead to the same entry, and following both at every level is exponential.
+    /// The second is reported and left out.
+    pub(crate) fn children(
+        &mut self,
+        path: &str,
+        problems: &mut Problems,
+    ) -> io::Result<Vec<Child>> {
+        let mut seen = HashSet::new();
+        let mut children = Vec::new();
+        for e in self.cfb.read_storage(path)? {
+            if self.entries == 0 {
+                problems.push(
+                    path,
+                    ProblemKind::Budget,
+                    "more directory entries listed than the file can hold: the rest of this storage is not read",
+                );
+                break;
+            }
+            self.entries -= 1;
+            let key: (usize, String) = (
+                e.name().encode_utf16().count(),
+                e.name().chars().flat_map(char::to_uppercase).collect(),
+            );
+            if !seen.insert(key) {
+                problems.push(
+                    &join(path, e.name()),
+                    ProblemKind::UnknownEntry,
+                    "a second entry of the same name (ignoring case): not read",
+                );
+                continue;
+            }
+            children.push(Child {
                 name: e.name().to_owned(),
                 is_stream: e.is_stream(),
                 clsid: guid_of(&e),
-            })
-            .collect())
+            });
+        }
+        Ok(children)
     }
 
     /// Reads the stream at `path`. Returns the bytes read and whether that is the whole
@@ -94,11 +128,11 @@ impl<F: Read + Seek> Reader<F> {
         };
         let declared = stream.len();
         let allowed = declared.min(self.budget);
-        // The declared length is not trusted for the allocation: the data cannot be longer
-        // than the file.
-        let capacity = allowed.min(self.file_len).min(usize::MAX as u64) as usize;
-        let mut data = Vec::with_capacity(capacity);
+        // The declared length is not trusted for the allocation: start small and grow with
+        // what is actually read (many streams can declare huge lengths and hold nothing).
+        let mut data = Vec::with_capacity(allowed.min(64 << 10) as usize);
         let result = (&mut stream).take(allowed).read_to_end(&mut data);
+        data.shrink_to_fit();
         self.budget -= (data.len() as u64).min(self.budget);
         let mut complete = true;
         if let Err(e) = result {
