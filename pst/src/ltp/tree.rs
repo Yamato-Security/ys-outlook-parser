@@ -301,37 +301,52 @@ where
             return Ok(Default::default());
         }
 
-        // Each heap allocation at most once: a record that points back at its own node or at a
-        // node above it is an error, and the walk reads no more than the heap holds, whatever
-        // bIdxLevels says.
+        // Each heap allocation at most once, whatever bIdxLevels says: a record that points at a
+        // node already read (its own, one above it, or another record's) would read it again, so
+        // the walk reads no more than the heap holds. When reading leniently, such a record and a
+        // record whose node cannot be found are problems and are skipped; the others are read.
         let mut visited = BTreeSet::from([u32::from(self.user_root)]);
-        let mut visit = |heap_id: HeapId| {
+        let mut visit = |heap_id: HeapId| -> io::Result<Option<HeapId>> {
             if visited.insert(u32::from(heap_id)) {
-                Ok(heap_id)
-            } else {
-                Err(LtpError::HeapTreeLoop(u32::from(heap_id)))
+                return Ok(Some(heap_id));
+            }
+            let err = LtpError::HeapTreeLoop(u32::from(heap_id));
+            let detail = format!("{err}: it is read once");
+            problems::check(ProblemKind::HeapRecord, None, || detail, || err.into())?;
+            Ok(None)
+        };
+        let node = |heap_id: HeapId| -> io::Result<Option<&[u8]>> {
+            match self.heap.find_entry(heap_id) {
+                Ok(data) => Ok(Some(data)),
+                Err(err) => {
+                    let detail = format!("BTH node 0x{:08X}: {err}", u32::from(heap_id));
+                    problems::check(ProblemKind::HeapRecord, None, || detail, || err)?;
+                    Ok(None)
+                }
             }
         };
-        let mut next_level = vec![visit(header.root())?];
+        let mut next_level: Vec<HeapId> = visit(header.root())?.into_iter().collect();
 
         for _ in 0..header.levels() {
             for heap_id in mem::take(&mut next_level).into_iter() {
-                let rows = read_records::<HeapTreeIntermediateEntry<K>>(
-                    self.heap.find_entry(heap_id)?,
-                    K::SIZE,
-                    // An intermediate record's value is an HID.
-                    4,
-                )?;
+                let Some(data) = node(heap_id)? else {
+                    continue;
+                };
+                // An intermediate record's value is an HID.
+                let rows = read_records::<HeapTreeIntermediateEntry<K>>(data, K::SIZE, 4)?;
                 for row in rows {
-                    next_level.push(visit(row.next_level())?);
+                    next_level.extend(visit(row.next_level())?);
                 }
             }
         }
 
         let mut results = Vec::new();
         for heap_id in mem::take(&mut next_level).into_iter() {
+            let Some(data) = node(heap_id)? else {
+                continue;
+            };
             results.extend(read_records::<HeapTreeLeafEntry<K, V>>(
-                self.heap.find_entry(heap_id)?,
+                data,
                 K::SIZE,
                 V::SIZE,
             )?);
@@ -501,6 +516,34 @@ mod tests {
         let index = [0x07_u8, 0x0E, 0x60, 0, 0, 0, 0x08, 0x0E, 0x60, 0, 0, 0].to_vec();
         let tree = heap_tree(&[bth_header(1, 0x40), index, leaf]);
         assert!(tree.entries().is_err());
+    }
+
+    #[test]
+    fn test_bth_repeated_or_missing_node_is_skipped_when_lenient() {
+        // Three index records: one for each leaf, then the first leaf again (which lost every
+        // record of the object, even when reading leniently), then a node that does not exist.
+        let index = [
+            [0x01_u8, 0x00, 0x60, 0, 0, 0],
+            [0x02, 0x00, 0x80, 0, 0, 0],
+            [0x03, 0x00, 0x60, 0, 0, 0],
+            [0x04, 0x00, 0xE0, 0x0F, 0, 0],
+        ]
+        .concat();
+        let first = [record(0x0001, 0x0003, 1), record(0x0002, 0x0003, 2)].concat();
+        let second = record(0x0E07, 0x0003, 3);
+        let allocations = [bth_header(1, 0x40), index, first, second];
+        assert!(heap_tree(&allocations).entries().is_err());
+
+        let (_scope, log) = crate::problems::lenient_scope();
+        let entries = heap_tree(&allocations).entries().unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.key()).collect::<Vec<_>>(),
+            [0x0001, 0x0002, 0x0E07]
+        );
+        let problems = log.problems();
+        assert_eq!(problems.len(), 2);
+        assert!(problems.iter().all(|p| p.kind() == ProblemKind::HeapRecord));
+        assert!(problems[0].detail().contains("twice"), "{}", problems[0]);
     }
 
     #[test]
