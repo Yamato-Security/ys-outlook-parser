@@ -67,7 +67,13 @@ impl MsgItem {
 }
 
 fn item(message: &outlook_msg::Message) -> Item {
-    let mut problems: Vec<String> = message.problems.iter().map(ToString::to_string).collect();
+    // The item reports a damaged RTF body itself (Item::build decompresses it again).
+    let mut problems: Vec<String> = message
+        .problems
+        .iter()
+        .filter(|problem| problem.kind != outlook_msg::ProblemKind::Rtf)
+        .map(ToString::to_string)
+        .collect();
     let recipients = message
         .recipients
         .iter()

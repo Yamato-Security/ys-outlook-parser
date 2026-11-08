@@ -246,3 +246,21 @@ fn embedded_messages_that_hold_themselves() {
     // what is left of the appointment is read
     assert_eq!(appointment.subject.as_deref(), Some("Test appointment"));
 }
+
+#[test]
+fn a_damaged_rtf_body_is_reported_once() {
+    // RAWSIZE in its compressed RTF header is wrong
+    let msg = MsgItem::from_bytes(
+        &common::msg_fixture("aspose-email-net/message.msg"),
+        &Default::default(),
+    )
+    .unwrap();
+    let rtf: Vec<_> = msg
+        .item
+        .problems
+        .iter()
+        .filter(|p| p.contains("RAWSIZE"))
+        .collect();
+    assert_eq!(rtf.len(), 1, "{:?}", msg.item.problems);
+    assert!(msg.item.body.rtf.is_some());
+}
