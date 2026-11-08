@@ -19,3 +19,7 @@ name = "outlook"
 [dependencies]
 outlook-msg = { package = "ys-outlook-parser-msg", version = "1.0.0", path = "../msg" }
 outlook-pst = { package = "ys-outlook-parser-pst", version = "1.0.0", path = "../pst" }
+
+[dev-dependencies]
+flate2.workspace = true
+sha2.workspace = true
