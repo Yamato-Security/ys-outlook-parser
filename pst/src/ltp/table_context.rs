@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Table Context (TC)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5e48be0d-a75a-4918-a277-50408ff96740)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -12,6 +29,7 @@ use std::{
 
 use super::{heap::*, prop_context::*, prop_type::*, read_write::*, tree::*, *};
 use crate::{
+    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
     messaging::{
         read_write::StoreReadWrite,
         store::{AnsiStore, UnicodeStore},
@@ -28,14 +46,13 @@ use crate::{
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
 };
 
 pub const LTP_ROW_ID_PROP_ID: u16 = 0x67F2;
 pub const LTP_ROW_VERSION_PROP_ID: u16 = 0x67F3;
 
 pub const fn existence_bitmap_size(column_count: usize) -> usize {
-    column_count / 8 + if column_count % 8 == 0 { 0 } else { 1 }
+    column_count / 8 + if column_count.is_multiple_of(8) { 0 } else { 1 }
 }
 
 pub const fn check_existence_bitmap(column: usize, existence_bitmap: &[u8]) -> LtpResult<bool> {
@@ -72,11 +89,11 @@ impl TableContextInfo {
             return Err(LtpError::InvalidTableContextColumnCount(columns.len()));
         }
 
-        if end_4byte_values % 4 != 0 {
+        if !end_4byte_values.is_multiple_of(4) {
             return Err(LtpError::InvalidTableContext4ByteOffset(end_4byte_values));
         }
 
-        if end_2byte_values % 2 != 0 || end_2byte_values < end_4byte_values {
+        if !end_2byte_values.is_multiple_of(2) || end_2byte_values < end_4byte_values {
             return Err(LtpError::InvalidTableContext2ByteOffset(end_2byte_values));
         }
 
@@ -674,7 +691,7 @@ impl TableRowData {
                                 _ => {
                                     return Err(
                                         LtpError::InvalidTableColumnBooleanValue(value).into()
-                                    )
+                                    );
                                 }
                             },
                         ))))
@@ -857,10 +874,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,

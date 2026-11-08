@@ -1,10 +1,27 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs) and its copy outlook-pst-ost 1.3.0
+// (https://crates.io/crates/outlook-pst-ost), whose code is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! [HEADER](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/c9876f5a-664b-46a3-9887-ba63f113abf5)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use super::{block_id::*, read_write::*, root::*, *};
-use crate::{crc::compute_crc, AnsiPstFile, PstFile, UnicodePstFile};
+use crate::{AnsiPstFile, PstFile, UnicodePstFile, crc::compute_crc};
 
 /// `dwMagic`
 ///

@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs) and its copy outlook-pst-ost 1.3.0
+// (https://crates.io/crates/outlook-pst-ost), whose code is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! [Pages](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5774b4f2-cdc4-453e-996a-8c8230116930)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -11,7 +28,7 @@ use std::{
 
 use super::{block_id::*, block_ref::*, byte_index::*, node_id::*, read_write::*, *};
 use crate::{
-    block_sig::compute_sig, crc::compute_crc, AnsiPstFile, PstFile, PstReader, UnicodePstFile,
+    AnsiPstFile, PstFile, PstReader, UnicodePstFile, block_sig::compute_sig, crc::compute_crc,
 };
 
 /// `ptype`
@@ -268,7 +285,10 @@ where
             } else {
                 let leading_zero = u16::from(leading_zero_count(page));
                 let trailing_zero = u16::from(trailing_zero_count(page));
-                assert!(leading_zero + trailing_zero < 8, "leading_zero: {leading_zero}, trailing_zero: {trailing_zero} for page: 0x{page:02X}");
+                assert!(
+                    leading_zero + trailing_zero < 8,
+                    "leading_zero: {leading_zero}, trailing_zero: {trailing_zero} for page: 0x{page:02X}"
+                );
 
                 let page_offset = current.end + 8;
                 current.end += leading_zero;
@@ -2077,16 +2097,16 @@ where
     Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>,
     LeafPage: RootBTreeLeafPage<Pst, Entry = Entry>,
     Self: BTreePage<
-        Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
-        Trailer = <Pst as PstFile>::PageTrailer,
-    >,
+            Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
+            Trailer = <Pst as PstFile>::PageTrailer,
+        >,
 {
     type Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>
         + BTreePageEntry<Block = <Pst as PstFile>::PageRef>;
     type Page: BTreePageReadWrite<
-        Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
-        Trailer = <Pst as PstFile>::PageTrailer,
-    >;
+            Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
+            Trailer = <Pst as PstFile>::PageTrailer,
+        >;
 }
 
 impl<Entry, LeafPage> RootBTreeIntermediatePage<UnicodePstFile, Entry, LeafPage>
@@ -2144,9 +2164,9 @@ pub trait RootBTreeLeafPage<Pst>
 where
     Pst: PstFile,
     Self: BTreePage<
-        Entry = <Self as RootBTreeLeafPage<Pst>>::Entry,
-        Trailer = <Pst as PstFile>::PageTrailer,
-    >,
+            Entry = <Self as RootBTreeLeafPage<Pst>>::Entry,
+            Trailer = <Pst as PstFile>::PageTrailer,
+        >,
 {
     type Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>;
 }

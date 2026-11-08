@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Search](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/3991391e-6cf6-4c97-8b9e-fc25bee7391b)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -9,17 +26,17 @@ use std::{
 
 use super::{read_write::*, *};
 use crate::{
+    AnsiPstFile, PstFile, UnicodePstFile,
     messaging::store::{AnsiStore, UnicodeStore},
     ndb::{
         block::{DataTree, IntermediateTreeBlock},
         block_id::BlockId,
         header::Header,
-        node_id::{NodeId, NID_SEARCH_MANAGEMENT_QUEUE},
+        node_id::{NID_SEARCH_MANAGEMENT_QUEUE, NodeId},
         page::{BTreePage, NodeBTreeEntry, RootBTree},
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, UnicodePstFile,
 };
 
 /// `wFlags`
@@ -461,10 +478,10 @@ where
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <Pst as PstFile>::NodeBTreeEntry,
-            <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <Pst as PstFile>::NodeBTreeEntry,
+                <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
+            >,
     <<<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage as BTreePage>::Entry:
         BTreePageEntryReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
@@ -473,10 +490,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,

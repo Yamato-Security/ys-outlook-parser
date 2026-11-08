@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Named Property Lookup Map](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e17e195d-0454-4b9b-b398-c9127a26a678)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -10,6 +27,7 @@ use std::{
 
 use super::{read_write::*, store::*, *};
 use crate::{
+    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
     crc::compute_crc,
     ltp::{
         heap::HeapNode,
@@ -25,7 +43,6 @@ use crate::{
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,7 +137,7 @@ pub struct StringEntry {
 
 impl StringEntry {
     pub fn new(size: u32, buffer: Vec<u8>) -> MessagingResult<Self> {
-        if size % 2 != 0 || size as usize != buffer.len() {
+        if !size.is_multiple_of(2) || size as usize != buffer.len() {
             Err(MessagingError::NamedPropertyMapStringEntryOutOfBounds)
         } else {
             Ok(Self { size, buffer })
@@ -372,7 +389,7 @@ impl NamedPropertyMapProperties {
                             return Err(MessagingError::InvalidNamedPropertyMapStreamGuid(
                                 PropertyType::from(&invalid),
                             )
-                            .into())
+                            .into());
                         }
                     }
                 }
@@ -475,10 +492,10 @@ where
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <Pst as PstFile>::NodeBTreeEntry,
-            <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <Pst as PstFile>::NodeBTreeEntry,
+                <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
+            >,
     <<<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage as BTreePage>::Entry:
         BTreePageEntryReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
@@ -487,10 +504,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,

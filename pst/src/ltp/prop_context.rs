@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs) and its copy outlook-pst-ost 1.3.0
+// (https://crates.io/crates/outlook-pst-ost), whose code is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Property Context (PC)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/294c83c6-ff92-42f5-b6b6-876c29fa9737)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -11,6 +28,7 @@ use std::{
 
 use super::{heap::*, prop_type::*, read_write::*, tree::*, *};
 use crate::{
+    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
     ndb::{
         block::{DataBlockCache, DataTree, IntermediateTreeBlock, SubNodeTree},
         block_id::BlockId,
@@ -23,7 +41,6 @@ use crate::{
         },
         read_write::*,
     },
-    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
 };
 
 #[derive(Copy, Clone)]
@@ -987,10 +1004,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,

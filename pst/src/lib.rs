@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs) and its copy outlook-pst-ost 1.3.0
+// (https://crates.io/crates/outlook-pst-ost), whose code is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 #![doc = include_str!("../README.md")]
 
 use std::{
@@ -171,22 +188,22 @@ pub trait PstFile: Sized {
     type DensityListPage: DensityListPage<Self>;
     type DataTreeEntry: IntermediateTreeEntry + IntermediateDataTreeEntry<Self>;
     type DataTreeBlock: IntermediateTreeBlock<
-        Header = DataTreeBlockHeader,
-        Entry = Self::DataTreeEntry,
-        Trailer = Self::BlockTrailer,
-    >;
+            Header = DataTreeBlockHeader,
+            Entry = Self::DataTreeEntry,
+            Trailer = Self::BlockTrailer,
+        >;
     type DataBlock: Block<Trailer = Self::BlockTrailer>;
     type SubNodeTreeBlockHeader: IntermediateTreeHeader;
     type SubNodeTreeBlock: IntermediateTreeBlock<
-        Header = Self::SubNodeTreeBlockHeader,
-        Entry = IntermediateSubNodeTreeEntry<Self::BlockId>,
-        Trailer = Self::BlockTrailer,
-    >;
+            Header = Self::SubNodeTreeBlockHeader,
+            Entry = IntermediateSubNodeTreeEntry<Self::BlockId>,
+            Trailer = Self::BlockTrailer,
+        >;
     type SubNodeBlock: IntermediateTreeBlock<
-        Header = Self::SubNodeTreeBlockHeader,
-        Entry = LeafSubNodeTreeEntry<Self::BlockId>,
-        Trailer = Self::BlockTrailer,
-    >;
+            Header = Self::SubNodeTreeBlockHeader,
+            Entry = LeafSubNodeTreeEntry<Self::BlockId>,
+            Trailer = Self::BlockTrailer,
+        >;
     type TableContext: TableContext;
     type PropertyContext: PropertyContext;
     type HeapNode: HeapNode;
@@ -476,10 +493,10 @@ where
     <Pst as PstFile>::NodeBTree: NodeBTreeReadWrite<Pst, <Pst as PstFile>::NodeBTreeEntry>,
     <<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <Pst as PstFile>::NodeBTreeEntry,
-            <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <Pst as PstFile>::NodeBTreeEntry,
+                <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
+            >,
     <<<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage as BTreePage>::Entry:
         BTreePageEntryReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
@@ -487,10 +504,10 @@ where
     <Pst as PstFile>::BlockBTree: BlockBTreeReadWrite<Pst, <Pst as PstFile>::BlockBTreeEntry>,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <Pst as PstFile>::BlockBTreeEntry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <Pst as PstFile>::BlockBTreeEntry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage as BTreePage>::Entry:
         BTreePageEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
@@ -634,10 +651,10 @@ where
                 let has_pmap_page = index % 8 == 0;
                 let has_fmap_page = has_pmap_page
                     && index >= FMAP_FIRST_SIZE
-                    && (index - FMAP_FIRST_SIZE) % FMAP_PAGE_COUNT == 0;
+                    && (index - FMAP_FIRST_SIZE).is_multiple_of(FMAP_PAGE_COUNT);
                 let has_fpmap_page = has_pmap_page
                     && index >= FPMAP_FIRST_SIZE
-                    && (index - FPMAP_FIRST_SIZE) % FPMAP_PAGE_COUNT == 0;
+                    && (index - FPMAP_FIRST_SIZE).is_multiple_of(FPMAP_PAGE_COUNT);
 
                 let index =
                     <<<Pst as PstFile>::ByteIndex as ByteIndex>::Index as TryFrom<u64>>::try_from(
@@ -1084,10 +1101,10 @@ where
     /// Initialize the density list at the beginning of a transaction if it is missing, corrupt, or
     /// the page ID doesn't match the next page ID in the header.
     fn ensure_density_list(&mut self) -> PstResult<()> {
-        if let Ok(density_list) = self.density_list.as_ref() {
-            if density_list.trailer().block_id() == self.header.next_page() {
-                return Ok(());
-            }
+        if let Ok(density_list) = self.density_list.as_ref()
+            && density_list.trailer().block_id() == self.header.next_page()
+        {
+            return Ok(());
         }
 
         let current_page = u32::try_from(
@@ -1187,10 +1204,11 @@ where
 }
 
 pub fn open_store(path: impl AsRef<Path>) -> io::Result<Rc<dyn Store>> {
-    Ok(if let Ok(pst_file) = UnicodePstFile::open(path.as_ref()) {
-        UnicodeStore::read(Rc::new(pst_file))?
-    } else {
-        let pst_file = AnsiPstFile::open(path.as_ref())?;
-        AnsiStore::read(Rc::new(pst_file))?
+    Ok(match UnicodePstFile::open(path.as_ref()) {
+        Ok(pst_file) => UnicodeStore::read(Rc::new(pst_file))?,
+        _ => {
+            let pst_file = AnsiPstFile::open(path.as_ref())?;
+            AnsiStore::read(Rc::new(pst_file))?
+        }
     })
 }

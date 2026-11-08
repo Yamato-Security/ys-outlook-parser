@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs) and its copy outlook-pst-ost 1.3.0
+// (https://crates.io/crates/outlook-pst-ost), whose code is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 #![allow(dead_code)]
 
 use std::{
@@ -12,9 +29,9 @@ use super::{
     block::*, block_id::*, block_ref::*, byte_index::*, header::*, node_id::*, page::*, root::*, *,
 };
 use crate::{
+    PstFile, PstReader,
     crc::compute_crc,
     encode::{cyclic, permute},
-    PstFile, PstReader,
 };
 
 pub trait NodeIdReadWrite: Copy + Sized {
@@ -824,10 +841,10 @@ where
     <<Self as RootBTree>::Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Self as RootBTree>::Entry: BTreeEntryReadWrite,
     <Self as RootBTree>::IntermediatePage: RootBTreeIntermediatePageReadWrite<
-        <Self as RootBTree>::Pst,
-        <Self as RootBTree>::Entry,
-        <Self as RootBTree>::LeafPage,
-    >,
+            <Self as RootBTree>::Pst,
+            <Self as RootBTree>::Entry,
+            <Self as RootBTree>::LeafPage,
+        >,
     <Self as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<<Self as RootBTree>::Pst> + BTreePageReadWrite,
 {

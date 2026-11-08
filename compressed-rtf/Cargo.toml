@@ -1,8 +1,11 @@
+# Yamato Security's fork of Microsoft's compressed-rtf (https://github.com/microsoft/outlook-pst-rs):
+# not published.
 [package]
-name = "compressed-rtf"
-description = "[MS-OXRTFCP]: Rich Text Format (RTF) Compression Algorithm"
-version = "1.0.1"
+name = "ys-outlook-parser-rtf"
+description = "[MS-OXRTFCP]: Rich Text Format (RTF) compression, for forensics"
+publish = false
 
+version.workspace = true
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +13,9 @@ repository.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[lib]
+name = "compressed_rtf"
 
 [dependencies]
 byteorder.workspace = true
