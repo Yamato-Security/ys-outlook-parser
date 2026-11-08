@@ -15,6 +15,26 @@
 //! and OST stores, and `.msg` and `.oft` items. An item's well-known fields (its class,
 //! sender, recipients, times, bodies and attachments, and the fields of contacts, calendar items
 //! and tasks) are read from its properties, and every property is kept as stored.
+//!
+//! ```no_run
+//! use outlook::pst::{Options, PstStore};
+//!
+//! let store = PstStore::open("mailbox.ost", &Options::default())?;
+//! for folder in store.folders() {
+//!     for stored in store.items(&folder) {
+//!         match &stored.item {
+//!             Ok(item) => println!("{} {:?} {:?} {:?}", folder.path, item.kind, item.submitted, item.subject),
+//!             Err(e) => println!("{}: message {:#x}: {e}", folder.path, stored.node),
+//!         }
+//!     }
+//! }
+//! for problem in store.problems() {
+//!     println!("{problem}");
+//! }
+//! let msg = outlook::MsgItem::from_bytes(&std::fs::read("mail.msg")?, &Default::default())?;
+//! println!("{:?} {:?}", msg.item.subject, msg.item.attachments.len());
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 // It reads what the readers give, from untrusted files: no unchecked indexing or arithmetic,
 // and no unwrap, expect or panic.
