@@ -17,7 +17,8 @@ use crate::guid::{Guid, PS_MAPI, PS_PUBLIC_STRINGS};
 use crate::problem::{ProblemKind, Problems};
 use crate::property::{NamedProperty, PropertyName};
 use crate::text::Text;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// One entry of the entry stream (`__substg1.0_00030102`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +82,7 @@ impl NamedProperties {
             );
         }
         let entry_path = format!("{path}/__substg1.0_00030102");
+        let mut names = Names::new(string_stream.len());
         let mut entries = Vec::with_capacity(entry_chunks.len());
         let mut by_id = BTreeMap::new();
         for (i, e) in entry_chunks.iter().enumerate() {
@@ -115,9 +117,9 @@ impl NamedProperties {
                 );
             }
             let name = if is_string {
-                match read_name(string_stream, id_or_offset) {
-                    Ok(text) => {
-                        if text.is_lossy() {
+                match names.get(string_stream, id_or_offset) {
+                    Ok((name, lossy)) => {
+                        if lossy {
                             problems.push(
                                 &format!("{path}/__substg1.0_00040102"),
                                 ProblemKind::Text,
@@ -126,7 +128,7 @@ impl NamedProperties {
                                 ),
                             );
                         }
-                        Some(PropertyName::Name(text.into_string()))
+                        Some(PropertyName::Name(name))
                     }
                     Err(detail) => {
                         problems.push(
@@ -168,8 +170,37 @@ impl NamedProperties {
     }
 }
 
+/// The names of the string stream, decoded once per offset. In a well-formed file the names do
+/// not overlap, so the total decoded is capped near the stream's length: entries pointing into
+/// the middle of each other's names cannot make the decoded names grow with the square of it.
+struct Names {
+    by_offset: HashMap<u32, (Arc<str>, bool)>,
+    left: usize,
+}
+
+impl Names {
+    fn new(len: usize) -> Self {
+        Self {
+            by_offset: HashMap::new(),
+            left: len.saturating_mul(2).saturating_add(4096),
+        }
+    }
+
+    /// The name at `offset` and whether it was not valid UTF-16.
+    fn get(&mut self, strings: &[u8], offset: u32) -> Result<(Arc<str>, bool), String> {
+        if let Some(name) = self.by_offset.get(&offset) {
+            return Ok(name.clone());
+        }
+        let text = read_name(strings, offset, self.left)?;
+        self.left -= text.raw().len();
+        let name = (Arc::from(text.as_str()), text.is_lossy());
+        self.by_offset.insert(offset, name.clone());
+        Ok(name)
+    }
+}
+
 /// A name of the string stream: a 4-byte length in bytes, then UTF-16LE.
-fn read_name(strings: &[u8], offset: u32) -> Result<Text, String> {
+fn read_name(strings: &[u8], offset: u32, left: usize) -> Result<Text, String> {
     let offset = offset as usize;
     let len = strings
         .get(offset..)
@@ -181,6 +212,11 @@ fn read_name(strings: &[u8], offset: u32) -> Result<Text, String> {
                 strings.len()
             )
         })?;
+    if len > left {
+        return Err(format!(
+            "string at offset {offset} of {len} bytes overlaps the other names: not decoded"
+        ));
+    }
     let start = offset + 4;
     let bytes = start
         .checked_add(len)

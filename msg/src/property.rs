@@ -17,6 +17,7 @@
 use crate::guid::Guid;
 use crate::text::Text;
 use std::fmt;
+use std::sync::Arc;
 
 /// A MAPI property type ([MS-OXCDATA] 2.11.1). The names follow `outlook_pst`'s
 /// `PropertyType`, so that items read from PST files and from `.msg` files map alike.
@@ -368,8 +369,9 @@ impl PropertyValue {
 pub enum PropertyName {
     /// A numeric identifier (LID), as in `PidLidAppointmentStartWhole` = 0x820D.
     Id(u32),
-    /// A string name, as in `PidNameKeywords` = `"Keywords"`.
-    Name(String),
+    /// A string name, as in `PidNameKeywords` = `"Keywords"` (shared: every property and entry
+    /// with this name holds the same string).
+    Name(Arc<str>),
 }
 
 impl fmt::Display for PropertyName {

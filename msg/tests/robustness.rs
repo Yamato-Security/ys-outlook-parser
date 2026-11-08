@@ -654,6 +654,51 @@ fn declared_stream_lengths_do_not_reserve_memory() {
 }
 
 #[test]
+fn overlapping_named_property_names_are_decoded_within_bounds() {
+    // 2000 string-named entries: half at one 16 KB name, half at offsets inside it.
+    let len = 16_000u32;
+    let mut entries = Vec::new();
+    for i in 0..2000u32 {
+        let offset = if i % 2 == 0 { 0 } else { 4 * (i / 2 % 100) };
+        entries.extend_from_slice(&offset.to_le_bytes());
+        entries.extend_from_slice(&((i << 16) | (2 << 1) | 1).to_le_bytes());
+    }
+    let mut strings = len.to_le_bytes().to_vec();
+    strings.extend(std::iter::repeat_n([b'A', 0], len as usize / 2).flatten());
+    let streams = vec![
+        ("/__properties_version1.0".to_owned(), vec![0; 32]),
+        (
+            "/__nameid_version1.0/__substg1.0_00020102".to_owned(),
+            vec![],
+        ),
+        (
+            "/__nameid_version1.0/__substg1.0_00030102".to_owned(),
+            entries,
+        ),
+        (
+            "/__nameid_version1.0/__substg1.0_00040102".to_owned(),
+            strings,
+        ),
+    ];
+    let data = write_tree(&streams, &[]);
+    let file = MsgFile::from_bytes(&data).unwrap();
+    let mut distinct = std::collections::HashSet::new();
+    let mut held = 0;
+    for e in &file.named_properties.entries {
+        if let Some(outlook_msg::NamedProperty {
+            name: outlook_msg::PropertyName::Name(name),
+            ..
+        }) = &e.named
+            && distinct.insert(std::sync::Arc::as_ptr(name) as *const u8 as usize)
+        {
+            held += name.len();
+        }
+    }
+    assert!(held <= 2 * data.len(), "{held} bytes of names held");
+    assert!(file.problems.iter().any(|p| p.detail.contains("overlaps")));
+}
+
+#[test]
 fn corpus_does_not_panic() {
     let Some(dir) = std::env::var_os("OUTLOOK_MSG_CORPUS") else {
         eprintln!("OUTLOOK_MSG_CORPUS is not set: skipped");
