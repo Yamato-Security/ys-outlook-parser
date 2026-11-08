@@ -414,7 +414,7 @@ where
                     store.clone(),
                     node,
                     prop_ids,
-                    message.embedded_depth().saturating_add(1),
+                    message.message_blocks(),
                 );
                 isolate_part(
                     pst,
@@ -583,6 +583,106 @@ mod tests {
             }
         }
         panic!("no attachment");
+    }
+
+    /// The first message with an embedded message, its node ID, and the attachment's node ID.
+    fn message_with_embedded_message(
+        store: &Rc<UnicodeStore>,
+    ) -> (Rc<UnicodeMessage>, NodeId, NodeId) {
+        for entry in walk_folders(store.as_ref()) {
+            let Some(contents) = entry.folder.unwrap().contents_table().cloned() else {
+                continue;
+            };
+            for row in contents.rows_matrix() {
+                let node = NodeId::from(u32::from(row.id()));
+                let entry_id = store.properties().make_entry_id(node).unwrap();
+                let message = UnicodeMessage::read(store.clone(), &entry_id, None).unwrap();
+                let Some(table) = message.attachment_table().cloned() else {
+                    continue;
+                };
+                for row in table.rows_matrix() {
+                    let attachment = NodeId::from(u32::from(row.id()));
+                    let read = UnicodeAttachment::read(message.clone(), attachment, None).unwrap();
+                    if read.embedded_message().is_some() {
+                        return (message, node, attachment);
+                    }
+                }
+            }
+        }
+        panic!("no embedded message");
+    }
+
+    #[test]
+    fn test_message_embedded_in_itself() {
+        let mut data = dist_list();
+        let store = open(&data, Validation::Strict);
+        let (message, node, attachment) = message_with_embedded_message(&store);
+        let read = UnicodeAttachment::read(message.clone(), attachment, None).unwrap();
+        let embedded = read
+            .properties()
+            .data_object(AttachmentMethod::EmbeddedMessage)
+            .unwrap()
+            .node();
+
+        // The attachment's sub-node tree is one SLBLOCK (not encoded): its entry for the
+        // embedded message gets the data and sub-node blocks of the message it is attached to.
+        let parent = store.pst().read_node(node).unwrap();
+        let sub_node = message
+            .sub_nodes()
+            .get(&attachment)
+            .unwrap()
+            .sub_node()
+            .unwrap();
+        let entry = store
+            .block_btree()
+            .find_entry(
+                &mut Cursor::new(data.clone()),
+                sub_node.search_key(),
+                &mut Default::default(),
+            )
+            .unwrap();
+        let offset = entry.block().index().index() as usize;
+        let size = usize::from(entry.size());
+        assert_eq!(data[offset..offset + 2], [0x02, 0x00]);
+        let count = usize::from(u16::from_le_bytes([data[offset + 2], data[offset + 3]]));
+        let at = (0..count)
+            .map(|index| offset + 8 + 24 * index)
+            .find(|at| data[*at..*at + 4] == u32::from(embedded).to_le_bytes())
+            .unwrap();
+        data[at + 8..at + 16].copy_from_slice(&parent.data().into_u64().to_le_bytes());
+        let sub = parent.sub_node().map_or(0, BlockId::into_u64);
+        data[at + 16..at + 24].copy_from_slice(&sub.to_le_bytes());
+        let trailer = offset + (size + 16).div_ceil(64) * 64 - 16;
+        let crc = crate::crc::compute_crc(0, &data[offset..offset + size]);
+        data[trailer + 4..trailer + 8].copy_from_slice(&crc.to_le_bytes());
+
+        let store = open(&data, Validation::Strict);
+        let entry_id = store.properties().make_entry_id(node).unwrap();
+        let message = UnicodeMessage::read(store.clone(), &entry_id, None).unwrap();
+        let err = UnicodeAttachment::read(message, attachment, None)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("blocks of a message it is embedded in"),
+            "{err}"
+        );
+
+        let store = open(&data, Validation::Lenient);
+        let entry_id = store.properties().make_entry_id(node).unwrap();
+        let message = UnicodeMessage::read(store.clone(), &entry_id, None).unwrap();
+        let read = UnicodeAttachment::read(message, attachment, None).unwrap();
+        assert!(read.embedded_message().is_none());
+        assert!(read.data().is_none());
+        let problems = store.pst().problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind(), ProblemKind::Attachment);
+        assert_eq!(problems[0].node(), Some(attachment));
+        assert!(
+            problems[0].detail().starts_with("embedded message: "),
+            "{}",
+            problems[0].detail()
+        );
     }
 
     #[test]

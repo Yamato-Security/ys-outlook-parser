@@ -50,16 +50,19 @@ where
         entry_id: &EntryId,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>>;
-    /// Read the message embedded `depth` levels down: 1 for a message attached to a message in a
-    /// folder. Deeper than [`MAX_EMBEDDED_MESSAGE_DEPTH`] is an error.
+    /// Read the message embedded in the message whose [`message_blocks`](Self::message_blocks)
+    /// are `parents`: as many levels down as there are of them. Deeper than
+    /// [`MAX_EMBEDDED_MESSAGE_DEPTH`] is an error, and so is a message with the blocks of one of
+    /// `parents`, which is embedded in itself.
     fn read_embedded(
         store: Rc<Pst::Store>,
         node: Pst::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
-        depth: usize,
+        parents: &[MessageBlocks],
     ) -> io::Result<Rc<Self>>;
-    /// How many levels down the message is embedded: 0 for a message in a folder.
-    fn embedded_depth(&self) -> usize;
+    /// The data and sub-node blocks of the messages the message is embedded in, outermost first,
+    /// then its own: one pair for a message in a folder.
+    fn message_blocks(&self) -> &[MessageBlocks];
     fn pst_store(&self) -> &Rc<Pst::Store>;
     fn sub_nodes(&self) -> &MessageSubNodes<Pst>;
 }

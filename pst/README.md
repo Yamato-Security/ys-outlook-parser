@@ -47,6 +47,6 @@ inflated, more than `MAX_BLOCK_TREE_INFLATION` (8) times that; a BTree-on-heap r
 allocation at most once; an object's properties read each heap allocation or sub-node at most once
 (a second property naming it is a problem), and their values hold no more than
 `MAX_BLOCK_TREE_INFLATION` times the file's size (a property past that is a problem); embedded
-messages are read at most `MAX_EMBEDDED_MESSAGE_DEPTH` levels down; and
-`messaging::folder::walk_folders` walks the folder hierarchy with each folder at most once, at most
-`MAX_FOLDER_DEPTH` levels down.
+messages are read at most `MAX_EMBEDDED_MESSAGE_DEPTH` levels down, and none with the data and
+sub-node blocks of a message it is embedded in; and `messaging::folder::walk_folders` walks the
+folder hierarchy with each folder at most once, at most `MAX_FOLDER_DEPTH` levels down.

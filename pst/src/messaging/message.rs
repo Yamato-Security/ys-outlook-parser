@@ -151,8 +151,13 @@ impl MessageProperties {
 }
 
 /// The most levels of messages embedded in messages that are read: a message attached to a
-/// message in a folder is 1 level down. An attachment loop in a corrupt file ends here.
+/// message in a folder is 1 level down. A chain of embedded messages in a corrupt file ends here,
+/// and a loop of them sooner, at a message with the blocks of one it is embedded in.
 pub const MAX_EMBEDDED_MESSAGE_DEPTH: usize = 64;
+
+/// The data and sub-node blocks of a message's node. A message embedded in a message it holds,
+/// in a corrupt file, has the blocks of a message it is embedded in.
+pub(crate) type MessageBlocks = (u64, Option<u64>);
 
 pub trait Message {
     fn store(&self) -> Rc<dyn Store>;
@@ -170,7 +175,8 @@ where
     sub_nodes: MessageSubNodes<Pst>,
     recipient_table: Option<Rc<dyn TableContext>>,
     attachment_table: Option<Rc<dyn TableContext>>,
-    depth: usize,
+    /// The blocks of the messages the message is embedded in, outermost first, then its own.
+    blocks: Vec<MessageBlocks>,
 }
 
 impl<Pst> MessageInner<Pst>
@@ -248,18 +254,29 @@ where
             node_btree.find_entry(file, node_key, &mut page_cache)?
         };
 
-        Self::read_embedded(store, node, prop_ids, 0)
+        Self::read_embedded(store, node, prop_ids, &[])
     }
 
     fn read_embedded(
         store: Rc<<Pst as PstFile>::Store>,
         node: <Pst as PstFile>::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
-        depth: usize,
+        parents: &[MessageBlocks],
     ) -> io::Result<Self> {
+        let depth = parents.len();
         if depth > MAX_EMBEDDED_MESSAGE_DEPTH {
             return Err(MessagingError::EmbeddedMessageTooDeep(depth).into());
         }
+        let own = (
+            node.data().into_u64(),
+            node.sub_node().map(BlockId::into_u64),
+        );
+        if parents.contains(&own) {
+            return Err(MessagingError::EmbeddedMessageCycle(own.0, own.1).into());
+        }
+        let mut blocks = Vec::with_capacity(depth.saturating_add(1));
+        blocks.extend_from_slice(parents);
+        blocks.push(own);
         let node_id = node.node();
 
         let pst = store.pst();
@@ -359,7 +376,7 @@ where
             sub_nodes,
             recipient_table,
             attachment_table,
-            depth,
+            blocks,
         })
     }
 }
@@ -470,14 +487,14 @@ impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
         store: Rc<UnicodeStore>,
         node: UnicodeNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
-        depth: usize,
+        parents: &[MessageBlocks],
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids, depth)?;
+        let inner = MessageInner::read_embedded(store, node, prop_ids, parents)?;
         Ok(Rc::new(Self { inner }))
     }
 
-    fn embedded_depth(&self) -> usize {
-        self.inner.depth
+    fn message_blocks(&self) -> &[MessageBlocks] {
+        &self.inner.blocks
     }
 
     fn pst_store(&self) -> &Rc<UnicodeStore> {
@@ -535,14 +552,14 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
         store: Rc<AnsiStore>,
         node: AnsiNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
-        depth: usize,
+        parents: &[MessageBlocks],
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids, depth)?;
+        let inner = MessageInner::read_embedded(store, node, prop_ids, parents)?;
         Ok(Rc::new(Self { inner }))
     }
 
-    fn embedded_depth(&self) -> usize {
-        self.inner.depth
+    fn message_blocks(&self) -> &[MessageBlocks] {
+        &self.inner.blocks
     }
 
     fn pst_store(&self) -> &Rc<AnsiStore> {
@@ -565,14 +582,54 @@ mod tests {
         let store =
             UnicodeStore::read(Rc::new(crate::UnicodePstFile::open(path).unwrap())).unwrap();
         let node = store.pst().read_node(NID_ROOT_FOLDER).unwrap();
-        let err = <UnicodeMessage as MessageReadWrite<UnicodePstFile>>::read_embedded(
-            store,
-            node,
-            None,
-            MAX_EMBEDDED_MESSAGE_DEPTH + 1,
-        )
-        .err()
-        .unwrap();
+        let parents: Vec<_> = (1..=MAX_EMBEDDED_MESSAGE_DEPTH as u64 + 1)
+            .map(|block| (u64::MAX - block, None))
+            .collect();
+        let read = |parents: &[MessageBlocks]| {
+            <UnicodeMessage as MessageReadWrite<UnicodePstFile>>::read_embedded(
+                store.clone(),
+                node,
+                None,
+                parents,
+            )
+        };
+        let err = read(&parents).err().unwrap();
         assert!(err.to_string().contains("levels down"), "{err}");
+        let message = read(&parents[1..]).unwrap();
+        assert_eq!(
+            message.message_blocks().len(),
+            MAX_EMBEDDED_MESSAGE_DEPTH + 1
+        );
+        assert_eq!(message.message_blocks()[..64], parents[1..]);
+    }
+
+    #[test]
+    fn test_message_embedded_in_itself() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Empty.pst");
+        let store =
+            UnicodeStore::read(Rc::new(crate::UnicodePstFile::open(path).unwrap())).unwrap();
+        let node = store.pst().read_node(NID_ROOT_FOLDER).unwrap();
+        let blocks = (
+            node.data().into_u64(),
+            node.sub_node().map(BlockId::into_u64),
+        );
+        let read = |parents: &[MessageBlocks]| {
+            <UnicodeMessage as MessageReadWrite<UnicodePstFile>>::read_embedded(
+                store.clone(),
+                node,
+                None,
+                parents,
+            )
+        };
+        let message = read(&[]).unwrap();
+        assert_eq!(message.message_blocks(), [blocks]);
+        // The same data block with another sub-node tree is another message.
+        assert!(read(&[(blocks.0, Some(4))]).is_ok());
+        let err = read(&[(4, None), blocks, (8, None)]).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("blocks of a message it is embedded in"),
+            "{err}"
+        );
     }
 }

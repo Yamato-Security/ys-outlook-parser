@@ -161,6 +161,10 @@ pub enum MessagingError {
     AttachmentSubNodeNotFound(crate::ndb::node_id::NodeId),
     #[error("Embedded message {0} levels down, more than MAX_EMBEDDED_MESSAGE_DEPTH")]
     EmbeddedMessageTooDeep(usize),
+    #[error(
+        "Embedded message has the data and sub-node blocks of a message it is embedded in (0x{0:X}, {1:X?})"
+    )]
+    EmbeddedMessageCycle(u64, Option<u64>),
     #[error("Missing PidTagAttachDataObject on afEmbeddedMessage attachment")]
     AttachmentMessageObjectDataNotFound,
     #[error("Invalid PidTagAttachDataObject on afEmbeddedMessage attachment: {0:?}")]
