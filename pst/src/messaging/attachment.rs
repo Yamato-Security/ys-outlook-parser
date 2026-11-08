@@ -29,7 +29,7 @@ use crate::{
         read_write::*,
     },
     ndb::{
-        block::{DataTree, IntermediateTreeBlock},
+        block::{DataTree, IntermediateTreeBlock, SubNodeTree},
         block_id::BlockId,
         header::Header,
         node_id::{NodeId, NodeIdType},
@@ -190,6 +190,13 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
+    <Pst as PstFile>::SubNodeTreeBlockHeader: IntermediateTreeHeaderReadWrite,
+    <Pst as PstFile>::SubNodeTreeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeTreeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
+    <Pst as PstFile>::SubNodeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
     <Pst as PstFile>::DataTreeBlock: IntermediateTreeBlockReadWrite,
     <<Pst as PstFile>::DataTreeBlock as IntermediateTreeBlock>::Entry:
         IntermediateTreeEntryReadWrite,
@@ -218,6 +225,7 @@ where
         let header = pst.header();
         let root = header.root();
 
+        let mut embedded = None;
         let (properties, data) = {
             let mut file = pst
                 .reader()
@@ -241,6 +249,7 @@ where
                 node.sub_node(),
                 None,
             );
+            let attachment_sub_nodes = node.sub_node();
 
             let mut page_cache = pst.block_cache();
             let data = node.data();
@@ -299,24 +308,30 @@ where
                         }
                     };
 
+                    // The embedded message is in the attachment's sub-node tree, not the message's.
                     let sub_node = object_data.node();
-                    let node = message
-                        .sub_nodes()
-                        .get(&sub_node)
+                    let attachment_sub_nodes = attachment_sub_nodes
                         .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
-                    let node = <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
-                        node.node(),
-                        node.block(),
-                        node.sub_node(),
-                        None,
+                    let block = block_btree.find_entry(
+                        file,
+                        attachment_sub_nodes.search_key(),
+                        &mut page_cache,
+                    )?;
+                    let entry = SubNodeTree::<Pst>::read(file, &block)?
+                        .entries(file, &block_btree, &mut page_cache)?
+                        .find(|entry| entry.node() == sub_node)
+                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+
+                    // Read it once the file lock is released, since read_embedded takes it again.
+                    embedded = Some(
+                        <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
+                            entry.node(),
+                            entry.block(),
+                            entry.sub_node(),
+                            None,
+                        ),
                     );
-                    let message =
-                        <<Pst as PstFile>::Message as MessageReadWrite<Pst>>::read_embedded(
-                            store.clone(),
-                            node,
-                            prop_ids,
-                        )?;
-                    Some(AttachmentData::Message(message))
+                    None
                 }
                 AttachmentMethod::Storage => {
                     let object_data = match properties
@@ -355,6 +370,17 @@ where
             };
 
             (properties, data)
+        };
+
+        let data = match embedded {
+            Some(node) => Some(AttachmentData::Message(
+                <<Pst as PstFile>::Message as MessageReadWrite<Pst>>::read_embedded(
+                    store.clone(),
+                    node,
+                    prop_ids,
+                )?,
+            )),
+            None => data,
         };
 
         Ok(Self {

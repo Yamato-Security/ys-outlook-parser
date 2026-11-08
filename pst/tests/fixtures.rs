@@ -34,6 +34,19 @@ fn dist_list_pst() {
     assert_eq!((counts.messages, counts.messages_read), (4, 4));
     assert_eq!((counts.fai, counts.fai_read), (3, 3));
     assert_eq!(counts.attachments, 2);
+    // Both attachments are embedded messages, in each attachment's own sub-node tree.
+    assert_eq!((counts.attachments_read, counts.embedded), (2, 2));
+}
+
+#[test]
+fn dist_list_pst_embedded_messages() {
+    let store = open_unicode(fixture("dist-list.pst.gz")).unwrap();
+    let embedded = embedded_messages(&store);
+    assert_eq!(embedded.len(), 2);
+    for message in embedded {
+        assert!(message.properties().message_class().is_ok());
+        assert!(message.properties().iter().count() > 10);
+    }
 }
 
 #[test]

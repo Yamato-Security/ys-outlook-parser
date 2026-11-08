@@ -125,6 +125,56 @@ pub fn walk(store: &Rc<UnicodeStore>) -> Counts {
     counts
 }
 
+/// Every embedded message attached to a message of the store, one level deep.
+pub fn embedded_messages(store: &Rc<UnicodeStore>) -> Vec<Rc<dyn Message>> {
+    let dyn_store: Rc<dyn Store> = store.clone();
+    let mut result = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![NID_ROOT_FOLDER];
+    while let Some(node_id) = stack.pop() {
+        if !seen.insert(u32::from(node_id)) {
+            continue;
+        }
+        let Ok(folder) =
+            dyn_store.open_folder(&dyn_store.properties().make_entry_id(node_id).unwrap())
+        else {
+            continue;
+        };
+        if let Some(table) = folder.hierarchy_table() {
+            stack.extend(
+                table
+                    .rows_matrix()
+                    .map(|row| NodeId::from(u32::from(row.id()))),
+            );
+        }
+        let Some(table) = folder.contents_table() else {
+            continue;
+        };
+        for row in table.rows_matrix() {
+            let entry_id = dyn_store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(row.id())))
+                .unwrap();
+            let message = UnicodeMessage::read(store.clone(), &entry_id, None).unwrap();
+            let Some(attachments) = message.attachment_table() else {
+                continue;
+            };
+            for row in attachments.rows_matrix() {
+                let attachment = UnicodeAttachment::read(
+                    message.clone(),
+                    NodeId::from(u32::from(row.id())),
+                    None,
+                )
+                .unwrap();
+                if let Some(AttachmentData::Message(embedded)) = attachment.data() {
+                    result.push(embedded.clone());
+                }
+            }
+        }
+    }
+    result
+}
+
 fn walk_message(message: &Rc<UnicodeMessage>, counts: &mut Counts) {
     if let Some(table) = message.recipient_table() {
         counts.recipients += table.rows_matrix().count();
