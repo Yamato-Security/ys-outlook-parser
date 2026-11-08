@@ -250,7 +250,7 @@ fn encoding_for_code_page(code_page: u32) -> Option<&'static Encoding> {
 /// (`PidTagInternetCodepage`, the MIME charset of the message) are most likely in: Outlook
 /// stores 8-bit strings in a Windows code page, not in a 7-bit or stateful MIME encoding.
 /// `None` for Unicode encodings, which say nothing about the 8-bit strings.
-pub(crate) fn windows_code_page_of_internet(code_page: u32) -> Option<u32> {
+pub fn windows_code_page_of_internet(code_page: u32) -> Option<u32> {
     Some(match code_page {
         0 | 1200 | 1201 | 12000 | 12001 | 65000 | 65001 => return None,
         20127 | 28591 | 28605 => 1252,
@@ -272,7 +272,7 @@ pub(crate) fn windows_code_page_of_internet(code_page: u32) -> Option<u32> {
 
 /// The Windows ANSI code page of a locale (LCID, as in `PidTagMessageLocaleId`), or `None` for
 /// locales that have none (Unicode-only languages) or that are not known.
-pub(crate) fn ansi_code_page_of_locale(lcid: u32) -> Option<u32> {
+pub fn ansi_code_page_of_locale(lcid: u32) -> Option<u32> {
     let lang = (lcid & 0xFFFF) as u16;
     let primary = lang & 0x03FF;
     Some(match primary {

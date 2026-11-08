@@ -478,7 +478,7 @@ impl<F: Read + Seek> Context<'_, F> {
             .get_tag((u32::from(tags::RTF_COMPRESSED) << 16) | 0x0102)
             .and_then(|p| p.value.best_effort()?.as_bytes())
             .map(|data| {
-                let rtf = rtf::decompress(data);
+                let rtf = rtf::decompress_rtf(data);
                 let rtf_path = join(path, "__substg1.0_10090102");
                 for flag in &rtf.flags {
                     problems.push(&rtf_path, ProblemKind::Rtf, flag.to_string());

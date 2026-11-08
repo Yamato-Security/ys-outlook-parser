@@ -223,8 +223,9 @@ fn crc(data: &[u8]) -> u32 {
     })
 }
 
-/// Decompresses a `PidTagRtfCompressed` value.
-pub(crate) fn decompress(data: &[u8]) -> Rtf {
+/// Decompresses a `PidTagRtfCompressed` value ([MS-OXRTFCP]), of a `.msg` file or of any other
+/// store: damage is flagged on the result, and the data is decompressed as far as it goes.
+pub fn decompress_rtf(data: &[u8]) -> Rtf {
     let mut flags = Vec::new();
     let Some(head) = data.first_chunk::<HEADER_LEN>() else {
         flags.push(RtfFlag::TooShort { len: data.len() });
@@ -346,7 +347,7 @@ mod tests {
         let compressed = compressed_rtf::compress_rtf(r"{\rtf1\ansi Hello}").unwrap();
         let stored = u32::from_le_bytes(compressed[12..16].try_into().unwrap());
         assert_eq!(crc(&compressed[16..]), stored);
-        let rtf = decompress(&compressed);
+        let rtf = decompress_rtf(&compressed);
         assert_eq!(rtf.rtf.as_deref(), Some(&br"{\rtf1\ansi Hello}"[..]));
         assert_eq!(rtf.decompressed_len, Some(18));
         assert!(rtf.flags.is_empty(), "{:?}", rtf.flags);
@@ -357,17 +358,17 @@ mod tests {
         let good = compressed_rtf::compress_rtf(r"{\rtf1\ansi Hello world}").unwrap();
         // Too short.
         assert_eq!(
-            decompress(&good[..10]).flags,
+            decompress_rtf(&good[..10]).flags,
             [RtfFlag::TooShort { len: 10 }]
         );
         // Flipped CRC: still decompressed.
         let mut bad = good.clone();
         bad[12] ^= 0xFF;
-        let rtf = decompress(&bad);
+        let rtf = decompress_rtf(&bad);
         assert!(rtf.rtf.is_some());
         assert!(matches!(rtf.flags[0], RtfFlag::CrcMismatch { .. }));
         // Truncated: size mismatch, partial output.
-        let rtf = decompress(&good[..good.len() - 3]);
+        let rtf = decompress_rtf(&good[..good.len() - 3]);
         assert!(matches!(
             rtf.flags[0],
             RtfFlag::CompressedSizeMismatch { .. }
@@ -375,7 +376,7 @@ mod tests {
         // Huge RAWSIZE must not allocate it.
         let mut huge = good.clone();
         huge[4..8].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
-        let rtf = decompress(&huge);
+        let rtf = decompress_rtf(&huge);
         assert!(rtf.rtf.is_some());
         assert!(
             rtf.flags
@@ -389,11 +390,11 @@ mod tests {
         mela.extend_from_slice(&UNCOMPRESSED.to_le_bytes());
         mela.extend_from_slice(&0u32.to_le_bytes());
         mela.extend_from_slice(b"{\\rtf1 x}abc");
-        let rtf = decompress(&mela);
+        let rtf = decompress_rtf(&mela);
         assert_eq!(rtf.rtf.as_deref(), Some(&b"{\\rtf1 x}abc"[..]));
         // Unknown type.
         let mut unknown = good;
         unknown[8] = 0;
-        assert!(decompress(&unknown).rtf.is_none());
+        assert!(decompress_rtf(&unknown).rtf.is_none());
     }
 }

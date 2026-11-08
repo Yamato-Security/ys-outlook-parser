@@ -42,8 +42,11 @@ pub use property::{
     NamedProperty, Properties, Property, PropertyEntry, PropertyName, PropertyType, PropertyValue,
     Value,
 };
-pub use rtf::{Rtf, RtfFlag, RtfHeader};
-pub use text::{Text, TextEncoding, is_code_page_supported};
+pub use rtf::{Rtf, RtfFlag, RtfHeader, decompress_rtf};
+pub use text::{
+    Text, TextEncoding, ansi_code_page_of_locale, is_code_page_supported,
+    windows_code_page_of_internet,
+};
 pub use time::{filetime_to_unix, floating_time_to_filetime, format_filetime};
 
 use message::{Context, NAMEID_STORAGE, PROPERTIES_STREAM};
