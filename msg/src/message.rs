@@ -18,7 +18,7 @@ use crate::guid::Guid;
 use crate::named::NamedProperties;
 use crate::problem::{Problem, ProblemKind, Problems};
 use crate::property::{Properties, Property, PropertyEntry, PropertyType, PropertyValue, Value};
-use crate::reader::{Child, Reader, depth_of, join};
+use crate::reader::{Child, Reader, depth_of, is_addressable, join};
 use crate::rtf::{self, Rtf};
 use crate::tags;
 use crate::text::{Text, TextEncoding, ansi_code_page_of_locale, windows_code_page_of_internet};
@@ -753,7 +753,17 @@ impl<F: Read + Seek> Context<'_, F> {
         let mut entries = Vec::with_capacity(children.len());
         for child in children {
             let cpath = join(path, &child.name);
-            if child.is_stream {
+            if !is_addressable(&child.name) {
+                problems.push(
+                    &cpath,
+                    ProblemKind::UnknownEntry,
+                    format!(
+                        "a {} named {:?} cannot be read by path: skipped",
+                        if child.is_stream { "stream" } else { "storage" },
+                        child.name
+                    ),
+                );
+            } else if child.is_stream {
                 let (data, _) = self.reader.read(&cpath, problems);
                 entries.push(StorageEntry::Stream {
                     name: child.name,

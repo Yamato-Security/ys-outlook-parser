@@ -44,6 +44,12 @@ pub(crate) fn join(parent: &str, name: &str) -> String {
     }
 }
 
+/// Whether an entry name can be put in a path: `cfb` resolves paths, so an entry named `""`,
+/// `.` or `..` (which it accepts) would lead to the storage itself or to its parent.
+pub(crate) fn is_addressable(name: &str) -> bool {
+    !matches!(name, "" | "." | "..")
+}
+
 /// The number of storages from the root to `path` (0 for the root).
 pub(crate) fn depth_of(path: &str) -> usize {
     path.split('/').filter(|p| !p.is_empty()).count()
@@ -137,5 +143,8 @@ mod tests {
         assert_eq!(join("/a", "b"), "/a/b");
         assert_eq!(depth_of("/"), 0);
         assert_eq!(depth_of("/a/b"), 2);
+        assert!(is_addressable("__substg1.0_3701000D"));
+        assert!(!is_addressable(""));
+        assert!(!is_addressable(".."));
     }
 }

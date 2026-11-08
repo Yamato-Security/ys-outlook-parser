@@ -178,7 +178,8 @@ fn read_tree(data: &[u8]) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
 
 /// Writes a compound file from storage paths and streams.
 fn write_tree(streams: &[(String, Vec<u8>)], storages: &[String]) -> Vec<u8> {
-    let mut cfb = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    let mut cfb =
+        cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new())).unwrap();
     for s in storages {
         cfb.create_storage_all(s).unwrap();
     }
@@ -432,6 +433,61 @@ fn stream_lengths_past_the_end_of_the_file_are_bounded() {
                 assert!(raw.len() <= data.len());
             }
         }
+    }
+}
+
+/// Renames the directory entry called `from` (UTF-16, same length or shorter) to `to`.
+fn rename_entry(data: &mut [u8], from: &str, to: &str) {
+    let from16: Vec<u8> = from.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    for e in directory_entries(data) {
+        let len = u16::from_le_bytes([data[e + 64], data[e + 65]]) as usize;
+        if len == from16.len() + 2 && data[e..e + from16.len()] == from16[..] {
+            let to16: Vec<u8> = to.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            data[e..e + 64].fill(0);
+            data[e..e + to16.len()].copy_from_slice(&to16);
+            data[e + 64..e + 66].copy_from_slice(&(to16.len() as u16 + 2).to_le_bytes());
+            return;
+        }
+    }
+    panic!("no entry {from}");
+}
+
+#[test]
+fn storage_names_that_are_path_components_are_not_followed() {
+    // An OLE-object attachment whose storage holds storages named "", "." and "..": as paths
+    // they would lead back to an ancestor, again and again.
+    for (a, b) in [("", ".."), (".", ".."), ("..", "."), ("..", "")] {
+        let att = "/__attach_version1.0_#00000000";
+        let mut props = vec![0; 8];
+        // PidTagAttachMethod = afStorage.
+        props.extend_from_slice(&0x3705_0003u32.to_le_bytes());
+        props.extend_from_slice(&[6, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let object = format!("{att}/__substg1.0_3701000D");
+        let storages = vec![
+            att.to_owned(),
+            object.clone(),
+            format!("{object}/QQ"),
+            format!("{object}/QQ/RR"),
+        ];
+        let streams = vec![
+            ("/__properties_version1.0".to_owned(), vec![0; 32]),
+            (format!("{att}/__properties_version1.0"), props),
+            (format!("{object}/QQ/RR/data"), vec![1; 10]),
+        ];
+        let mut data = write_tree(&streams, &storages);
+        rename_entry(&mut data, "QQ", a);
+        rename_entry(&mut data, "RR", b);
+        let file = MsgFile::from_bytes(&data).unwrap();
+        let AttachmentContent::Storage(storage) = &file.message.attachments[0].content else {
+            panic!("{:?}", file.message.attachments[0].content)
+        };
+        assert!(storage.entries.len() <= 1, "{a:?}/{b:?}");
+        assert!(
+            file.all_problems()
+                .iter()
+                .any(|p| p.kind == outlook_msg::ProblemKind::UnknownEntry),
+            "{a:?}/{b:?}"
+        );
     }
 }
 
