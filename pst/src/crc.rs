@@ -19,8 +19,6 @@
 //!
 //! This is a direct port of the CRC calculation code from the PST specification.
 
-use core::mem;
-
 const CRC_TABLE_OFFSET32: [u32; 256] = [
     0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA, 0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
     0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988, 0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
@@ -301,52 +299,71 @@ const CRC_TABLE_OFFSET88: [u32; 256] = [
     0x2C8E0FFF, 0xE0240F61, 0x6EAB0882, 0xA201081C, 0xA8C40105, 0x646E019B, 0xEAE10678, 0x264B06E6,
 ];
 
-/// Compute the CRC of the data with the given initial CRC value.
-pub fn compute_crc(crc: u32, data: &[u8]) -> u32 {
-    let aligned_offset = if data.len() < mem::size_of::<u32>() {
-        0
-    } else {
-        data.as_ptr() as usize % mem::size_of::<u32>()
-    };
-    let initial_unaligned_bytes = if aligned_offset == 0 {
-        0
-    } else {
-        mem::size_of::<u32>() - aligned_offset
-    };
-    let running_length = if data.len() < mem::size_of::<u32>() {
-        0
-    } else {
-        (data.len() - initial_unaligned_bytes) / 8 * 8
-    };
-    let end_unaligned_bytes = data.len() - initial_unaligned_bytes - running_length;
+/// Look up a table entry: the index is masked to a byte, so it is always in bounds.
+#[inline]
+fn lookup(table: &[u32; 256], index: u32) -> u32 {
+    table
+        .get((index & 0xFF) as usize)
+        .copied()
+        .unwrap_or_default()
+}
 
+/// Compute the CRC of the data with the given initial CRC value.
+///
+/// Eight bytes at a time with the slicing-by-8 tables, then one byte at a time; the result is the
+/// same as one byte at a time throughout.
+pub fn compute_crc(crc: u32, data: &[u8]) -> u32 {
     let mut crc = crc;
 
-    for unaligned in &data[..initial_unaligned_bytes] {
-        crc =
-            CRC_TABLE_OFFSET32[((crc ^ u32::from(*unaligned)) & 0x000000FF) as usize] ^ (crc >> 8);
+    let (chunks, remainder) = data.as_chunks::<8>();
+    for [a, b, c, d, e, f, g, h] in chunks {
+        crc ^= u32::from_le_bytes([*a, *b, *c, *d]);
+        crc = lookup(&CRC_TABLE_OFFSET88, crc)
+            ^ lookup(&CRC_TABLE_OFFSET80, crc >> 8)
+            ^ lookup(&CRC_TABLE_OFFSET72, crc >> 16)
+            ^ lookup(&CRC_TABLE_OFFSET64, crc >> 24);
+
+        let second = u32::from_le_bytes([*e, *f, *g, *h]);
+        crc ^= lookup(&CRC_TABLE_OFFSET56, second)
+            ^ lookup(&CRC_TABLE_OFFSET48, second >> 8)
+            ^ lookup(&CRC_TABLE_OFFSET40, second >> 16)
+            ^ lookup(&CRC_TABLE_OFFSET32, second >> 24);
     }
 
-    for chunk in data[initial_unaligned_bytes..initial_unaligned_bytes + running_length].chunks(8) {
-        let first_chunk = u32::from_le_bytes(chunk[..4].try_into().expect("invalid chunk size"));
-        crc ^= first_chunk;
-        crc = CRC_TABLE_OFFSET88[(crc & 0x000000FF) as usize]
-            ^ CRC_TABLE_OFFSET80[((crc >> 8) & 0x000000FF) as usize]
-            ^ CRC_TABLE_OFFSET72[((crc >> 16) & 0x000000FF) as usize]
-            ^ CRC_TABLE_OFFSET64[((crc >> 24) & 0x000000FF) as usize];
-
-        let second_chunk = u32::from_le_bytes(chunk[4..].try_into().expect("invalid chunk size"));
-        crc = crc
-            ^ CRC_TABLE_OFFSET56[(second_chunk & 0x000000FF) as usize]
-            ^ CRC_TABLE_OFFSET48[((second_chunk >> 8) & 0x000000FF) as usize]
-            ^ CRC_TABLE_OFFSET40[((second_chunk >> 16) & 0x000000FF) as usize]
-            ^ CRC_TABLE_OFFSET32[((second_chunk >> 24) & 0x000000FF) as usize];
-    }
-
-    for unaligned in &data[data.len() - end_unaligned_bytes..] {
-        crc =
-            CRC_TABLE_OFFSET32[((crc ^ u32::from(*unaligned)) & 0x000000FF) as usize] ^ (crc >> 8);
+    for byte in remainder {
+        crc = lookup(&CRC_TABLE_OFFSET32, crc ^ u32::from(*byte)) ^ (crc >> 8);
     }
 
     crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytewise(crc: u32, data: &[u8]) -> u32 {
+        data.iter().fold(crc, |crc, byte| {
+            CRC_TABLE_OFFSET32[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8)
+        })
+    }
+
+    #[test]
+    fn test_slicing_by_8_matches_bytewise() {
+        let data: Vec<u8> = (0..1000_u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for start in 0..9 {
+            for end in [start, start + 1, start + 7, start + 8, start + 9, 500, 1000] {
+                let data = &data[start..end];
+                assert_eq!(compute_crc(0x1234_5678, data), bytewise(0x1234_5678, data));
+                assert_eq!(compute_crc(0, data), bytewise(0, data));
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty() {
+        assert_eq!(compute_crc(0, &[]), 0);
+        assert_eq!(compute_crc(0xDEAD_BEEF, &[]), 0xDEAD_BEEF);
+    }
 }

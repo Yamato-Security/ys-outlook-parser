@@ -62,6 +62,10 @@ pub enum LtpError {
     HeapBlockIndexNotFound(u16),
     #[error("Missing HID hidIndex: {0}")]
     HeapAllocIndexNotFound(u16),
+    #[error(
+        "HNPAGEMAP allocation {0} (offset 0x{1:04X}, size 0x{2:04X}) is past the end of its block"
+    )]
+    HeapAllocOutOfBounds(u16, u16, u16),
     #[error("Invalid PC BTH Record wPropType: 0x{0:04X}")]
     InvalidPropertyType(u16),
     #[error("Invalid variable length PC value property type: {0:?}")]

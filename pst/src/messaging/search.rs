@@ -527,7 +527,7 @@ where
         )?;
 
         let start = node.parent().map(u32::from).unwrap_or_default();
-        if start % SEARCH_UPDATE_SIZE != 0 {
+        if !start.is_multiple_of(SEARCH_UPDATE_SIZE) {
             return Err(MessagingError::InvalidSearchUpdateQueueOffset(start).into());
         }
         let start = usize::try_from(start)
@@ -556,14 +556,13 @@ where
             )?
             .read_to_end(&mut data)?;
 
-        if size % SEARCH_UPDATE_SIZE as usize != 0 {
+        if !size.is_multiple_of(SEARCH_UPDATE_SIZE as usize) {
             return Err(MessagingError::InvalidSearchUpdateQueueSize(size).into());
         }
 
-        let updates = if size > start {
-            let count = (size - start) / SEARCH_UPDATE_SIZE as usize;
-            let mut updates = Vec::with_capacity(count);
-            let mut cursor = Cursor::new(&data[start..]);
+        let updates = if let Some(queue) = data.get(start..) {
+            let mut updates = Vec::new();
+            let mut cursor = Cursor::new(queue);
             while let Ok(entry) = SearchUpdate::read(&mut cursor) {
                 updates.push(entry);
             }

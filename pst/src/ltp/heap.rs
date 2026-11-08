@@ -53,10 +53,9 @@ impl HeapId {
 
     pub fn index(&self) -> LtpResult<u16> {
         let index = (self.0.index() & HEAP_INDEX_MASK) as u16;
-        if index < 1 {
-            return Err(LtpError::InvalidHeapIndex(index));
-        }
-        Ok(index - 1)
+        index
+            .checked_sub(1)
+            .ok_or(LtpError::InvalidHeapIndex(index))
     }
 
     pub fn block_index(&self) -> u16 {
@@ -214,17 +213,13 @@ impl TryFrom<u8> for HeapFillLevel {
 }
 
 impl HeapFillLevel {
+    /// The fill level of a nibble: every value of 0 to 15 is one.
+    fn from_nibble(value: u32) -> HeapFillLevel {
+        HeapFillLevel::try_from((value & 0x0F) as u8).unwrap_or(HeapFillLevel::Level15)
+    }
+
     fn unpack_fill_levels(value: u32) -> [HeapFillLevel; 8] {
-        [
-            HeapFillLevel::try_from((value & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 4) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 8) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 12) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 16) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 20) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 24) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 28) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-        ]
+        [0, 4, 8, 12, 16, 20, 24, 28].map(|shift| Self::from_nibble(value >> shift))
     }
 
     fn pack_fill_levels(fill_levels: &[HeapFillLevel; 8]) -> u32 {
@@ -361,9 +356,8 @@ impl HeapNodePageReadWrite for HeapNodeBitmapHeader {
         let page_map_offset = f.read_u16::<LittleEndian>()?;
 
         let mut fill_levels = [HeapFillLevel::Empty; 128];
-        for i in 0..16 {
-            let unpacked = HeapFillLevel::unpack_fill_levels(f.read_u32::<LittleEndian>()?);
-            fill_levels[i * 8..(i + 1) * 8].copy_from_slice(&unpacked);
+        for chunk in fill_levels.as_chunks_mut::<8>().0 {
+            *chunk = HeapFillLevel::unpack_fill_levels(f.read_u32::<LittleEndian>()?);
         }
 
         Ok(Self::new(page_map_offset, fill_levels))
@@ -371,10 +365,8 @@ impl HeapNodePageReadWrite for HeapNodeBitmapHeader {
 
     fn write(&self, f: &mut dyn Write) -> io::Result<()> {
         f.write_u16::<LittleEndian>(self.page_map_offset)?;
-        for i in 0..16 {
-            let mut packed = [HeapFillLevel::Empty; 8];
-            packed.copy_from_slice(&self.fill_levels[i * 8..(i + 1) * 8]);
-            f.write_u32::<LittleEndian>(HeapFillLevel::pack_fill_levels(&packed))?;
+        for chunk in self.fill_levels.as_chunks::<8>().0 {
+            f.write_u32::<LittleEndian>(HeapFillLevel::pack_fill_levels(chunk))?;
         }
         Ok(())
     }
@@ -457,11 +449,9 @@ impl TryFrom<HeapNodePageAllocOffsets> for HeapNodePageMap {
                     return None;
                 };
 
-                if next_offset < last_offset {
+                let Some(size) = next_offset.checked_sub(last_offset) else {
                     return Some(Err(LtpError::InvalidHeapPageAllocOffset(next_offset)));
-                }
-
-                let size = next_offset - last_offset;
+                };
                 let alloc = HeapNodePageAlloc {
                     offset: last_offset,
                     size,
@@ -516,7 +506,9 @@ impl HeapNodePageReadWrite for HeapNodePageMap {
         let mut last_offset = 0;
         for HeapNodePageAlloc { offset, size } in &self.allocations {
             f.write_u16::<LittleEndian>(*offset)?;
-            last_offset = *offset + *size;
+            last_offset = offset
+                .checked_add(*size)
+                .ok_or(LtpError::HeapPageOutOfSpace)?;
         }
         f.write_u16::<LittleEndian>(last_offset)
     }
@@ -620,14 +612,14 @@ where
         let allocations = page_map.allocations();
 
         let index = heap_id.index()?;
-        if index as usize >= allocations.len() {
-            return Err(LtpError::HeapAllocIndexNotFound(index).into());
-        }
-
-        let alloc = &allocations[index as usize];
-        let start = alloc.offset() as usize;
-        let end = start + alloc.size() as usize;
-        Ok(&block[start..end])
+        let alloc = allocations
+            .get(usize::from(index))
+            .ok_or(LtpError::HeapAllocIndexNotFound(index))?;
+        let start = usize::from(alloc.offset());
+        let end = start.saturating_add(usize::from(alloc.size()));
+        block.get(start..end).ok_or_else(|| {
+            LtpError::HeapAllocOutOfBounds(index, alloc.offset(), alloc.size()).into()
+        })
     }
 }
 
@@ -682,5 +674,71 @@ impl HeapNodeReadWrite<AnsiPstFile> for AnsiHeapNode {
     ) -> io::Result<Self> {
         let inner = HeapNodeInner::read(f, block_btree, page_cache, encoding, key)?;
         Ok(Self { inner })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ndb::{
+        block::{UnicodeBlockTrailer, UnicodeDataBlock},
+        block_id::UnicodeBlockId,
+    };
+
+    /// A heap node of one block: an HNHDR, then `offsets` as its HNPAGEMAP's rgibAlloc.
+    fn heap_node(block_len: usize, offsets: &[u16]) -> HeapNodeInner<UnicodePstFile> {
+        let mut data = vec![0_u8; block_len];
+        let page_map = block_len - (4 + 2 * offsets.len());
+        data[0..2].copy_from_slice(&(page_map as u16).to_le_bytes());
+        data[2] = 0xEC;
+        data[3] = HeapNodeType::Properties as u8;
+        data[4..8].copy_from_slice(&0x20_u32.to_le_bytes());
+        let alloc_count = offsets.len() as u16 - 1;
+        data[page_map..page_map + 2].copy_from_slice(&alloc_count.to_le_bytes());
+        for (i, offset) in offsets.iter().enumerate() {
+            let at = page_map + 4 + 2 * i;
+            data[at..at + 2].copy_from_slice(&offset.to_le_bytes());
+        }
+        let trailer =
+            UnicodeBlockTrailer::new(block_len as u16, 0, 0, UnicodeBlockId::from(4)).unwrap();
+        let block = UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer).unwrap();
+        HeapNodeInner { data: vec![block] }
+    }
+
+    #[test]
+    fn test_find_entry() {
+        let heap = heap_node(64, &[12, 20, 30]);
+        assert_eq!(
+            heap.find_entry(HeapId::new(1, 0).unwrap()).unwrap().len(),
+            8
+        );
+        assert_eq!(
+            heap.find_entry(HeapId::new(2, 0).unwrap()).unwrap().len(),
+            10
+        );
+        assert!(heap.find_entry(HeapId::new(3, 0).unwrap()).is_err());
+        assert!(heap.find_entry(HeapId::new(1, 1).unwrap()).is_err());
+        assert!(heap.find_entry(HeapId::from(0)).is_err());
+    }
+
+    #[test]
+    fn test_allocation_past_its_block_is_an_error() {
+        // The second allocation ends at 0x2000, far past the 64-byte block: this sliced out of
+        // bounds before.
+        let heap = heap_node(64, &[12, 20, 0x2000]);
+        assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_ok());
+        let err = heap.find_entry(HeapId::new(2, 0).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("past the end"), "{err}");
+        // Offsets that go down.
+        let heap = heap_node(64, &[20, 12, 30]);
+        assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_fill_levels() {
+        let levels = HeapFillLevel::unpack_fill_levels(0xFEDC_BA98);
+        assert_eq!(levels[0], HeapFillLevel::Level8);
+        assert_eq!(levels[7], HeapFillLevel::Level15);
+        assert!(HeapId::from(0).index().is_err());
     }
 }

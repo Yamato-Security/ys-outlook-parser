@@ -58,13 +58,18 @@ where
     R: PstReader,
 {
     let size = usize::from(block.size());
-    let slot = (size + UNICODE_4K_BLOCK_TRAILER_SIZE).div_ceil(UNICODE_4K_BLOCK_ALIGNMENT)
-        * UNICODE_4K_BLOCK_ALIGNMENT;
+    // At most 65,535 + 24 bytes, rounded up to 512: no overflow.
+    let slot = size
+        .saturating_add(UNICODE_4K_BLOCK_TRAILER_SIZE)
+        .div_ceil(UNICODE_4K_BLOCK_ALIGNMENT)
+        .saturating_mul(UNICODE_4K_BLOCK_ALIGNMENT);
     f.seek(SeekFrom::Start(block.block().index().index().into()))?;
     let mut buffer = vec![0; slot];
     f.read_exact(&mut buffer)?;
 
-    let mut trailer = &buffer[slot - UNICODE_4K_BLOCK_TRAILER_SIZE..];
+    let (stored, mut trailer) = buffer
+        .split_at_checked(slot.saturating_sub(UNICODE_4K_BLOCK_TRAILER_SIZE))
+        .ok_or(NdbError::InvalidBlockSize(block.size()))?;
     let stored_size = trailer.read_u16::<LittleEndian>()?;
     let signature = trailer.read_u16::<LittleEndian>()?;
     let crc = trailer.read_u32::<LittleEndian>()?;
@@ -73,7 +78,9 @@ where
         return Err(NdbError::InvalidBlockSize(stored_size).into());
     }
 
-    let stored = &buffer[..size];
+    let stored = stored
+        .get(..size)
+        .ok_or(NdbError::InvalidBlockSize(stored_size))?;
     let stored_crc = compute_crc(0, stored);
     if stored_crc != crc {
         return Err(NdbError::InvalidBlockCrc(stored_crc).into());
@@ -87,7 +94,9 @@ where
             .take(u64::from(inflated_size) + 1)
             .read_to_end(&mut data)?;
         if data.len() != usize::from(inflated_size) {
-            return Err(NdbError::InvalidBlockSize(data.len() as u16).into());
+            return Err(
+                NdbError::InvalidBlockSize(u16::try_from(data.len()).unwrap_or(u16::MAX)).into(),
+            );
         }
         data
     };
@@ -127,25 +136,36 @@ where
     Block::Entry: IntermediateTreeEntryReadWrite,
     Block::Trailer: BlockTrailerReadWrite,
 {
-    let header_size = usize::from(Block::Header::HEADER_SIZE);
     let entry_count = header.entry_count();
-    if header_size + usize::from(entry_count) * usize::from(Block::Entry::ENTRY_SIZE) > data.len() {
-        return Err(NdbError::InvalidInternalBlockEntryCount(entry_count).into());
-    }
-    let mut cursor = &data[header_size..];
-    let entries = (0..entry_count)
-        .map(|_| Block::Entry::read(&mut cursor))
-        .collect::<io::Result<Vec<_>>>()?;
+    let entries = data
+        .get(usize::from(Block::Header::HEADER_SIZE)..)
+        .ok_or(NdbError::InvalidInternalBlockEntryCount(entry_count))?;
+    let entries = read_intermediate_entries::<Block::Entry>(entries, entry_count)?;
     Ok(Block::new(header, entries, trailer)?)
 }
 
-pub const fn block_size(size: u16) -> u16 {
-    assert!(size > 0);
-    assert!(size <= MAX_BLOCK_SIZE);
-    size.div_ceil(64) * 64
+/// The size of the slot a block fills: its data and trailer, `size` bytes, rounded up to a
+/// multiple of 64. `None` for a size of 0 or more than [`MAX_BLOCK_SIZE`].
+pub const fn block_size(size: u16) -> Option<u16> {
+    if size == 0 || size > MAX_BLOCK_SIZE {
+        None
+    } else {
+        size.div_ceil(64).checked_mul(64)
+    }
 }
 
 /// [BLOCKTRAILER](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/a14943ef-70c2-403f-898c-5bc3747117e1)
+/// The size of the slot a block with `size` bytes of data fills, with its trailer.
+fn slot_size<Pst>(size: u16) -> NdbResult<u16>
+where
+    Pst: PstFile,
+    <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
+{
+    size.checked_add(<<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE)
+        .and_then(block_size)
+        .ok_or(NdbError::InvalidBlockSize(size))
+}
+
 pub trait BlockTrailer {
     type BlockId: BlockId;
 
@@ -751,10 +771,8 @@ where
 
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
-        let block_size = block_size(
-            block.size() + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        );
-        let mut data = vec![0; block_size as usize];
+        let block_size = slot_size::<Pst>(block.size())?;
+        let mut data = vec![0; usize::from(block_size)];
         f.read_exact(&mut data)?;
         let mut cursor = Cursor::new(data);
 
@@ -1110,8 +1128,10 @@ where
             };
             self.cursor.current = Cursor::new(next.data().to_vec());
 
-            let buf = &mut buf[total_read..];
-            total_read += self.cursor.current.read(buf)?;
+            let Some(buf) = buf.get_mut(total_read..) else {
+                break;
+            };
+            total_read = total_read.saturating_add(self.cursor.current.read(buf)?);
         }
 
         Ok(total_read)
@@ -1497,10 +1517,8 @@ where
 
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
-        let block_size = block_size(
-            block.size() + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        );
-        let mut data = vec![0; block_size as usize];
+        let block_size = slot_size::<Pst>(block.size())?;
+        let mut data = vec![0; usize::from(block_size)];
         f.read_exact(&mut data)?;
         let mut cursor = Cursor::new(data);
         let header =

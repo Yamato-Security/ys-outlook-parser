@@ -284,7 +284,7 @@ where
             );
             let attachment_sub_nodes = node.sub_node();
 
-            let mut page_cache = pst.block_cache();
+            let mut page_cache = pst.block_cache()?;
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
                 file,

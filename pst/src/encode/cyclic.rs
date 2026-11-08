@@ -34,11 +34,11 @@ pub fn encode_decode_block(data: &mut [u8], key: u32) {
         let high_key = (key >> 8) as u8;
 
         *b = (*b).wrapping_add(low_key);
-        *b = r_table[*b as usize];
+        *b = lookup(r_table, *b);
         *b = (*b).wrapping_add(high_key);
-        *b = s_table[*b as usize];
+        *b = lookup(s_table, *b);
         *b = (*b).wrapping_sub(high_key);
-        *b = i_table[*b as usize];
+        *b = lookup(i_table, *b);
         *b = (*b).wrapping_sub(low_key);
 
         key = key.wrapping_add(1);

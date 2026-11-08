@@ -59,6 +59,12 @@ static KEY_DATA: [u8; 768] = [
     108, 249, 236,
 ];
 
+/// Look up a byte in a 256-entry key table: a byte index is always in bounds.
+#[inline]
+fn lookup(table: &[u8], index: u8) -> u8 {
+    table.get(usize::from(index)).copied().unwrap_or(index)
+}
+
 fn key_data_r() -> &'static [u8] {
     &KEY_DATA[..256]
 }

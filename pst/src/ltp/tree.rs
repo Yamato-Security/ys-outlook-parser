@@ -84,14 +84,13 @@ fn read_records<T: HeapNodePageReadWrite>(
     key_size: u8,
     entry_size: u8,
 ) -> io::Result<Vec<T>> {
-    let record_size = usize::from(key_size) + usize::from(entry_size);
-    if !data.len().is_multiple_of(record_size) {
+    let record_size = usize::from(key_size).saturating_add(usize::from(entry_size));
+    if record_size == 0 || !data.len().is_multiple_of(record_size) {
         return Err(LtpError::InvalidHeapTreeDataSize(entry_size).into());
     }
 
-    let mut cursor = Cursor::new(data);
-    (0..data.len() / record_size)
-        .map(|_| T::read(&mut cursor))
+    data.chunks_exact(record_size)
+        .map(|mut record| T::read(&mut record))
         .collect()
 }
 
@@ -274,10 +273,9 @@ where
             return Ok(Default::default());
         }
 
-        let mut level = header.levels();
         let mut next_level = vec![header.root()];
 
-        while level > 0 {
+        for _ in 0..header.levels() {
             for heap_id in mem::take(&mut next_level).into_iter() {
                 let rows = read_records::<HeapTreeIntermediateEntry<K>>(
                     self.heap.find_entry(heap_id)?,
@@ -287,8 +285,6 @@ where
                 )?;
                 next_level.extend(rows.into_iter().map(|row| row.next_level()));
             }
-
-            level -= 1;
         }
 
         let mut results = Vec::new();

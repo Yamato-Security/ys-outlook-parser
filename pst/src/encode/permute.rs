@@ -34,7 +34,7 @@ pub fn decode_block(data: &mut [u8]) {
 
 fn permute(data: &mut [u8], table: &[u8]) {
     for b in data.iter_mut() {
-        *b = table[*b as usize];
+        *b = lookup(table, *b);
     }
 }
 

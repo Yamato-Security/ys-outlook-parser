@@ -240,7 +240,7 @@ where
                 *root.node_btree(),
             )?;
 
-            let mut page_cache = pst.node_cache();
+            let mut page_cache = pst.node_cache()?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
             node_btree.find_entry(file, node_key, &mut page_cache)?
         };
@@ -274,7 +274,7 @@ where
             // (a distribution list, say) may have no sub-node tree at all.
             let sub_node = node.sub_node();
 
-            let mut page_cache = pst.block_cache();
+            let mut page_cache = pst.block_cache()?;
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
                 file,

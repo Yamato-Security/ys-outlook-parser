@@ -52,14 +52,18 @@ pub const LTP_ROW_ID_PROP_ID: u16 = 0x67F2;
 pub const LTP_ROW_VERSION_PROP_ID: u16 = 0x67F3;
 
 pub const fn existence_bitmap_size(column_count: usize) -> usize {
-    column_count / 8 + if column_count.is_multiple_of(8) { 0 } else { 1 }
+    column_count.div_ceil(8)
 }
 
 pub const fn check_existence_bitmap(column: usize, existence_bitmap: &[u8]) -> LtpResult<bool> {
-    if column >= existence_bitmap.len() * 8 {
+    let Some((_, [byte, ..])) = existence_bitmap.split_at_checked(column / 8) else {
         return Err(LtpError::InvalidTableContextColumnCount(column));
-    }
-    Ok(existence_bitmap[column / 8] & (1_u8 << (7 - (column % 8))) != 0)
+    };
+    // The bits of each byte count from its high bit.
+    let Some(mask) = 0x80_u8.checked_shr((column & 0x07) as u32) else {
+        return Err(LtpError::InvalidTableContextColumnCount(column));
+    };
+    Ok(*byte & mask != 0)
 }
 
 /// [TCINFO](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/45b3a0c5-d6d6-4e02-aebf-13766ff693f0)
@@ -89,7 +93,8 @@ impl TableContextInfo {
             return Err(LtpError::InvalidTableContextColumnCount(columns.len()));
         }
 
-        if !end_4byte_values.is_multiple_of(4) {
+        // Every row starts with dwRowID and the 4 bytes of PidTagLtpRowVer.
+        if !end_4byte_values.is_multiple_of(4) || end_4byte_values < 8 {
             return Err(LtpError::InvalidTableContext4ByteOffset(end_4byte_values));
         }
 
@@ -101,9 +106,9 @@ impl TableContextInfo {
             return Err(LtpError::InvalidTableContext1ByteOffset(end_1byte_values));
         }
 
-        if end_existence_bitmap < end_1byte_values
-            || (end_existence_bitmap - end_1byte_values) as usize
-                != existence_bitmap_size(columns.len())
+        if end_existence_bitmap
+            .checked_sub(end_1byte_values)
+            .is_none_or(|size| usize::from(size) != existence_bitmap_size(columns.len()))
         {
             return Err(LtpError::InvalidTableContextBitmaskOffset(
                 end_existence_bitmap,
@@ -176,7 +181,9 @@ impl TableContextInfo {
                 (PropertyType::Integer16, offset)
                     if offset % 2 == 0
                         && offset >= end_4byte_values
-                        && offset + 2 <= end_2byte_values => {}
+                        && offset
+                            .checked_add(2)
+                            .is_some_and(|end| end <= end_2byte_values) => {}
                 (
                     PropertyType::Integer32
                     | PropertyType::Floating32
@@ -199,7 +206,10 @@ impl TableContextInfo {
                     | PropertyType::MultipleGuid
                     | PropertyType::MultipleBinary,
                     offset,
-                ) if offset % 4 == 0 && offset + 4 <= end_4byte_values => {}
+                ) if offset % 4 == 0
+                    && offset
+                        .checked_add(4)
+                        .is_some_and(|end| end <= end_4byte_values) => {}
                 (
                     PropertyType::Floating64
                     | PropertyType::Currency
@@ -207,7 +217,10 @@ impl TableContextInfo {
                     | PropertyType::Integer64
                     | PropertyType::Time,
                     offset,
-                ) if offset % 4 == 0 && offset + 8 <= end_4byte_values => {}
+                ) if offset % 4 == 0
+                    && offset
+                        .checked_add(8)
+                        .is_some_and(|end| end <= end_4byte_values) => {}
                 (_, offset) => {
                     return Err(LtpError::InvalidTableColumnOffset(offset));
                 }
@@ -745,48 +758,35 @@ impl TableRowData {
             .collect()
     }
 
+    /// `size` bytes of `data`, which starts at `start` in the row, from the row offset `offset`.
+    fn column_bytes(data: &[u8], start: u16, offset: u16, size: usize) -> LtpResult<&[u8]> {
+        let begin = usize::from(
+            offset
+                .checked_sub(start)
+                .ok_or(LtpError::InvalidTableColumnOffset(offset))?,
+        );
+        data.get(begin..begin.saturating_add(size))
+            .ok_or(LtpError::InvalidTableColumnOffset(offset))
+    }
+
     fn read_1byte_offset(&self, context: &TableContextInfo, offset: u16) -> LtpResult<u8> {
-        if offset < context.end_2byte_values() {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        let offset_1byte = (offset - context.end_2byte_values()) as usize;
-        if offset_1byte >= self.align_1byte.len() {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        Ok(self.align_1byte[offset_1byte])
+        let bytes = Self::column_bytes(&self.align_1byte, context.end_2byte_values(), offset, 1)?;
+        bytes
+            .first()
+            .copied()
+            .ok_or(LtpError::InvalidTableColumnOffset(offset))
     }
 
     fn read_2byte_offset(&self, context: &TableContextInfo, offset: u16) -> LtpResult<&[u8]> {
-        if offset < context.end_4byte_values() {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        let offset_2byte = (offset - context.end_4byte_values()) as usize;
-        if offset_2byte + 2 > self.align_2byte.len() {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        Ok(&self.align_2byte[offset_2byte..offset_2byte + 2])
+        Self::column_bytes(&self.align_2byte, context.end_4byte_values(), offset, 2)
     }
 
     fn read_4byte_offset(&self, offset: u16) -> LtpResult<&[u8]> {
-        if offset < 8 {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        let offset_4byte = (offset - 8) as usize;
-        if offset_4byte + 4 > self.align_4byte.len() {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        Ok(&self.align_4byte[offset_4byte..offset_4byte + 4])
+        Self::column_bytes(&self.align_4byte, 8, offset, 4)
     }
 
     fn read_8byte_offset(&self, offset: u16) -> LtpResult<&[u8]> {
-        if offset < 8 {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        let offset_4byte = (offset - 8) as usize;
-        if offset_4byte + 8 > self.align_4byte.len() {
-            return Err(LtpError::InvalidTableColumnOffset(offset));
-        }
-        Ok(&self.align_4byte[offset_4byte..offset_4byte + 8])
+        Self::column_bytes(&self.align_4byte, 8, offset, 8)
     }
 }
 
@@ -799,17 +799,30 @@ impl TableRowReadWrite for TableRowData {
 
         // rgdwData
         let unique = f.read_u32::<LittleEndian>()?;
-        let mut align_4byte = vec![0; context.end_4byte_values() as usize - 8];
+        // TableContextInfo::new checked that the offsets increase.
+        let mut align_4byte = vec![0; usize::from(context.end_4byte_values().saturating_sub(8))];
         f.read_exact(align_4byte.as_mut_slice())?;
 
         // rgwData
-        let mut align_2byte =
-            vec![0; (context.end_2byte_values() - context.end_4byte_values()) as usize];
+        let mut align_2byte = vec![
+            0;
+            usize::from(
+                context
+                    .end_2byte_values()
+                    .saturating_sub(context.end_4byte_values())
+            )
+        ];
         f.read_exact(align_2byte.as_mut_slice())?;
 
         // rgbData
-        let mut align_1byte =
-            vec![0; (context.end_1byte_values() - context.end_2byte_values()) as usize];
+        let mut align_1byte = vec![
+            0;
+            usize::from(
+                context
+                    .end_1byte_values()
+                    .saturating_sub(context.end_2byte_values())
+            )
+        ];
         f.read_exact(align_1byte.as_mut_slice())?;
 
         // rgbCEB
@@ -911,7 +924,7 @@ where
 
         let header = store.pst().header();
         let encoding = header.crypt_method();
-        let mut page_cache = store.pst().block_cache();
+        let mut page_cache = store.pst().block_cache()?;
         let block_btree = <<Pst as PstFile>::BlockBTree as RootBTreeReadWrite>::read(
             file,
             *header.root().block_btree(),
@@ -971,7 +984,12 @@ where
             }
             .into_iter()
             .map(|data| {
-                let row_count = data.len() / context.end_existence_bitmap() as usize;
+                let row_count = data
+                    .len()
+                    .checked_div(usize::from(context.end_existence_bitmap()))
+                    .ok_or(LtpError::InvalidTableContextBitmaskOffset(
+                        context.end_existence_bitmap(),
+                    ))?;
                 let mut cursor = Cursor::new(data);
                 let mut rows = Vec::with_capacity(row_count);
                 for _ in 0..row_count {
@@ -1034,7 +1052,7 @@ where
 
                 let encoding = self.store.pst().header().crypt_method();
                 let block_btree = self.store.block_btree();
-                let mut page_cache = self.store.pst().block_cache();
+                let mut page_cache = self.store.pst().block_cache()?;
 
                 let sub_node =
                     self.node
@@ -1047,7 +1065,10 @@ where
                 let block =
                     sub_node_tree.find_entry(file, block_btree, *sub_node_id, &mut page_cache)?;
                 let block = block_btree.find_entry(file, block.search_key(), &mut page_cache)?;
-                let mut block_cache = self.block_cache.borrow_mut();
+                let mut block_cache = self
+                    .block_cache
+                    .try_borrow_mut()
+                    .map_err(|_| LtpError::FailedToLockFile)?;
                 let data_tree = match block_cache.remove(&block.block().block()) {
                     Some(data_tree) => data_tree,
                     None => DataTree::read(file, encoding, &block)?,
@@ -1102,7 +1123,10 @@ impl TableContext for UnicodeTableContext {
             .row_index
             .get(&id)
             .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))?;
-        Ok(&self.inner.rows[u32::from(*index) as usize])
+        self.inner
+            .rows
+            .get(u32::from(*index) as usize)
+            .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))
     }
 
     fn read_column(
@@ -1158,7 +1182,10 @@ impl TableContext for AnsiTableContext {
             .row_index
             .get(&id)
             .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))?;
-        Ok(&self.inner.rows[u32::from(*index) as usize])
+        self.inner
+            .rows
+            .get(u32::from(*index) as usize)
+            .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))
     }
 
     fn read_column(
@@ -1181,6 +1208,76 @@ impl TableContextReadWrite<AnsiPstFile> for AnsiTableContext {
 mod tests {
     use super::*;
     use crate::open_store;
+
+    #[test]
+    fn test_existence_bitmap() {
+        assert!(check_existence_bitmap(0, &[0x80]).unwrap());
+        assert!(!check_existence_bitmap(1, &[0x80]).unwrap());
+        assert!(check_existence_bitmap(7, &[0x01]).unwrap());
+        assert!(check_existence_bitmap(15, &[0x00, 0x01]).unwrap());
+        assert!(check_existence_bitmap(8, &[0xFF]).is_err());
+        assert!(check_existence_bitmap(usize::MAX, &[0xFF]).is_err());
+        assert!(check_existence_bitmap(0, &[]).is_err());
+        assert_eq!(existence_bitmap_size(0), 0);
+        assert_eq!(existence_bitmap_size(8), 1);
+        assert_eq!(existence_bitmap_size(9), 2);
+    }
+
+    #[test]
+    fn test_row_offsets_below_the_row_id_are_an_error() {
+        // rgib[TCI_4b] below 8 made the row reader compute 4 - 8.
+        for end_4byte in [0, 4] {
+            assert!(
+                TableContextInfo::new(
+                    end_4byte,
+                    end_4byte,
+                    end_4byte,
+                    end_4byte,
+                    HeapId::from(0),
+                    None,
+                    vec![],
+                )
+                .is_err()
+            );
+        }
+        let context = TableContextInfo::new(8, 8, 8, 8, HeapId::from(0), None, vec![]).unwrap();
+        let row = TableRowData::read(&mut [1, 0, 0, 0, 2, 0, 0, 0].as_slice(), &context).unwrap();
+        assert_eq!(u32::from(row.id()), 1);
+        assert!(TableRowData::read(&mut [1, 0, 0].as_slice(), &context).is_err());
+    }
+
+    #[test]
+    fn test_column_offsets_past_the_row_are_an_error() {
+        let column = TableColumnDescriptor::new(PropertyType::Integer32, 0x3001, 8, 4, 0);
+        let context =
+            TableContextInfo::new(12, 12, 12, 13, HeapId::from(0), None, vec![column]).unwrap();
+        // A row with less data than its context describes.
+        let row = TableRowData::new(TableRowId::new(1), 0, vec![], vec![], vec![], vec![0x80]);
+        assert!(row.columns(&context).is_err());
+        let row = TableRowData::new(
+            TableRowId::new(1),
+            0,
+            vec![1, 0, 0, 0],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(row.columns(&context).is_err());
+        let row = TableRowData::new(
+            TableRowId::new(1),
+            0,
+            vec![1, 0, 0, 0],
+            vec![],
+            vec![],
+            vec![0x80],
+        );
+        assert!(matches!(
+            row.columns(&context).unwrap().as_slice(),
+            [Some(TableRowColumnValue::Small(PropertyValue::Integer32(
+                1
+            )))]
+        ));
+    }
 
     #[test]
     fn test_hnid_zero_cell_is_empty_string() {

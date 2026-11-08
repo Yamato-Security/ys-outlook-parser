@@ -73,7 +73,11 @@ impl BlockId for UnicodeBlockId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Self::new(self.is_internal(), self.index() + 1)
+        let index = self.index();
+        let next = index
+            .checked_add(1)
+            .ok_or(NdbError::InvalidUnicodeBlockIndex(index))?;
+        Self::new(self.is_internal(), next)
     }
 }
 
@@ -134,7 +138,11 @@ impl BlockId for UnicodePageId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Ok(Self::from(u64::from(self) + 1))
+        let value = u64::from(self);
+        let next = value
+            .checked_add(1)
+            .ok_or(NdbError::InvalidUnicodeBlockIndex(value))?;
+        Ok(Self::from(next))
     }
 }
 
@@ -201,7 +209,11 @@ impl BlockId for AnsiBlockId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Self::new(self.is_internal(), self.index() + 1)
+        let index = self.index();
+        let next = index
+            .checked_add(1)
+            .ok_or(NdbError::InvalidAnsiBlockIndex(index))?;
+        Self::new(self.is_internal(), next)
     }
 }
 
@@ -262,7 +274,11 @@ impl BlockId for AnsiPageId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Ok(Self::from(u32::from(self) + 1))
+        let value = u32::from(self);
+        let next = value
+            .checked_add(1)
+            .ok_or(NdbError::InvalidAnsiBlockIndex(value))?;
+        Ok(Self::from(next))
     }
 }
 
@@ -307,6 +323,29 @@ mod tests {
             panic!("UnicodeBlockId should be out of range");
         };
         assert_eq!(value, MAX_UNICODE_BLOCK_INDEX + 1);
+    }
+
+    #[test]
+    fn test_next_does_not_overflow() {
+        assert!(UnicodePageId::from(u64::MAX).next().is_err());
+        assert!(AnsiPageId::from(u32::MAX).next().is_err());
+        assert!(
+            UnicodeBlockId::new(true, MAX_UNICODE_BLOCK_INDEX)
+                .unwrap()
+                .next()
+                .is_err()
+        );
+        assert!(
+            AnsiBlockId::new(false, MAX_ANSI_BLOCK_INDEX)
+                .unwrap()
+                .next()
+                .is_err()
+        );
+        assert_eq!(
+            u64::from(UnicodePageId::from(7).next().unwrap()),
+            8,
+            "a page ID counts up by one"
+        );
     }
 
     #[test]

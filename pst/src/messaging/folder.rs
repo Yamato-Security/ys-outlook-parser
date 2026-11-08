@@ -202,10 +202,10 @@ where
                 *root.block_btree(),
             )?;
 
-            let mut node_page_cache = pst.node_cache();
+            let mut node_page_cache = pst.node_cache()?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
             let node = node_btree.find_entry(file, node_key, &mut node_page_cache)?;
-            let mut block_page_cache = pst.block_cache();
+            let mut block_page_cache = pst.block_cache()?;
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
                 file,
@@ -274,7 +274,7 @@ where
 
             let node_id = NodeId::new(node_id_type, self.properties.node_id.index())?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
-            let mut node_page_cache = pst.node_cache();
+            let mut node_page_cache = pst.node_cache()?;
 
             let Ok(node) = node_btree.find_entry(file, node_key, &mut node_page_cache) else {
                 return Ok(None);

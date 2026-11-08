@@ -518,6 +518,58 @@ impl From<&PropertyValue> for PropertyType {
     }
 }
 
+/// The rest of a property value's bytes. It comes from a heap allocation or a sub-node's data
+/// tree, so its size is bounded by the file.
+fn read_value(f: &mut dyn Read) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// The items of a variable-size multi-valued property (`PtypMultipleString8`,
+/// `PtypMultipleString`, `PtypMultipleBinary`): `ulCount`, then `ulCount` offsets from the start of
+/// the value (`rgulDataOffsets`), then the items in that order, each running to the next item's
+/// offset and the last one to the end of the value.
+fn multi_value_items(data: &[u8]) -> LtpResult<Vec<&[u8]>> {
+    let Some((count, rest)) = data.split_first_chunk::<4>() else {
+        return Err(LtpError::InvalidMultiValuePropertyCount(data.len()));
+    };
+    let count = u32::from_le_bytes(*count) as usize;
+    let (offsets, _) = rest.as_chunks::<4>();
+    let Some(offsets) = offsets.get(..count) else {
+        // There is not even room for the offsets.
+        return Err(LtpError::InvalidMultiValuePropertyCount(count));
+    };
+    let offsets: Vec<usize> = offsets
+        .iter()
+        .map(|offset| u32::from_le_bytes(*offset) as usize)
+        .collect();
+
+    let mut start = count
+        .checked_add(1)
+        .and_then(|words| words.checked_mul(mem::size_of::<u32>()))
+        .ok_or(LtpError::InvalidMultiValuePropertyCount(count))?;
+    let mut items = Vec::with_capacity(offsets.len());
+    for (i, &offset) in offsets.iter().enumerate() {
+        if offset != start {
+            return Err(LtpError::InvalidMultiValuePropertyOffset(offset));
+        }
+        let end = match offsets.get(i.saturating_add(1)) {
+            Some(&next) if next < start => {
+                return Err(LtpError::InvalidMultiValuePropertyOffset(next));
+            }
+            Some(&next) => next,
+            None => data.len(),
+        };
+        let item = data
+            .get(start..end)
+            .ok_or(LtpError::InvalidMultiValuePropertyOffset(end))?;
+        items.push(item);
+        start = end;
+    }
+    Ok(items)
+}
+
 impl PropertyValueReadWrite for PropertyValue {
     fn read(f: &mut dyn Read, prop_type: PropertyType) -> io::Result<Self> {
         match prop_type {
@@ -649,98 +701,35 @@ impl PropertyValueReadWrite for PropertyValue {
             }
 
             PropertyType::MultipleString8 => {
-                // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
-
-                // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
-                for _ in 0..count {
-                    offsets.push(f.read_u32::<LittleEndian>()? as usize);
-                }
-
-                // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
-                for i in 0..offsets.len() {
-                    let next = offsets[i];
-                    if next != start {
-                        return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                    }
-
-                    let mut buffer = if i < offsets.len() - 1 {
-                        let next = offsets[i + 1];
-                        if next < start {
-                            return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
+                let data = read_value(f)?;
+                let values = multi_value_items(&data)?
+                    .into_iter()
+                    .map(|item| {
+                        let end = item.iter().position(|&b| b == 0).unwrap_or(item.len());
+                        String8Value {
+                            buffer: item.get(..end).unwrap_or_default().to_vec(),
                         }
-
-                        if next > start {
-                            let mut buffer = vec![0; next - start];
-                            start = next;
-                            f.read_exact(&mut buffer)?;
-                            buffer
-                        } else {
-                            Default::default()
-                        }
-                    } else {
-                        let mut buffer = Vec::new();
-                        f.read_to_end(&mut buffer)?;
-                        buffer
-                    };
-
-                    if let Some(end) = buffer.iter().position(|&b| b == 0) {
-                        buffer.truncate(end);
-                    }
-
-                    values.push(String8Value { buffer });
-                }
-
+                    })
+                    .collect();
                 Ok(Self::MultipleString8(values))
             }
 
             PropertyType::MultipleUnicode => {
-                // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
-
-                // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
-                for _ in 0..count {
-                    offsets.push(f.read_u32::<LittleEndian>()? as usize);
-                }
-
-                // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
-                for i in 0..offsets.len() {
-                    let next = offsets[i];
-                    if next != start {
-                        return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                    }
-
-                    let mut buffer = Vec::new();
-                    if i < offsets.len() - 1 {
-                        let next = offsets[i + 1];
-                        if next < start {
-                            return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                        }
-
-                        while start < next {
-                            let ch = f.read_u16::<LittleEndian>()?;
-                            buffer.push(ch);
-                            start += mem::size_of::<u16>();
-                        }
-                    } else {
-                        while let Ok(ch) = f.read_u16::<LittleEndian>() {
-                            buffer.push(ch);
-                        }
-                    };
-
-                    if let Some(end) = buffer.iter().position(|&ch| ch == 0) {
-                        buffer.truncate(end);
-                    }
-
-                    values.push(UnicodeValue { buffer });
-                }
-
+                let data = read_value(f)?;
+                let values = multi_value_items(&data)?
+                    .into_iter()
+                    .map(|item| {
+                        // An odd last byte is not part of a UTF-16 code unit.
+                        let buffer = item
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|ch| u16::from_le_bytes(*ch))
+                            .take_while(|&ch| ch != 0)
+                            .collect();
+                        UnicodeValue { buffer }
+                    })
+                    .collect();
                 Ok(Self::MultipleUnicode(values))
             }
 
@@ -776,47 +765,13 @@ impl PropertyValueReadWrite for PropertyValue {
             }
 
             PropertyType::MultipleBinary => {
-                // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
-
-                // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
-                for _ in 0..count {
-                    offsets.push(f.read_u32::<LittleEndian>()? as usize);
-                }
-
-                // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
-                for i in 0..offsets.len() {
-                    let next = offsets[i];
-                    if next != start {
-                        return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                    }
-
-                    let buffer = if i < offsets.len() - 1 {
-                        let next = offsets[i + 1];
-                        if next < start {
-                            return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                        }
-
-                        if next > start {
-                            let mut buffer = vec![0; next - start];
-                            start = next;
-                            f.read_exact(&mut buffer)?;
-                            buffer
-                        } else {
-                            Default::default()
-                        }
-                    } else {
-                        let mut buffer = Vec::new();
-                        f.read_to_end(&mut buffer)?;
-                        buffer
-                    };
-
-                    values.push(BinaryValue { buffer });
-                }
-
+                let data = read_value(f)?;
+                let values = multi_value_items(&data)?
+                    .into_iter()
+                    .map(|item| BinaryValue {
+                        buffer: item.to_vec(),
+                    })
+                    .collect();
                 Ok(Self::MultipleBinary(values))
             }
 
@@ -915,12 +870,15 @@ impl PropertyValueReadWrite for PropertyValue {
                 f.write_u32::<LittleEndian>(count)?;
 
                 // rgulDataOffsets
-                let mut start = (values.len() + 1) * mem::size_of::<u32>();
+                let mut start = values
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(mem::size_of::<u32>());
                 for value in values {
                     let offset = u32::try_from(start)
                         .map_err(|_| LtpError::InvalidMultiValuePropertyOffset(start))?;
                     f.write_u32::<LittleEndian>(offset)?;
-                    start += value.buffer().len();
+                    start = start.saturating_add(value.buffer().len());
                 }
 
                 // rgDataItems
@@ -938,12 +896,15 @@ impl PropertyValueReadWrite for PropertyValue {
                 f.write_u32::<LittleEndian>(count)?;
 
                 // rgulDataOffsets
-                let mut start = (values.len() + 1) * mem::size_of::<u32>();
+                let mut start = values
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(mem::size_of::<u32>());
                 for value in values {
                     let offset = u32::try_from(start)
                         .map_err(|_| LtpError::InvalidMultiValuePropertyOffset(start))?;
                     f.write_u32::<LittleEndian>(offset)?;
-                    start += mem::size_of_val(value.buffer());
+                    start = start.saturating_add(mem::size_of_val(value.buffer()));
                 }
 
                 // rgDataItems
@@ -980,12 +941,15 @@ impl PropertyValueReadWrite for PropertyValue {
                 f.write_u32::<LittleEndian>(count)?;
 
                 // rgulDataOffsets
-                let mut start = (values.len() + 1) * mem::size_of::<u32>();
+                let mut start = values
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(mem::size_of::<u32>());
                 for value in values {
                     let offset = u32::try_from(start)
                         .map_err(|_| LtpError::InvalidMultiValuePropertyOffset(start))?;
                     f.write_u32::<LittleEndian>(offset)?;
-                    start += value.buffer().len();
+                    start = start.saturating_add(value.buffer().len());
                 }
 
                 // rgDataItems
@@ -1099,7 +1063,10 @@ where
                 let sub_node_tree = SubNodeTree::<Pst>::read(f, &block)?;
                 let block = sub_node_tree.find_entry(f, block_btree, sub_node_id, page_cache)?;
                 let block = block_btree.find_entry(f, block.search_key(), page_cache)?;
-                let mut block_cache = self.block_cache.borrow_mut();
+                let mut block_cache = self
+                    .block_cache
+                    .try_borrow_mut()
+                    .map_err(|_| LtpError::FailedToLockFile)?;
                 let data_tree = match block_cache.remove(&block.block().block()) {
                     Some(data_tree) => data_tree,
                     None => DataTree::read(f, encoding, &block)?,
@@ -1239,7 +1206,63 @@ impl PropertyContextReadWrite<AnsiPstFile> for AnsiPropertyContext {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{ndb::node_id::NID_ROOT_FOLDER, open_store};
+
+    fn multi_value(count: u32, offsets: &[u32], data: &[u8]) -> Vec<u8> {
+        let mut value = count.to_le_bytes().to_vec();
+        for offset in offsets {
+            value.extend_from_slice(&offset.to_le_bytes());
+        }
+        value.extend_from_slice(data);
+        value
+    }
+
+    #[test]
+    fn test_multi_value_items() {
+        let value = multi_value(2, &[12, 14], b"abcde");
+        let items = multi_value_items(&value).unwrap();
+        assert_eq!(items, [&b"ab"[..], &b"cde"[..]]);
+        assert!(
+            multi_value_items(&multi_value(0, &[], b""))
+                .unwrap()
+                .is_empty()
+        );
+        // An empty item.
+        let value = multi_value(2, &[12, 12], b"x");
+        assert_eq!(multi_value_items(&value).unwrap(), [&b""[..], &b"x"[..]]);
+    }
+
+    #[test]
+    fn test_multi_value_counts_from_the_file() {
+        // ulCount of 4 billion: this reserved 32 GiB (and aborted) before.
+        let value = multi_value(u32::MAX, &[8], b"abc");
+        assert!(multi_value_items(&value).is_err());
+        for prop_type in [
+            PropertyType::MultipleString8,
+            PropertyType::MultipleUnicode,
+            PropertyType::MultipleBinary,
+        ] {
+            assert!(PropertyValue::read(&mut value.as_slice(), prop_type).is_err());
+        }
+        // Offsets past the value, out of order, or not where the items start.
+        assert!(multi_value_items(&multi_value(1, &[0xFFFF_FFF0], b"abc")).is_err());
+        assert!(multi_value_items(&multi_value(2, &[12, 0xFFFF_FFF0], b"abc")).is_err());
+        assert!(multi_value_items(&multi_value(2, &[12, 11], b"abc")).is_err());
+        assert!(multi_value_items(&multi_value(1, &[4], b"abc")).is_err());
+        assert!(multi_value_items(&[1, 0]).is_err());
+    }
+
+    #[test]
+    fn test_multiple_unicode_odd_length() {
+        let value = multi_value(1, &[8], &[b'h', 0, b'i', 0, b'!']);
+        let PropertyValue::MultipleUnicode(values) =
+            PropertyValue::read(&mut value.as_slice(), PropertyType::MultipleUnicode).unwrap()
+        else {
+            panic!("MultipleUnicode");
+        };
+        assert_eq!(values[0].to_string(), "hi");
+    }
 
     #[test]
     fn test_hnid_zero_is_empty_string() {

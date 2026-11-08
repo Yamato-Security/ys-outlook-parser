@@ -59,7 +59,12 @@ pub fn calculate_crc(previous: u32, data: &[u8]) -> u32 {
     for byte in data.iter().copied() {
         let table_position = ((crc_value ^ u32::from(byte)) & 0xff) as usize;
         let intermediate_value = crc_value >> 8;
-        crc_value = CRC_LOOKUP_TABLE[table_position] ^ intermediate_value;
+        // The position is masked to a byte, and the table has 256 entries.
+        let table_value = CRC_LOOKUP_TABLE
+            .get(table_position)
+            .copied()
+            .unwrap_or_default();
+        crc_value = table_value ^ intermediate_value;
     }
     crc_value
 }

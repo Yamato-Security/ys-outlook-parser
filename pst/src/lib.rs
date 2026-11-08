@@ -16,6 +16,21 @@
 // and limitations under the RPL.
 
 #![doc = include_str!("../README.md")]
+// No input may panic or abort this crate: outside tests, no unchecked indexing, slicing or
+// arithmetic, and no unwrap, expect or panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 use std::{
     cell::RefMut,
@@ -80,13 +95,24 @@ impl From<&io::Error> for PstError {
     }
 }
 
-/// Crate-internal access to a file's B-tree page caches.
+/// Crate-internal access to a file's B-tree page caches. Each is borrowed by one reader at a time;
+/// a second borrow is an error, not a panic.
 trait PstFileCaches<Pst>
 where
     Pst: PstFile,
 {
-    fn block_cache(&self) -> RefMut<'_, RootBTreePageCache<<Pst as PstFile>::BlockBTree>>;
-    fn node_cache(&self) -> RefMut<'_, RootBTreePageCache<<Pst as PstFile>::NodeBTree>>;
+    fn block_cache(
+        &self,
+    ) -> io::Result<RefMut<'_, RootBTreePageCache<<Pst as PstFile>::BlockBTree>>>;
+    fn node_cache(&self)
+    -> io::Result<RefMut<'_, RootBTreePageCache<<Pst as PstFile>::NodeBTree>>>;
+}
+
+/// Borrow a page cache, or fail with [`PstError::LockError`] if it is already borrowed.
+fn borrow_cache<T>(cache: &std::cell::RefCell<T>) -> io::Result<RefMut<'_, T>> {
+    cache
+        .try_borrow_mut()
+        .map_err(|_| PstError::LockError.into())
 }
 
 pub trait PstReader: Read + Seek {}
@@ -178,12 +204,16 @@ impl UnicodePstFile {
 }
 
 impl PstFileCaches<UnicodePstFile> for UnicodePstFile {
-    fn block_cache(&self) -> RefMut<'_, RootBTreePageCache<<Self as PstFile>::BlockBTree>> {
-        self.inner.block_cache.borrow_mut()
+    fn block_cache(
+        &self,
+    ) -> io::Result<RefMut<'_, RootBTreePageCache<<Self as PstFile>::BlockBTree>>> {
+        borrow_cache(&self.inner.block_cache)
     }
 
-    fn node_cache(&self) -> RefMut<'_, RootBTreePageCache<<Self as PstFile>::NodeBTree>> {
-        self.inner.node_cache.borrow_mut()
+    fn node_cache(
+        &self,
+    ) -> io::Result<RefMut<'_, RootBTreePageCache<<Self as PstFile>::NodeBTree>>> {
+        borrow_cache(&self.inner.node_cache)
     }
 }
 
@@ -261,12 +291,16 @@ impl AnsiPstFile {
 }
 
 impl PstFileCaches<AnsiPstFile> for AnsiPstFile {
-    fn block_cache(&self) -> RefMut<'_, RootBTreePageCache<<Self as PstFile>::BlockBTree>> {
-        self.inner.block_cache.borrow_mut()
+    fn block_cache(
+        &self,
+    ) -> io::Result<RefMut<'_, RootBTreePageCache<<Self as PstFile>::BlockBTree>>> {
+        borrow_cache(&self.inner.block_cache)
     }
 
-    fn node_cache(&self) -> RefMut<'_, RootBTreePageCache<<Self as PstFile>::NodeBTree>> {
-        self.inner.node_cache.borrow_mut()
+    fn node_cache(
+        &self,
+    ) -> io::Result<RefMut<'_, RootBTreePageCache<<Self as PstFile>::NodeBTree>>> {
+        borrow_cache(&self.inner.node_cache)
     }
 }
 
@@ -417,7 +451,7 @@ where
         let reader = &mut *reader;
         let node_btree =
             <<Pst as PstFile>::NodeBTree as RootBTreeReadWrite>::read(reader, node_btree)?;
-        let mut page_cache = self.node_cache.borrow_mut();
+        let mut page_cache = borrow_cache(&self.node_cache)?;
         let node_id: <Pst as PstFile>::BTreeKey = u32::from(node).into();
         let node = node_btree.find_entry(reader, node_id, &mut page_cache)?;
         Ok(node)
@@ -430,7 +464,7 @@ where
         let reader = &mut *reader;
         let block_btree =
             <<Pst as PstFile>::BlockBTree as RootBTreeReadWrite>::read(reader, block_btree)?;
-        let mut page_cache = self.block_cache.borrow_mut();
+        let mut page_cache = borrow_cache(&self.block_cache)?;
         let block = block_btree.find_entry(reader, block.search_key(), &mut page_cache)?;
         let block = DataTree::<Pst>::read(reader, encoding, &block)?;
         let mut block_cache = Default::default();

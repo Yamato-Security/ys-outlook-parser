@@ -23,7 +23,6 @@ use std::{
     fmt::Debug,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
-    ops::Range,
 };
 
 use super::{block_id::*, block_ref::*, byte_index::*, node_id::*, read_write::*, *};
@@ -238,103 +237,11 @@ where
     fn trailer(&self) -> &Pst::PageTrailer;
 }
 
-const fn leading_zero_count(b: u8) -> u8 {
-    match b {
-        0x00 => 8,
-        b if b < 0x02 => 7,
-        b if b < 0x04 => 6,
-        b if b < 0x08 => 5,
-        b if b < 0x10 => 4,
-        b if b < 0x20 => 3,
-        b if b < 0x40 => 2,
-        b if b < 0x80 => 1,
-        _ => 0,
-    }
-}
-
-const fn trailing_zero_count(b: u8) -> u8 {
-    match b {
-        0x00 => 8,
-        b if b & 0x7F == 0 => 7,
-        b if b & 0x3F == 0 => 6,
-        b if b & 0x1F == 0 => 5,
-        b if b & 0x0F == 0 => 4,
-        b if b & 0x07 == 0 => 3,
-        b if b & 0x03 == 0 => 2,
-        b if b & 0x01 == 0 => 1,
-        _ => 0,
-    }
-}
-
 /// [AMAPPAGE](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/43d8f556-2c0e-4976-8ec7-84e57f8b1234)
 pub trait AllocationMapPage<Pst>: MapPage<Pst, { PageType::AllocationMap as u8 }>
 where
     Pst: PstFile,
 {
-    /// Scan the allocation map for contiguous free bits up to the specified max size.
-    fn find_free_bits(&self, max_size: u16) -> Range<u16> {
-        let mut max_free_slots = 0..0;
-        let mut current = 0..0;
-
-        for &page in self.map_bits() {
-            if page == 0 {
-                current.end += 8;
-                if current.end - current.start > max_free_slots.end - max_free_slots.start {
-                    max_free_slots = current.clone();
-                }
-            } else {
-                let leading_zero = u16::from(leading_zero_count(page));
-                let trailing_zero = u16::from(trailing_zero_count(page));
-                assert!(
-                    leading_zero + trailing_zero < 8,
-                    "leading_zero: {leading_zero}, trailing_zero: {trailing_zero} for page: 0x{page:02X}"
-                );
-
-                let page_offset = current.end + 8;
-                current.end += leading_zero;
-
-                if current.end - current.start > max_free_slots.end - max_free_slots.start {
-                    max_free_slots = current.clone();
-                }
-
-                if page != 0xFF
-                    && (max_free_slots.end - max_free_slots.start + 2)
-                        < (8 - trailing_zero - leading_zero)
-                {
-                    let mut current = (current.end + 1)..(current.end + 1);
-
-                    for i in (leading_zero + 1)..(7 - trailing_zero) {
-                        if page & (0x80 >> i) == 0 {
-                            current.end += 1;
-                        } else {
-                            if current.end - current.start
-                                > max_free_slots.end - max_free_slots.start
-                            {
-                                max_free_slots = current.clone();
-                            }
-                            current = (current.end + 1)..(current.end + 1);
-                        }
-                    }
-
-                    if current.end - current.start > max_free_slots.end - max_free_slots.start {
-                        max_free_slots = current;
-                    }
-                }
-
-                current = (page_offset - trailing_zero)..page_offset;
-            }
-
-            if max_free_slots.end - max_free_slots.start >= max_size {
-                break;
-            }
-        }
-
-        if current.end - current.start > max_free_slots.end - max_free_slots.start {
-            max_free_slots = current;
-        }
-
-        (max_free_slots.start)..(max_free_slots.end.min(max_free_slots.start + max_size))
-    }
 }
 
 impl<Pst, Page> AllocationMapPage<Pst> for Page
@@ -698,7 +605,9 @@ impl DensityListPage<UnicodePstFile> for UnicodeDensityListPage {
     }
 
     fn entries(&self) -> &[DensityListPageEntry] {
-        &self.entries[..self.entry_count as usize]
+        self.entries
+            .get(..usize::from(self.entry_count))
+            .unwrap_or_default()
     }
 
     fn trailer(&self) -> &UnicodePageTrailer {
@@ -726,7 +635,9 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
         let entry_count = entries.len() as u8;
 
         let mut buffer = [DensityListPageEntry(0); Self::MAX_ENTRIES];
-        buffer[..entries.len()].copy_from_slice(entries);
+        for (entry, value) in buffer.iter_mut().zip(entries) {
+            *entry = *value;
+        }
         let entries = buffer;
 
         Ok(Self {
@@ -767,10 +678,10 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
         for entry in entries.iter_mut().take(entry_count as usize) {
             *entry = DensityListPageEntry::read(&mut cursor)?;
         }
-        cursor.seek(SeekFrom::Current(
-            ((Self::MAX_ENTRIES - entry_count as usize) * mem::size_of::<DensityListPageEntry>())
-                as i64,
-        ))?;
+        let skipped = Self::MAX_ENTRIES
+            .saturating_sub(usize::from(entry_count))
+            .saturating_mul(mem::size_of::<DensityListPageEntry>());
+        cursor.seek(SeekFrom::Current(skipped as i64))?;
 
         // rgPadding
         let mut padding = [0_u8; 12];
@@ -820,7 +731,9 @@ impl DensityListPage<AnsiPstFile> for AnsiDensityListPage {
     }
 
     fn entries(&self) -> &[DensityListPageEntry] {
-        &self.entries[..self.entry_count as usize]
+        self.entries
+            .get(..usize::from(self.entry_count))
+            .unwrap_or_default()
     }
 
     fn trailer(&self) -> &AnsiPageTrailer {
@@ -848,7 +761,9 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
         let entry_count = entries.len() as u8;
 
         let mut buffer = [DensityListPageEntry(0); Self::MAX_ENTRIES];
-        buffer[..entries.len()].copy_from_slice(entries);
+        for (entry, value) in buffer.iter_mut().zip(entries) {
+            *entry = *value;
+        }
         let entries = buffer;
 
         Ok(Self {
@@ -889,10 +804,10 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
         for entry in entries.iter_mut().take(entry_count as usize) {
             *entry = DensityListPageEntry::read(&mut cursor)?;
         }
-        cursor.seek(SeekFrom::Current(
-            ((Self::MAX_ENTRIES - entry_count as usize) * mem::size_of::<DensityListPageEntry>())
-                as i64,
-        ))?;
+        let skipped = Self::MAX_ENTRIES
+            .saturating_sub(usize::from(entry_count))
+            .saturating_mul(mem::size_of::<DensityListPageEntry>());
+        cursor.seek(SeekFrom::Current(skipped as i64))?;
 
         // rgPadding
         let mut padding = [0_u8; 12];
@@ -2117,7 +2032,7 @@ where
         } else {
             let mut buffer = vec![0_u8; PAGE_SIZE];
             f.read_exact(&mut buffer)?;
-            (buffer, LeafPage::BTREE_ENTRIES_SIZE + 3)
+            (buffer, LeafPage::BTREE_ENTRIES_SIZE.saturating_add(3))
         };
         let mut cursor = Cursor::new(buffer);
 

@@ -89,12 +89,8 @@ impl TryFrom<&[u8]> for StoreRecordKey {
     type Error = MessagingError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() != 16 {
-            return Err(MessagingError::InvalidStoreRecordKeySize(value.len()));
-        }
-
-        let mut record_key = [0; 16];
-        record_key.copy_from_slice(value);
+        let record_key = <[u8; 16]>::try_from(value)
+            .map_err(|_| MessagingError::InvalidStoreRecordKeySize(value.len()))?;
         Ok(Self::new(record_key))
     }
 }
@@ -356,11 +352,11 @@ where
                 *root.block_btree(),
             )?;
 
-            let mut page_cache = pst.node_cache();
+            let mut page_cache = pst.node_cache()?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(NID_MESSAGE_STORE).into();
             let node = node_btree.find_entry(file, node_key, &mut page_cache)?;
 
-            let mut page_cache = pst.block_cache();
+            let mut page_cache = pst.block_cache()?;
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
                 file,
@@ -416,7 +412,7 @@ where
 
                     let file = &mut *file;
                     let node_id = NodeId::new(NodeIdType::HierarchyTable, NID_ROOT_FOLDER.index())?;
-                    let mut page_cache = self.pst.node_cache();
+                    let mut page_cache = self.pst.node_cache()?;
                     let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
                     self.node_btree
                         .find_entry(file, node_key, &mut page_cache)?
