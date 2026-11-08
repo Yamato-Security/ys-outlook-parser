@@ -59,7 +59,7 @@ impl<F: Read + Seek> Reader<F> {
         Self {
             cfb,
             file_len,
-            budget: file_len.saturating_mul(2).saturating_add(1 << 20),
+            budget: file_len.saturating_mul(2).saturating_add(64 << 10),
         }
     }
 
