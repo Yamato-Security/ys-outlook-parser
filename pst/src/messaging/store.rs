@@ -19,7 +19,6 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::{
-    cell::OnceCell,
     collections::BTreeMap,
     fmt::Debug,
     io::{self, Read, Write},
@@ -322,7 +321,6 @@ where
     block_btree: PstFileReadWriteBlockBTree<Pst>,
     properties: StoreProperties,
     store: Weak<Pst::Store>,
-    root_hierarchy_table: OnceCell<io::Result<Rc<dyn TableContext>>>,
 }
 
 impl<Pst> StoreInner<Pst>
@@ -435,42 +433,35 @@ where
             block_btree,
             properties,
             store: Default::default(),
-            root_hierarchy_table: Default::default(),
         })
     }
 
+    /// Read the root folder's hierarchy table. It is not kept: the table holds the store, so a
+    /// store that kept it would hold itself, and neither would ever be dropped (nor the file).
     fn root_hierarchy_table(&self) -> io::Result<Rc<dyn TableContext>> {
-        let hierarchy_table = self
-            .root_hierarchy_table
-            .get_or_init(|| {
-                let store =
-                    self.store
-                        .upgrade()
-                        .ok_or(MessagingError::StoreRootHierarchyTableFailed(
-                            "Store has been dropped".to_string(),
-                        ))?;
-                let node = {
-                    let mut file = self.pst.lock_reader()?;
+        let read = || {
+            let store =
+                self.store
+                    .upgrade()
+                    .ok_or(MessagingError::StoreRootHierarchyTableFailed(
+                        "Store has been dropped".to_string(),
+                    ))?;
+            let node = {
+                let mut file = self.pst.lock_reader()?;
 
-                    let file = &mut *file;
-                    let node_id = NodeId::new(NodeIdType::HierarchyTable, NID_ROOT_FOLDER.index())?;
-                    let mut page_cache = self.pst.node_cache()?;
-                    let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
-                    self.node_btree
-                        .find_entry(file, node_key, &mut page_cache)?
-                };
+                let file = &mut *file;
+                let node_id = NodeId::new(NodeIdType::HierarchyTable, NID_ROOT_FOLDER.index())?;
+                let mut page_cache = self.pst.node_cache()?;
+                let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
+                self.node_btree
+                    .find_entry(file, node_key, &mut page_cache)?
+            };
 
-                <<Pst as PstFile>::TableContext as TableContextReadWrite<Pst>>::read(
-                    store.clone(),
-                    node,
-                )
-            })
-            .as_ref()
-            .map_err(|err| format!("{err:?}"))
-            .cloned()
-            .map_err(MessagingError::StoreRootHierarchyTableFailed)?;
-
-        Ok(hierarchy_table)
+            <<Pst as PstFile>::TableContext as TableContextReadWrite<Pst>>::read(store, node)
+        };
+        read().map_err(|err: io::Error| {
+            MessagingError::StoreRootHierarchyTableFailed(format!("{err:?}")).into()
+        })
     }
 
     fn open_folder(&self, entry_id: &EntryId) -> io::Result<Rc<dyn Folder>> {
@@ -653,5 +644,25 @@ impl StoreReadWrite<AnsiPstFile> for AnsiStore {
 
     fn block_btree(&self) -> &PstFileReadWriteBlockBTree<AnsiPstFile> {
         &self.inner.block_btree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_store_is_dropped_after_its_root_hierarchy_table() {
+        // The store kept its root hierarchy table, which holds the store: neither, nor the file,
+        // was ever dropped.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Empty.pst");
+        let pst = Rc::new(UnicodePstFile::open(path).unwrap());
+        let store = UnicodeStore::read(pst.clone()).unwrap();
+        let table = store.root_hierarchy_table().unwrap();
+        assert!(table.rows_matrix().count() > 0);
+        assert!(store.root_hierarchy_table().is_ok());
+        drop(table);
+        drop(store);
+        assert_eq!(Rc::strong_count(&pst), 1);
     }
 }
