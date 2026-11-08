@@ -16,6 +16,7 @@
 //!
 //! [MS-PST]: https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -372,6 +373,7 @@ impl PstStore {
         let reader = Reader {
             names: &self.names,
             default_code_page: self.default_code_page,
+            embedded: Cell::new(0),
         };
         match &self.inner {
             Inner::Unicode { store, .. } => reader.read::<Unicode>(store, node),
@@ -446,9 +448,15 @@ struct CodePage {
     default: bool,
 }
 
+/// The most embedded messages read in one item, at every level: a corrupt file whose embedded
+/// messages hold themselves again would otherwise be read over and over.
+pub const MAX_EMBEDDED_MESSAGES: usize = 1024;
+
 struct Reader<'a> {
     names: &'a BTreeMap<u16, PropertyName>,
     default_code_page: u32,
+    /// The embedded messages read so far in this item.
+    embedded: Cell<usize>,
 }
 
 impl Reader<'_> {
@@ -508,13 +516,22 @@ impl Reader<'_> {
             Some(AttachmentData::Binary(data)) => Some(data.buffer().to_vec()),
             _ => None,
         };
-        let embedded = K::embedded(&attachment)
-            .map(|embedded| Box::new(self.message::<K>(&embedded, Some(code_page))));
+        let mut problems = Vec::new();
+        let embedded = K::embedded(&attachment).and_then(|embedded| {
+            if self.embedded.get() >= MAX_EMBEDDED_MESSAGES {
+                problems.push(format!(
+                    "more than {MAX_EMBEDDED_MESSAGES} embedded messages in the item: not read"
+                ));
+                return None;
+            }
+            self.embedded.set(self.embedded.get().saturating_add(1));
+            Some(Box::new(self.message::<K>(&embedded, Some(code_page))))
+        });
         AttachmentParts {
             properties,
             data,
             embedded,
-            problems: Vec::new(),
+            problems,
         }
     }
 
