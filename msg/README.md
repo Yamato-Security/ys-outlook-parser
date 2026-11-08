@@ -65,4 +65,13 @@ Reading fails soft: a stream, property, recipient or attachment that cannot be r
 [`Problem`] (of its [`Message`], or of the [`MsgFile`]) and its siblings are still read.
 Nothing panics on any input, allocations are bounded by the size of the input (the total
 amount of stream data read is capped too), and nesting is capped. Only a compound file that
-the `cfb` crate cannot open at all (a broken header, FAT or directory) is an [`Error`].
+the `cfb` crate cannot open at all (a broken header, FAT or directory) is an [`Error`]; one
+whose FAT describes more sectors than the file has is read with the missing sectors as zeros
+(a [`ProblemKind::CompoundFile`] problem).
+
+## Tests
+
+`tests/fixtures/` holds openly licensed sample files (sources and licences in its README).
+`tests/oracle.rs` compares what the crate reads from them with the output of extract-msg
+(`tests/oracle/`, used only as an external oracle), `tests/robustness.rs` mutates them, and
+`cargo run --example msg_dump -- ROOT FILE...` writes the comparison format for any file.
