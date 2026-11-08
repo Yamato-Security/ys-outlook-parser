@@ -192,8 +192,9 @@ pub struct Attachment {
     pub flags: Option<i32>,
     pub hidden: Option<bool>,
     pub rendering_position: Option<i32>,
-    /// The attached file's bytes (`PidTagAttachDataBinary`); none for an embedded message or an
-    /// attachment by reference.
+    /// The attached file's bytes (`PidTagAttachDataBinary`), or for an OLE object in a PST or OST
+    /// the compound file that holds it; none for an embedded message, an attachment by reference,
+    /// or an OLE object in a `.msg` file (whose storage `outlook_msg` gives).
     pub data: Option<Vec<u8>>,
     /// An embedded message (`PidTagAttachDataObject` of method 5).
     pub embedded: Option<Box<Item>>,
@@ -408,27 +409,26 @@ impl<'a> Props<'a> {
 
 impl Item {
     /// An item from what a reader gives: the message's properties, its recipients' and its
-    /// attachments'. `decompress_rtf` turns `PidTagRtfCompressed` into RTF.
+    /// attachments'. A compressed RTF body is decompressed, as far as it goes.
     pub fn build(
         properties: Vec<Property>,
         recipients: Vec<Vec<Property>>,
         attachments: Vec<AttachmentParts>,
         mut problems: Vec<String>,
-        decompress_rtf: impl Fn(&[u8]) -> Result<Vec<u8>, String>,
     ) -> Item {
         let p = Props(&properties);
         let class = p.text(tags::MESSAGE_CLASS);
         let kind = ItemKind::of_class(class.as_deref());
         let rtf_compressed = p.bytes(tags::RTF_COMPRESSED);
-        let rtf = rtf_compressed
-            .as_deref()
-            .and_then(|data| match decompress_rtf(data) {
-                Ok(rtf) => Some(rtf),
-                Err(problem) => {
-                    problems.push(format!("compressed RTF body: {problem}"));
-                    None
-                }
-            });
+        let rtf = rtf_compressed.as_deref().and_then(|data| {
+            let rtf = outlook_msg::decompress_rtf(data);
+            problems.extend(
+                rtf.flags
+                    .iter()
+                    .map(|flag| format!("compressed RTF body: {flag}")),
+            );
+            rtf.rtf
+        });
         let html = match p.get(tags::HTML) {
             Some(Value::String(text)) => Some(text.as_bytes().to_vec()),
             Some(value) => value.as_bytes().map(<[u8]>::to_vec),
@@ -459,7 +459,7 @@ impl Item {
         };
         let item = Item {
             kind,
-            subject: p.text(tags::SUBJECT),
+            subject: p.text(tags::SUBJECT).map(subject),
             conversation_topic: p.text(tags::CONVERSATION_TOPIC),
             conversation_index: p.bytes(tags::CONVERSATION_INDEX),
             sender: Party {
@@ -519,6 +519,17 @@ impl Item {
             problems,
         };
         Item { properties, ..item }
+    }
+}
+
+/// A subject without the marker PST and OST stores may put before it: U+0001 and a character that
+/// gives the length of the subject's prefix ("RE: "), which is not part of the subject. The
+/// property keeps it.
+fn subject(text: String) -> String {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some('\u{1}'), Some(_)) => chars.as_str().to_owned(),
+        _ => text,
     }
 }
 
@@ -718,6 +729,14 @@ mod tests {
     }
 
     #[test]
+    fn subjects_without_their_prefix_marker() {
+        assert_eq!(subject("\u{1}\u{1}Test".into()), "Test");
+        assert_eq!(subject("\u{1}\u{5}RE: Test".into()), "RE: Test");
+        assert_eq!(subject("Test".into()), "Test");
+        assert_eq!(subject("\u{1}".into()), "\u{1}");
+    }
+
+    #[test]
     fn an_item_from_its_properties() {
         let properties = vec![
             text(tags::MESSAGE_CLASS, "IPM.Task"),
@@ -757,9 +776,7 @@ mod tests {
             ],
             ..AttachmentParts::default()
         }];
-        let item = Item::build(properties, recipients, attachments, Vec::new(), |_| {
-            Err("no RTF".into())
-        });
+        let item = Item::build(properties, recipients, attachments, Vec::new());
         assert_eq!(item.kind, ItemKind::Task);
         assert_eq!(item.subject.as_deref(), Some("Report"));
         assert_eq!(item.sender.name.as_deref(), Some("Alice"));

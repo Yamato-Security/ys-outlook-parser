@@ -8,7 +8,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-license.workspace = true
+# Our own code, so the RPL only (the pst and rtf crates it uses are under the RPL and MIT)
+license = "RPL-1.5"
 keywords.workspace = true
 categories.workspace = true
 
@@ -16,5 +17,5 @@ categories.workspace = true
 name = "outlook"
 
 [dependencies]
-compressed-rtf.workspace = true
-outlook-pst = { package = "ys-outlook-parser-pst", path = "../pst" }
+outlook-msg = { package = "ys-outlook-parser-msg", version = "1.0.0", path = "../msg" }
+outlook-pst = { package = "ys-outlook-parser-pst", version = "1.0.0", path = "../pst" }

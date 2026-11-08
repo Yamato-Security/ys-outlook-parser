@@ -16,11 +16,34 @@
 //! sender, recipients, times, bodies and attachments, and the fields of contacts, calendar items
 //! and tasks) are read from its properties, and every property is kept as stored.
 
+// It reads what the readers give, from untrusted files: no unchecked indexing or arithmetic,
+// and no unwrap, expect or panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 pub mod item;
 pub mod mapi;
+pub mod msg;
+pub mod pst;
 
 pub use item::{
     Appointment, Attachment, AttachmentParts, Body, Contact, Item, ItemKind, Party, Recipient,
     RecipientKind, Reminder, Task,
 };
 pub use mapi::{NameId, Property, PropertyName, Value};
+pub use msg::MsgItem;
+pub use pst::{Folder, PstStore, StoreInfo, StoreItem};
+
+/// The readers this crate builds on, for what its model does not cover.
+pub use {outlook_msg, outlook_pst};

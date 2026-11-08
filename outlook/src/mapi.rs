@@ -76,14 +76,30 @@ pub enum Value {
     Object,
     /// A multi-valued type's values.
     Multiple(Vec<Value>),
-    /// A type this reader does not decode.
-    Unsupported,
+    /// A type this reader does not decode: the bytes as stored.
+    Unsupported(Vec<u8>),
+    /// A damaged value: what could be recovered from it, the bytes as stored (as far as they
+    /// could be read), and why.
+    Damaged {
+        recovered: Option<Box<Value>>,
+        raw: Vec<u8>,
+        reason: String,
+    },
 }
 
 impl Value {
+    /// The value itself, or what was recovered from a damaged one. The `as_` methods read
+    /// through it.
+    pub fn best_effort(&self) -> Option<&Value> {
+        match self {
+            Value::Damaged { recovered, .. } => recovered.as_deref(),
+            value => Some(value),
+        }
+    }
+
     /// The text of a string value (`PtypString` or `PtypString8`).
     pub fn as_str(&self) -> Option<&str> {
-        match self {
+        match self.best_effort()? {
             Value::String(text) | Value::String8 { text, .. } => Some(text),
             _ => None,
         }
@@ -91,7 +107,7 @@ impl Value {
 
     /// An integer value of any width.
     pub fn as_i64(&self) -> Option<i64> {
-        match *self {
+        match *self.best_effort()? {
             Value::Integer16(v) => Some(i64::from(v)),
             Value::Integer32(v) => Some(i64::from(v)),
             Value::Integer64(v) => Some(v),
@@ -101,7 +117,7 @@ impl Value {
     }
 
     pub fn as_bool(&self) -> Option<bool> {
-        match *self {
+        match *self.best_effort()? {
             Value::Boolean(v) => Some(v),
             _ => self.as_i64().map(|v| v != 0),
         }
@@ -109,14 +125,14 @@ impl Value {
 
     /// A FILETIME (`PtypTime`); none for zero.
     pub fn as_filetime(&self) -> Option<i64> {
-        match *self {
+        match *self.best_effort()? {
             Value::Time(ticks) if ticks != 0 => Some(ticks),
             _ => None,
         }
     }
 
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
+        match self.best_effort()? {
             Value::Binary(bytes) | Value::String8 { bytes, .. } => Some(bytes),
             _ => None,
         }
@@ -124,7 +140,7 @@ impl Value {
 
     /// The values of a multi-valued property.
     pub fn as_multiple(&self) -> Option<&[Value]> {
-        match self {
+        match self.best_effort()? {
             Value::Multiple(values) => Some(values),
             _ => None,
         }
@@ -242,6 +258,7 @@ pub mod tags {
     pub const MESSAGE_SIZE: u16 = 0x0E08;
     pub const NORMALIZED_SUBJECT: u16 = 0x0E1D;
     pub const ATTACH_SIZE: u16 = 0x0E20;
+    pub const RECORD_KEY: u16 = 0x0FF9;
     pub const ENTRY_ID: u16 = 0x0FFF;
     pub const BODY: u16 = 0x1000;
     pub const RTF_COMPRESSED: u16 = 0x1009;
@@ -266,6 +283,10 @@ pub mod tags {
     pub const ATTACH_CONTENT_ID: u16 = 0x3712;
     pub const ATTACH_CONTENT_LOCATION: u16 = 0x3713;
     pub const ATTACH_FLAGS: u16 = 0x3714;
+    pub const CONTENT_COUNT: u16 = 0x3602;
+    pub const CONTENT_UNREAD_COUNT: u16 = 0x3603;
+    pub const SUBFOLDERS: u16 = 0x360A;
+    pub const CONTAINER_CLASS: u16 = 0x3613;
     pub const SMTP_ADDRESS: u16 = 0x39FE;
     pub const GIVEN_NAME: u16 = 0x3A06;
     pub const BUSINESS_TELEPHONE_NUMBER: u16 = 0x3A08;
@@ -277,6 +298,7 @@ pub mod tags {
     pub const MOBILE_TELEPHONE_NUMBER: u16 = 0x3A1C;
     pub const NICKNAME: u16 = 0x3A4F;
     pub const INTERNET_CODEPAGE: u16 = 0x3FDE;
+    pub const MESSAGE_LOCALE_ID: u16 = 0x3FF1;
     pub const MESSAGE_CODEPAGE: u16 = 0x3FFD;
     pub const SENDER_SMTP_ADDRESS: u16 = 0x5D01;
     pub const SENT_REPRESENTING_SMTP_ADDRESS: u16 = 0x5D02;
