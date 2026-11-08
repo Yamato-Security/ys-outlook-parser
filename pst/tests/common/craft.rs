@@ -104,6 +104,40 @@ impl UnicodePst {
         (self.u64_at(entry + 8), self.u64_at(entry + 16) as usize)
     }
 
+    /// The file offset of the leaf entry for `key` in the B-tree whose root page is at `root`, and
+    /// the offset of the leaf page that holds it.
+    pub fn find_leaf_entry(&self, root: usize, key: u64) -> (usize, usize) {
+        let mut page = root;
+        loop {
+            let count = self.page_entry_count(page);
+            let entry_size = usize::from(self.0[page + 490]);
+            if self.page_level(page) == 0 {
+                let entry = (0..count)
+                    .map(|i| page + i * entry_size)
+                    .find(|entry| self.u64_at(*entry) & !1 == key & !1)
+                    .unwrap();
+                return (entry, page);
+            }
+            let child = (0..count)
+                .map(|i| page + i * entry_size)
+                .take_while(|entry| self.u64_at(*entry) <= key)
+                .last()
+                .unwrap();
+            page = self.u64_at(child + 16) as usize;
+        }
+    }
+
+    /// The file offset of the BBT entry (BBTENTRY: BREF, cb, cRef) of block `bid`, and of its page.
+    pub fn bbt_entry(&self, bid: u64) -> (usize, usize) {
+        self.find_leaf_entry(self.bbt_root(), bid)
+    }
+
+    /// The file offset of the NBT entry (NBTENTRY: nid, bidData, bidSub, nidParent) of node `nid`,
+    /// and of its page.
+    pub fn nbt_entry(&self, nid: u32) -> (usize, usize) {
+        self.find_leaf_entry(self.nbt_root(), u64::from(nid))
+    }
+
     /// Recompute the header's dwCRCPartial and dwCRCFull.
     pub fn fix_header_crcs(&mut self) {
         let partial = crc(&self.0[8..8 + 471]);

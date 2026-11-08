@@ -173,6 +173,7 @@ dependencies = [
  "flate2",
  "thiserror",
  "tracing",
+ "ys-outlook-parser-rtf",
 ]
 
 [[package]]

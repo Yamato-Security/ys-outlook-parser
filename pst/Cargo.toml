@@ -22,3 +22,7 @@ byteorder.workspace = true
 flate2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The mutation test decompresses the RTF bodies it reads.
+compressed-rtf.workspace = true
