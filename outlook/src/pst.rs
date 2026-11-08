@@ -580,7 +580,7 @@ impl Reader<'_> {
         parent: Option<CodePage>,
     ) -> CodePage {
         let int = |id: u16| match get(id) {
-            Some(PropertyValue::Integer32(v)) => u32::try_from(*v).ok(),
+            Some(PropertyValue::Integer32(v)) => u32::try_from(*v).ok().filter(|&v| v != 0),
             _ => None,
         };
         let found = int(tags::MESSAGE_CODEPAGE)
@@ -722,12 +722,25 @@ fn string8(bytes: &[u8], code_page: u32) -> Value {
     }
 }
 
-fn unicode(units: &[u16]) -> Value {
-    Value::String(
-        String::from_utf16_lossy(units)
-            .trim_end_matches('\0')
-            .to_owned(),
-    )
+fn unicode(units: &[u16], trailing_byte: Option<u8>) -> Value {
+    match String::from_utf16(units) {
+        Ok(text) if trailing_byte.is_none() => {
+            Value::String(text.trim_end_matches('\0').to_owned())
+        }
+        _ => Value::Damaged {
+            recovered: Some(Box::new(Value::String(
+                String::from_utf16_lossy(units)
+                    .trim_end_matches('\0')
+                    .to_owned(),
+            ))),
+            raw: units
+                .iter()
+                .flat_map(|unit| unit.to_le_bytes())
+                .chain(trailing_byte)
+                .collect(),
+            reason: "text is not valid UTF-16LE".into(),
+        },
+    }
 }
 
 fn value(value: &PropertyValue, code_page: u32) -> Value {
@@ -748,7 +761,7 @@ fn value(value: &PropertyValue, code_page: u32) -> Value {
         V::Boolean(v) => Value::Boolean(*v),
         V::Integer64(v) => Value::Integer64(*v),
         V::String8(s) => string8(s.buffer(), code_page),
-        V::Unicode(s) => unicode(s.buffer()),
+        V::Unicode(s) => unicode(s.buffer(), s.trailing_byte()),
         V::Time(v) => Value::Time(*v),
         V::Guid(g) => guid_of(g),
         V::Binary(b) => Value::Binary(b.buffer().to_vec()),
@@ -761,7 +774,11 @@ fn value(value: &PropertyValue, code_page: u32) -> Value {
         V::MultipleFloatingTime(v) => many(v.iter().map(|&v| Value::FloatingTime(v)).collect()),
         V::MultipleInteger64(v) => many(v.iter().map(|&v| Value::Integer64(v)).collect()),
         V::MultipleString8(v) => many(v.iter().map(|s| string8(s.buffer(), code_page)).collect()),
-        V::MultipleUnicode(v) => many(v.iter().map(|s| unicode(s.buffer())).collect()),
+        V::MultipleUnicode(v) => many(
+            v.iter()
+                .map(|s| unicode(s.buffer(), s.trailing_byte()))
+                .collect(),
+        ),
         V::MultipleTime(v) => many(v.iter().map(|&v| Value::Time(v)).collect()),
         V::MultipleGuid(v) => many(v.iter().map(guid_of).collect()),
         V::MultipleBinary(v) => many(
@@ -769,5 +786,50 @@ fn value(value: &PropertyValue, code_page: u32) -> Value {
                 .map(|b| Value::Binary(b.buffer().to_vec()))
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_message_codepage_does_not_hide_the_locale_or_parent() {
+        let names = BTreeMap::new();
+        let reader = Reader {
+            names: &names,
+            default_code_page: 1252,
+            embedded: Cell::new(0),
+        };
+        let properties = BTreeMap::from([
+            (tags::MESSAGE_CODEPAGE, PropertyValue::Integer32(0)),
+            (tags::MESSAGE_LOCALE_ID, PropertyValue::Integer32(1041)),
+        ]);
+        let codepage = reader.code_page(|id| properties.get(&id), None);
+        assert_eq!(codepage.code_page, 932);
+        assert!(!codepage.default);
+        let properties = BTreeMap::from([(tags::MESSAGE_CODEPAGE, PropertyValue::Integer32(0))]);
+        let codepage = reader.code_page(
+            |id| properties.get(&id),
+            Some(CodePage {
+                code_page: 1251,
+                default: false,
+            }),
+        );
+        assert_eq!(codepage.code_page, 1251);
+        let codepage = reader.code_page(|id| properties.get(&id), None);
+        assert_eq!(codepage.code_page, 1252);
+        assert!(codepage.default);
+    }
+
+    #[test]
+    fn pst_unicode_keeps_invalid_surrogate_bytes() {
+        let raw = b"A\0\0\xd8B\0";
+        let parsed = unicode(&[0x0041, 0xD800, 0x0042], None);
+        assert_eq!(parsed.as_str(), Some("A\u{FFFD}B"));
+        assert!(matches!(parsed, Value::Damaged { raw: stored, .. } if stored == raw));
+        let parsed = unicode(&[0x0041], Some(0xFF));
+        assert_eq!(parsed.as_str(), Some("A"));
+        assert!(matches!(parsed, Value::Damaged { raw: stored, .. } if stored == b"A\0\xff"));
     }
 }

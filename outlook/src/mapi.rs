@@ -88,13 +88,14 @@ pub enum Value {
 }
 
 impl Value {
-    /// The value itself, or what was recovered from a damaged one. The `as_` methods read
-    /// through it.
+    /// The value itself, or what was recovered from a damaged one, through any nested
+    /// recovery records. The `as_` methods read through them too.
     pub fn best_effort(&self) -> Option<&Value> {
-        match self {
-            Value::Damaged { recovered, .. } => recovered.as_deref(),
-            value => Some(value),
+        let mut value = self;
+        while let Value::Damaged { recovered, .. } = value {
+            value = recovered.as_deref()?;
         }
+        Some(value)
     }
 
     /// The text of a string value (`PtypString` or `PtypString8`).
@@ -420,6 +421,30 @@ mod tests {
         assert_eq!(
             Property::new(0x0037, 0x001F, Value::Null).tag(),
             0x0037_001F
+        );
+    }
+
+    #[test]
+    fn nested_recovery_wrappers_keep_readable_values() {
+        let damaged = |value| Value::Damaged {
+            recovered: Some(Box::new(value)),
+            raw: vec![0xFF],
+            reason: "recovered text in a partially read property".into(),
+        };
+        let value = damaged(damaged(Value::String("recovered".into())));
+        assert_eq!(value.as_str(), Some("recovered"));
+        let value = damaged(damaged(Value::Integer32(42)));
+        assert_eq!(value.as_i64(), Some(42));
+        let value = damaged(damaged(Value::Binary(vec![1, 2])));
+        assert_eq!(value.as_bytes(), Some(&[1, 2][..]));
+        assert!(
+            damaged(Value::Damaged {
+                recovered: None,
+                raw: vec![],
+                reason: "missing".into()
+            })
+            .best_effort()
+            .is_none()
         );
     }
 }

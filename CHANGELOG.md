@@ -37,6 +37,17 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
   (@YamatoSecurity)
 
 ### Fixed
+- The unified item model could display an ANSI fallback even when a Unicode string or the
+  canonical binary HTML body was available, and an empty long attachment filename could hide
+  a usable short filename. (@YamatoSecurity)
+- Malformed Unicode properties lost their original bytes when converted to the unified
+  model. Invalid code units and unmatched final bytes are now retained alongside the
+  recovered text, including multi-valued properties. (@YamatoSecurity)
+- UTF-16BE text with an unmatched final byte was not flagged as lossy. (@YamatoSecurity)
+- A zero PST message code page prevented the locale, parent message or default code page
+  from being used. (@YamatoSecurity)
+- Nested recovery records and recovered categories, task progress and attachment data
+  could disappear from the unified item's fields. (@YamatoSecurity)
 - From upstream pull requests (MIT): `PtypObject` property records (#86), every BTH record read
   instead of stopping at the first bad one (#87), an embedded message read from the attachment's
   own sub-nodes (#88), the GUID kept when hashing a string-named property (#89), an HNID of 0 read

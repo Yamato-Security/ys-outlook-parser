@@ -16,11 +16,116 @@
 
 mod common;
 
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
 use outlook::msg::FileKind;
 use outlook::pst::{Encryption, Format, Options, PstStore, StoreKind};
 use outlook::{Item, ItemKind, MsgItem, RecipientKind};
+
+/// A synthetic MSG containing just the supplied property streams.
+fn synthetic_msg(streams: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    file.create_stream("/__properties_version1.0")
+        .unwrap()
+        .write_all(&[0; 32])
+        .unwrap();
+    for (name, data) in streams {
+        file.create_stream(name).unwrap().write_all(data).unwrap();
+    }
+    file.into_inner().into_inner()
+}
+
+#[test]
+fn unified_fields_prefer_unicode_to_ansi() {
+    let subject: Vec<u8> = "日本語 subject"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let body: Vec<u8> = "日本語 body"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let bytes = synthetic_msg(&[
+        ("/__substg1.0_0037001E", b"??? subject"),
+        ("/__substg1.0_0037001F", &subject),
+        ("/__substg1.0_1000001E", b"??? body"),
+        ("/__substg1.0_1000001F", &body),
+    ]);
+    let raw = outlook::outlook_msg::MsgFile::from_bytes(&bytes).unwrap();
+    let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+    assert_eq!(raw.message.subject(), Some("日本語 subject"));
+    assert_eq!(msg.item.subject.as_deref(), raw.message.subject());
+    assert_eq!(msg.item.body.text.as_deref(), raw.message.body());
+    assert_eq!(
+        msg.item.properties.len(),
+        4,
+        "both representations remain available"
+    );
+}
+
+#[test]
+fn unified_html_uses_the_same_representation_as_the_msg_reader() {
+    let unicode: Vec<u8> = "<p>日本語</p>"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    for binary in [None, Some(b"<p>canonical binary HTML</p>".as_slice())] {
+        let mut streams = vec![
+            ("/__substg1.0_1013001E", b"<p>ANSI fallback</p>".as_slice()),
+            ("/__substg1.0_1013001F", unicode.as_slice()),
+        ];
+        if let Some(binary) = binary {
+            streams.push(("/__substg1.0_10130102", binary));
+        }
+        let bytes = synthetic_msg(&streams);
+        let raw = outlook::outlook_msg::MsgFile::from_bytes(&bytes).unwrap();
+        let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+        let expected = binary.unwrap_or("<p>日本語</p>".as_bytes());
+        assert_eq!(msg.item.body.html.as_deref(), Some(expected));
+        assert_eq!(
+            raw.message.html.as_ref().unwrap().as_str().as_bytes(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn unified_unicode_properties_preserve_malformed_bytes() {
+    let raw = b"A\0\0\xd8B\0\xff";
+    let bytes = synthetic_msg(&[("/__substg1.0_0037001F", raw)]);
+    let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+    assert_eq!(msg.item.subject.as_deref(), Some("A\u{FFFD}B"));
+    assert!(msg.item.problems.iter().any(|p| p.contains("not valid")));
+    let property = msg.item.properties.iter().find(|p| p.id == 0x0037).unwrap();
+    match &property.value {
+        outlook::Value::Damaged {
+            raw: stored,
+            recovered: Some(value),
+            ..
+        } => {
+            assert_eq!(stored, raw);
+            assert_eq!(value.as_str(), Some("A\u{FFFD}B"));
+        }
+        other => panic!("malformed Unicode lost its raw bytes: {other:?}"),
+    }
+}
+
+#[test]
+fn unified_multivalue_unicode_preserves_each_malformed_element() {
+    let raw = b"B\0\xff";
+    let lengths = [2u32.to_le_bytes(), (raw.len() as u32).to_le_bytes()].concat();
+    let bytes = synthetic_msg(&[
+        ("/__substg1.0_3001101F", &lengths),
+        ("/__substg1.0_3001101F-00000000", b"A\0"),
+        ("/__substg1.0_3001101F-00000001", raw),
+    ]);
+    let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+    let property = msg.item.properties.iter().find(|p| p.id == 0x3001).unwrap();
+    let values = property.value.as_multiple().unwrap();
+    assert_eq!(values[0].as_str(), Some("A"));
+    assert_eq!(values[1].as_str(), Some("B"));
+    assert!(matches!(&values[1], outlook::Value::Damaged { raw: stored, .. } if stored == raw));
+}
 
 fn store(name: &str) -> PstStore {
     PstStore::from_reader(Cursor::new(common::pst_fixture(name)), &Options::default()).unwrap()

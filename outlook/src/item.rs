@@ -205,10 +205,14 @@ pub struct Attachment {
 impl Attachment {
     /// The best name to show: the long filename, the short one, or the display name.
     pub fn name(&self) -> Option<&str> {
-        self.long_filename
-            .as_deref()
-            .or(self.filename.as_deref())
-            .or(self.display_name.as_deref())
+        [
+            self.long_filename.as_deref(),
+            self.filename.as_deref(),
+            self.display_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|name| !name.is_empty())
     }
 
     pub fn is_inline(&self) -> bool {
@@ -385,11 +389,25 @@ impl<'a> Props<'a> {
     }
 
     pub fn text(&self, id: u16) -> Option<String> {
-        self.get(id).and_then(Value::as_str).map(str::to_owned)
+        preferred_text(
+            self.0
+                .iter()
+                .filter(|p| p.id == id && p.name.is_none())
+                .map(|p| &p.value),
+        )
     }
 
     fn named_string(&self, lid: lids::Lid) -> Option<String> {
-        self.named(lid).and_then(Value::as_str).map(str::to_owned)
+        preferred_text(
+            self.0
+                .iter()
+                .filter(|p| {
+                    p.name
+                        .as_ref()
+                        .is_some_and(|name| name.set == lid.0 && name.id == NameId::Number(lid.1))
+                })
+                .map(|p| &p.value),
+        )
     }
 
     pub fn int(&self, id: u16) -> Option<i64> {
@@ -407,6 +425,46 @@ impl<'a> Props<'a> {
     pub fn bytes(&self, id: u16) -> Option<Vec<u8>> {
         self.get(id).and_then(Value::as_bytes).map(<[u8]>::to_vec)
     }
+
+    fn html(&self) -> Option<Vec<u8>> {
+        let value = self
+            .0
+            .iter()
+            .filter(|p| p.id == tags::HTML && p.name.is_none())
+            .filter_map(|p| {
+                let value = p.value.best_effort()?;
+                let rank = match value {
+                    Value::Binary(_) => 0,
+                    Value::String(_) => 1,
+                    Value::String8 { .. } => 2,
+                    _ => return None,
+                };
+                Some(((matches!(p.value, Value::Damaged { .. }), rank), value))
+            })
+            .min_by_key(|(rank, _)| *rank)?
+            .1;
+        match value {
+            Value::String(text) => Some(text.as_bytes().to_vec()),
+            other => other.as_bytes().map(<[u8]>::to_vec),
+        }
+    }
+}
+
+/// Prefer a clean string over a recovered one, and Unicode over String8 at the same quality.
+/// Every source property remains available regardless of which representation is displayed.
+fn preferred_text<'a>(values: impl Iterator<Item = &'a Value>) -> Option<String> {
+    values
+        .filter_map(|value| {
+            let decoded = value.best_effort()?;
+            let text = decoded.as_str()?;
+            let rank = (
+                matches!(value, Value::Damaged { .. }),
+                matches!(decoded, Value::String8 { .. }),
+            );
+            Some((rank, text))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, text)| text.to_owned())
 }
 
 impl Item {
@@ -431,13 +489,10 @@ impl Item {
             );
             rtf.rtf
         });
-        let html = match p.get(tags::HTML).and_then(Value::best_effort) {
-            Some(Value::String(text)) => Some(text.as_bytes().to_vec()),
-            Some(value) => value.as_bytes().map(<[u8]>::to_vec),
-            None => None,
-        };
+        let html = p.html();
         let categories = p
             .named_text(sets::PUBLIC_STRINGS, "Keywords")
+            .and_then(Value::best_effort)
             .map(|value| match value {
                 Value::Multiple(values) => values
                     .iter()
@@ -554,10 +609,12 @@ fn recipient(index: usize, properties: Vec<Property>) -> Recipient {
 
 fn attachment(index: usize, parts: AttachmentParts) -> Attachment {
     let p = Props(&parts.properties);
-    let data = parts.data.or_else(|| match p.get(tags::ATTACH_DATA) {
-        Some(Value::Binary(bytes)) => Some(bytes.clone()),
-        _ => None,
-    });
+    let data = parts.data.or_else(
+        || match p.get(tags::ATTACH_DATA).and_then(Value::best_effort) {
+            Some(Value::Binary(bytes)) => Some(bytes.clone()),
+            _ => None,
+        },
+    );
     Attachment {
         index,
         method: p.int32(tags::ATTACH_METHOD),
@@ -668,11 +725,14 @@ fn appointment(p: &Props<'_>) -> Appointment {
 fn task(p: &Props<'_>) -> Task {
     Task {
         status: p.named(lids::TASK_STATUS).and_then(Value::as_i64),
-        percent_complete: p.named(lids::PERCENT_COMPLETE).and_then(|v| match v {
-            Value::Floating64(f) => Some(*f),
-            Value::Floating32(f) => Some(f64::from(*f)),
-            _ => None,
-        }),
+        percent_complete: p
+            .named(lids::PERCENT_COMPLETE)
+            .and_then(Value::best_effort)
+            .and_then(|v| match v {
+                Value::Floating64(f) => Some(*f),
+                Value::Floating32(f) => Some(f64::from(*f)),
+                _ => None,
+            }),
         start: p.named(lids::TASK_START_DATE).and_then(Value::as_filetime),
         due: p.named(lids::TASK_DUE_DATE).and_then(Value::as_filetime),
         completed: p
@@ -736,6 +796,111 @@ mod tests {
         assert_eq!(subject("\u{1}\u{5}RE: Test".into()), "RE: Test");
         assert_eq!(subject("Test".into()), "Test");
         assert_eq!(subject("\u{1}".into()), "\u{1}");
+    }
+
+    #[test]
+    fn empty_attachment_names_do_not_hide_usable_fallbacks() {
+        for (short, display, expected) in [
+            ("payload.txt", "display.txt", Some("payload.txt")),
+            ("", "display.txt", Some("display.txt")),
+            ("", "", None),
+        ] {
+            let item = Item::build(
+                Vec::new(),
+                Vec::new(),
+                vec![AttachmentParts {
+                    properties: vec![
+                        text(tags::ATTACH_LONG_FILENAME, ""),
+                        text(tags::ATTACH_FILENAME, short),
+                        text(tags::DISPLAY_NAME, display),
+                    ],
+                    ..Default::default()
+                }],
+                Vec::new(),
+            );
+            assert_eq!(item.attachments[0].name(), expected);
+        }
+    }
+
+    #[test]
+    fn recovered_metadata_remains_available_to_the_item_fields() {
+        let damaged = |value| Value::Damaged {
+            recovered: Some(Box::new(value)),
+            raw: vec![0xFF],
+            reason: "partial property".into(),
+        };
+        let mut categories = Property::new(
+            0x8001,
+            types::STRING | types::MULTIPLE,
+            damaged(Value::Multiple(vec![Value::String("Investigate".into())])),
+        );
+        categories.name = Some(PropertyName {
+            set: sets::PUBLIC_STRINGS,
+            id: NameId::Text("Keywords".into()),
+        });
+        let properties = vec![
+            text(tags::MESSAGE_CLASS, "IPM.Task"),
+            categories,
+            named(
+                sets::TASK,
+                0x8102,
+                damaged(Value::Floating64(0.5)),
+                types::FLOATING64,
+            ),
+        ];
+        let attachments = vec![AttachmentParts {
+            properties: vec![Property::new(
+                tags::ATTACH_DATA,
+                types::BINARY,
+                damaged(Value::Binary(b"partial".to_vec())),
+            )],
+            ..Default::default()
+        }];
+        let item = Item::build(properties, Vec::new(), attachments, Vec::new());
+        assert_eq!(item.categories, ["Investigate"]);
+        assert_eq!(item.task.as_ref().unwrap().percent_complete, Some(0.5));
+        assert_eq!(
+            item.attachments[0].data.as_deref(),
+            Some(b"partial".as_slice())
+        );
+        assert!(matches!(
+            item.attachments[0].properties[0].value,
+            Value::Damaged { .. }
+        ));
+    }
+
+    #[test]
+    fn string_selection_uses_clean_values_then_recovered_values() {
+        let recovered = Property::new(
+            tags::SUBJECT,
+            types::STRING,
+            Value::Damaged {
+                recovered: Some(Box::new(Value::String("recovered".into()))),
+                raw: vec![],
+                reason: "damaged".into(),
+            },
+        );
+        let ansi = Property::new(
+            tags::SUBJECT,
+            types::STRING8,
+            Value::String8 {
+                bytes: b"clean".to_vec(),
+                text: "clean".into(),
+            },
+        );
+        let unsupported = Property::new(tags::SUBJECT, types::NULL, Value::Unsupported(vec![]));
+        assert_eq!(
+            Props(&[unsupported.clone(), recovered.clone(), ansi])
+                .text(tags::SUBJECT)
+                .as_deref(),
+            Some("clean")
+        );
+        assert_eq!(
+            Props(&[unsupported, recovered])
+                .text(tags::SUBJECT)
+                .as_deref(),
+            Some("recovered")
+        );
     }
 
     #[test]

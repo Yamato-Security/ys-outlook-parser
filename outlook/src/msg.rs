@@ -150,6 +150,19 @@ fn text(text: &outlook_msg::Text) -> Value {
     }
 }
 
+fn unicode(text: &outlook_msg::Text) -> Value {
+    let value = Value::String(text.as_str().to_owned());
+    if text.is_lossy() {
+        Value::Damaged {
+            recovered: Some(Box::new(value)),
+            raw: text.raw().to_vec(),
+            reason: "text is not valid UTF-16LE".into(),
+        }
+    } else {
+        value
+    }
+}
+
 fn value(value: &outlook_msg::Value) -> Value {
     use outlook_msg::Value as V;
     let many = |values: Vec<Value>| Value::Multiple(values);
@@ -165,7 +178,7 @@ fn value(value: &outlook_msg::Value) -> Value {
         V::Boolean(v) => Value::Boolean(*v),
         V::Integer64(v) => Value::Integer64(*v),
         V::String8(t) => text(t),
-        V::Unicode(t) => Value::String(t.as_str().to_owned()),
+        V::Unicode(t) => unicode(t),
         V::Time(v) => Value::Time(*v),
         V::Guid(g) => Value::Guid(g.0),
         V::Binary(b) => Value::Binary(b.clone()),
@@ -178,11 +191,7 @@ fn value(value: &outlook_msg::Value) -> Value {
         V::MultipleFloatingTime(v) => many(v.iter().map(|&v| Value::FloatingTime(v)).collect()),
         V::MultipleInteger64(v) => many(v.iter().map(|&v| Value::Integer64(v)).collect()),
         V::MultipleString8(v) => many(v.iter().map(text).collect()),
-        V::MultipleUnicode(v) => many(
-            v.iter()
-                .map(|t| Value::String(t.as_str().to_owned()))
-                .collect(),
-        ),
+        V::MultipleUnicode(v) => many(v.iter().map(unicode).collect()),
         V::MultipleTime(v) => many(v.iter().map(|&v| Value::Time(v)).collect()),
         V::MultipleGuid(v) => many(v.iter().map(|g| Value::Guid(g.0)).collect()),
         V::MultipleBinary(v) => many(v.iter().map(|b| Value::Binary(b.clone())).collect()),

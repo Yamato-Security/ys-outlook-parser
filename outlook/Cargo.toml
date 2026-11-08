@@ -21,5 +21,6 @@ outlook-msg = { package = "ys-outlook-parser-msg", version = "1.0.0", path = "..
 outlook-pst = { package = "ys-outlook-parser-pst", version = "1.0.0", path = "../pst" }
 
 [dev-dependencies]
+cfb.workspace = true
 flate2.workspace = true
 sha2.workspace = true

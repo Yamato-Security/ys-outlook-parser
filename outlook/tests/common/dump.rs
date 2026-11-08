@@ -61,8 +61,8 @@ fn bytes(value: &Value) -> Option<Vec<u8>> {
 fn multiple(values: &[Value]) -> Option<Vec<u8>> {
     let variable = values.first().is_some_and(|v| {
         matches!(
-            v,
-            Value::String(_) | Value::String8 { .. } | Value::Binary(_)
+            v.best_effort(),
+            Some(Value::String(_) | Value::String8 { .. } | Value::Binary(_))
         )
     });
     let parts: Vec<Vec<u8>> = values.iter().map(bytes).collect::<Option<_>>()?;

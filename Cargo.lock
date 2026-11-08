@@ -417,6 +417,7 @@ dependencies = [
 name = "ys-outlook-parser"
 version = "1.0.0"
 dependencies = [
+ "cfb",
  "flate2",
  "sha2",
  "ys-outlook-parser-msg",

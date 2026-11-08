@@ -246,11 +246,35 @@ impl Debug for String8Value {
 #[derive(Clone, Default)]
 pub struct UnicodeValue {
     buffer: Vec<u16>,
+    trailing_byte: Option<u8>,
 }
 
 impl UnicodeValue {
     pub fn buffer(&self) -> &[u16] {
         &self.buffer
+    }
+
+    /// An unmatched final byte of an unterminated UTF-16 value. It is not a code unit,
+    /// but is retained so a forensic consumer can distinguish damage from valid text.
+    pub fn trailing_byte(&self) -> Option<u8> {
+        self.trailing_byte
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        let buffer: Vec<u16> = pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        // Bytes after a string terminator are padding, not part of the string value.
+        let trailing_byte = (buffer.len() == pairs.len())
+            .then(|| rest.first().copied())
+            .flatten();
+        Self {
+            buffer,
+            trailing_byte,
+        }
     }
 }
 
@@ -508,7 +532,9 @@ impl PropertyValue {
             | Self::Object(_) => 8,
             Self::Guid(_) => 16,
             Self::String8(value) => size(value.buffer()),
-            Self::Unicode(value) => size(value.buffer()),
+            Self::Unicode(value) => {
+                size(value.buffer()).saturating_add(u64::from(value.trailing_byte().is_some()))
+            }
             Self::Binary(value) => size(value.buffer()),
             Self::MultipleInteger16(values) => size(values),
             Self::MultipleInteger32(values) => size(values),
@@ -520,7 +546,9 @@ impl PropertyValue {
             Self::MultipleTime(values) => size(values),
             Self::MultipleGuid(values) => size(values),
             Self::MultipleString8(values) => sizes(values, |value| size(value.buffer())),
-            Self::MultipleUnicode(values) => sizes(values, |value| size(value.buffer())),
+            Self::MultipleUnicode(values) => sizes(values, |value| {
+                size(value.buffer()).saturating_add(u64::from(value.trailing_byte().is_some()))
+            }),
             Self::MultipleBinary(values) => sizes(values, |value| size(value.buffer())),
         }
     }
@@ -646,14 +674,9 @@ impl PropertyValueReadWrite for PropertyValue {
             }
 
             PropertyType::Unicode => {
-                let mut buffer = Vec::new();
-                while let Ok(ch) = f.read_u16::<LittleEndian>() {
-                    if ch == 0 {
-                        break;
-                    }
-                    buffer.push(ch);
-                }
-                Ok(Self::Unicode(UnicodeValue { buffer }))
+                let mut bytes = Vec::new();
+                f.read_to_end(&mut bytes)?;
+                Ok(Self::Unicode(UnicodeValue::from_bytes(&bytes)))
             }
 
             PropertyType::Time => {
@@ -761,17 +784,7 @@ impl PropertyValueReadWrite for PropertyValue {
                 let data = read_value(f)?;
                 let values = multi_value_items(&data)?
                     .into_iter()
-                    .map(|item| {
-                        // An odd last byte is not part of a UTF-16 code unit.
-                        let buffer = item
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|ch| u16::from_le_bytes(*ch))
-                            .take_while(|&ch| ch != 0)
-                            .collect();
-                        UnicodeValue { buffer }
-                    })
+                    .map(UnicodeValue::from_bytes)
                     .collect();
                 Ok(Self::MultipleUnicode(values))
             }
@@ -1305,6 +1318,23 @@ mod tests {
             panic!("MultipleUnicode");
         };
         assert_eq!(values[0].to_string(), "hi");
+    }
+
+    #[test]
+    fn test_unicode_odd_bytes_are_retained_in_the_value_size() {
+        let raw = b"h\0i\0!";
+        let value = PropertyValue::read(&mut raw.as_slice(), PropertyType::Unicode).unwrap();
+        assert_eq!(value.data_size(), raw.len() as u64);
+        let data = multi_value(1, &[8], raw);
+        let value =
+            PropertyValue::read(&mut data.as_slice(), PropertyType::MultipleUnicode).unwrap();
+        let PropertyValue::MultipleUnicode(values) = &value else {
+            panic!("MultipleUnicode");
+        };
+        assert_eq!(
+            value.data_size(),
+            mem::size_of_val(values.as_slice()) as u64 + raw.len() as u64
+        );
     }
 
     #[test]

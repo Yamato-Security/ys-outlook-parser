@@ -120,6 +120,10 @@ impl Text {
                     trim_nul_bytes(&raw)
                 };
                 let (text, lossy) = encoding.decode_without_bom_handling(bytes);
+                // Trimming UTF-16BE terminators also removes an odd final byte. It must
+                // still be reported, just as for UTF-16LE, even if the remainder decodes.
+                let lossy =
+                    lossy || (encoding == encoding_rs::UTF_16BE && !raw.len().is_multiple_of(2));
                 (text.into_owned(), lossy, tag)
             }
         };
@@ -320,6 +324,19 @@ pub fn ansi_code_page_of_locale(lcid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf16be_reports_an_odd_trailing_byte() {
+        for raw in [vec![0, b'A', 0xFF], vec![0xFF]] {
+            let text = Text::from_code_page(raw.clone(), 1201);
+            assert!(text.is_lossy(), "odd UTF-16BE was silently accepted");
+            assert_eq!(text.raw(), raw);
+            assert_eq!(text.encoding(), TextEncoding::CodePage(1201));
+        }
+        let text = Text::from_code_page(vec![0, b'A', 0, 0], 1201);
+        assert_eq!(text.as_str(), "A");
+        assert!(!text.is_lossy());
+    }
 
     #[test]
     fn utf16() {
