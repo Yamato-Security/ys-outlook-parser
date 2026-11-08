@@ -36,7 +36,7 @@ use std::{
     cell::RefMut,
     fmt::Debug,
     fs::File,
-    io::{self, Read, Seek},
+    io::{self, Read, Seek, SeekFrom},
     ops::{Deref, DerefMut},
     path::Path,
     rc::Rc,
@@ -108,6 +108,8 @@ where
     /// Lock the file's reader, with the file's [`Validation`] in force while it is locked.
     fn lock_reader(&self) -> io::Result<ReaderGuard<'_>>;
     fn problem_log(&self) -> &problems::ProblemLog;
+    /// The size of the file in bytes, when it was opened.
+    fn file_size(&self) -> u64;
 
     fn block_cache(
         &self,
@@ -217,6 +219,7 @@ where
     reader: Mutex<Box<dyn PstReader>>,
     validation: Validation,
     problems: Rc<problems::ProblemLog>,
+    file_size: u64,
     /// Whether the file has the 4 KiB pages of Outlook 2013 and later OSTs.
     large_pages: bool,
     header: Pst::Header,
@@ -260,6 +263,10 @@ impl PstFileInternal<UnicodePstFile> for UnicodePstFile {
 
     fn problem_log(&self) -> &problems::ProblemLog {
         &self.inner.problems
+    }
+
+    fn file_size(&self) -> u64 {
+        self.inner.file_size
     }
 
     fn block_cache(
@@ -375,6 +382,10 @@ impl PstFileInternal<AnsiPstFile> for AnsiPstFile {
 
     fn problem_log(&self) -> &problems::ProblemLog {
         &self.inner.problems
+    }
+
+    fn file_size(&self) -> u64 {
+        self.inner.file_size
     }
 
     fn block_cache(
@@ -536,10 +547,12 @@ where
         } else {
             <<Pst as PstFile>::DensityListPage as DensityListPageReadWrite<Pst>>::read(&mut reader)
         };
+        let file_size = reader.seek(SeekFrom::End(0))?;
         Ok(Self {
             reader: Mutex::new(Box::new(reader)),
             validation,
             problems,
+            file_size,
             large_pages,
             header,
             density_list,

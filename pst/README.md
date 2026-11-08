@@ -44,6 +44,9 @@ at most `MAX_BTREE_DEPTH` pages deep; a data tree or sub-node tree reads each bl
 (and no two blocks from the same file offset), at most `MAX_BLOCK_TREE_DEPTH` levels deep, and no
 more bytes than the file holds, nor, once the zlib-compressed blocks of a 4 KiB-page OST are
 inflated, more than `MAX_BLOCK_TREE_INFLATION` (8) times that; a BTree-on-heap reads each heap
-allocation at most once; embedded messages are read at most `MAX_EMBEDDED_MESSAGE_DEPTH` levels
-down; and `messaging::folder::walk_folders` walks the folder hierarchy with each folder at most
-once, at most `MAX_FOLDER_DEPTH` levels down.
+allocation at most once; an object's properties read each heap allocation or sub-node at most once
+(a second property naming it is a problem), and their values hold no more than
+`MAX_BLOCK_TREE_INFLATION` times the file's size (a property past that is a problem); embedded
+messages are read at most `MAX_EMBEDDED_MESSAGE_DEPTH` levels down; and
+`messaging::folder::walk_folders` walks the folder hierarchy with each folder at most once, at most
+`MAX_FOLDER_DEPTH` levels down.

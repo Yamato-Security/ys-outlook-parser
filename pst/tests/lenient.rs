@@ -188,19 +188,26 @@ fn open_with_and_open_store_with() {
     assert!(outlook_pst::open_store(&path).is_ok());
 }
 
-/// The message store's heap with one property record changed: `edit` gets the decoded record
-/// (key, type and value) and returns the bytes it should become; each new byte value must occur
-/// somewhere in the decoded block, where its permute-encoded form is taken from.
-fn edit_store_record(prop_id: u16, edit: impl FnOnce([u8; 8]) -> [u8; 8]) -> UnicodePst {
-    let mut pst = UnicodePst(fixture("Empty.pst"));
-    let (offset, size) = store_block(&pst);
-    let file = read(&pst, Validation::Strict).unwrap();
+/// The decoded data block of the message store's node, and where in it the property record of
+/// `prop_id` (key, type and value) is.
+fn store_record(pst: &UnicodePst, prop_id: u16) -> (Vec<u8>, usize) {
+    let file = read(pst, Validation::Strict).unwrap();
     let node = file.read_node(NID_MESSAGE_STORE).unwrap();
     let decoded = file.read_block(node.data()).unwrap();
     let key = prop_id.to_le_bytes();
     let at = (0..decoded.len() - 8)
         .find(|at| decoded[*at..*at + 2] == key && decoded[*at + 2..*at + 4] != [0, 0])
         .unwrap();
+    (decoded, at)
+}
+
+/// The message store's heap with one property record changed: `edit` gets the decoded record
+/// (key, type and value) and returns the bytes it should become; each new byte value must occur
+/// somewhere in the decoded block, where its permute-encoded form is taken from.
+fn edit_store_record(prop_id: u16, edit: impl FnOnce([u8; 8]) -> [u8; 8]) -> UnicodePst {
+    let mut pst = UnicodePst(fixture("Empty.pst"));
+    let (offset, size) = store_block(&pst);
+    let (decoded, at) = store_record(&pst, prop_id);
     let record: [u8; 8] = decoded[at..at + 8].try_into().unwrap();
     for (i, byte) in edit(record).into_iter().enumerate() {
         let source = decoded.iter().position(|b| *b == byte).unwrap();
@@ -252,6 +259,40 @@ fn property_value_that_cannot_be_read() {
     assert_eq!(
         problems[0].node().map(u32::from),
         Some(u32::from(NID_MESSAGE_STORE))
+    );
+}
+
+#[test]
+fn property_value_of_two_properties() {
+    // PidTagDisplayName's HID is PidTagRecordKey's: the value is PidTagRecordKey's alone.
+    let pst = UnicodePst(fixture("Empty.pst"));
+    let (decoded, at) = store_record(&pst, 0x0FF9);
+    let hid: [u8; 4] = decoded[at + 4..at + 8].try_into().unwrap();
+    let pst = edit_store_record(0x3001, |mut record| {
+        record[4..8].copy_from_slice(&hid);
+        record
+    });
+    let file = Rc::new(read(&pst, Validation::Strict).unwrap());
+    let Err(err) = UnicodeStore::read(file) else {
+        panic!("read strictly, the store opened");
+    };
+    let err = err.to_string();
+    assert!(
+        err.contains("is also the value of property 0x0FF9"),
+        "{err}"
+    );
+
+    let file = Rc::new(read(&pst, Validation::Lenient).unwrap());
+    let store = UnicodeStore::read(file.clone()).unwrap();
+    use outlook_pst::messaging::store::Store;
+    assert!(store.properties().display_name().is_err());
+    assert!(store.properties().record_key().is_ok());
+    assert_eq!(walk(&store).folders, 6);
+    let problems = file.problems();
+    assert_eq!(kinds(&file), [ProblemKind::Property]);
+    assert_eq!(
+        problems[0].detail(),
+        "property 0x3001 (Unicode): Property value is also the value of property 0x0FF9"
     );
 }
 

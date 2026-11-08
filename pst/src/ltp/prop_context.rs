@@ -481,6 +481,47 @@ impl PropertyValue {
             _ => Self::Null,
         }
     }
+
+    /// The number of bytes the value holds: its fixed size, or the size of its variable-size
+    /// data.
+    pub(crate) fn data_size(&self) -> u64 {
+        fn size<T>(values: &[T]) -> u64 {
+            u64::try_from(std::mem::size_of_val(values)).unwrap_or(u64::MAX)
+        }
+        fn sizes<T>(values: &[T], each: impl Fn(&T) -> u64) -> u64 {
+            values.iter().fold(size(values), |total, value| {
+                total.saturating_add(each(value))
+            })
+        }
+        match self {
+            Self::Null => 0,
+            Self::Integer16(_) => 2,
+            Self::Integer32(_) | Self::Floating32(_) | Self::ErrorCode(_) => 4,
+            Self::Boolean(_) => 1,
+            Self::Floating64(_)
+            | Self::Currency(_)
+            | Self::FloatingTime(_)
+            | Self::Integer64(_)
+            | Self::Time(_)
+            | Self::Object(_) => 8,
+            Self::Guid(_) => 16,
+            Self::String8(value) => size(value.buffer()),
+            Self::Unicode(value) => size(value.buffer()),
+            Self::Binary(value) => size(value.buffer()),
+            Self::MultipleInteger16(values) => size(values),
+            Self::MultipleInteger32(values) => size(values),
+            Self::MultipleFloating32(values) => size(values),
+            Self::MultipleFloating64(values) => size(values),
+            Self::MultipleCurrency(values) => size(values),
+            Self::MultipleFloatingTime(values) => size(values),
+            Self::MultipleInteger64(values) => size(values),
+            Self::MultipleTime(values) => size(values),
+            Self::MultipleGuid(values) => size(values),
+            Self::MultipleString8(values) => sizes(values, |value| size(value.buffer())),
+            Self::MultipleUnicode(values) => sizes(values, |value| size(value.buffer())),
+            Self::MultipleBinary(values) => sizes(values, |value| size(value.buffer())),
+        }
+    }
 }
 
 impl From<&PropertyValue> for PropertyType {
