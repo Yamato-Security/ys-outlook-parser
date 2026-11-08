@@ -48,8 +48,9 @@ pub fn format_filetime(ticks: i64) -> String {
 pub fn floating_time_to_filetime(days: f64) -> Option<i64> {
     // 1899-12-30 is 109205 days after 1601-01-01.
     const OLE_EPOCH_TICKS: f64 = 109_205.0 * 864_000_000_000.0;
-    // DATE uses a signed day number but an unsigned time of day ([MS-OAUT] 2.2.25).
-    // Treating it as a continuous count of days moves negative fractional dates backwards.
+    // The whole part is a signed day number and the absolute value of the fraction the time of
+    // day (https://learn.microsoft.com/en-us/cpp/atl-mfc-shared/date-type): the timeline is not
+    // continuous before 1899-12-30, where -1.25 is 06:00 on 1899-12-29, not 18:00 on 1899-12-28.
     let date = days.trunc() + days.fract().abs();
     let ticks = (date * 864_000_000_000.0 + OLE_EPOCH_TICKS).round();
     (ticks.is_finite() && ticks >= i64::MIN as f64 && ticks < i64::MAX as f64)
@@ -77,7 +78,7 @@ mod tests {
 
     #[test]
     fn floating_times_use_the_absolute_fraction_for_the_time_of_day() {
-        // [MS-OAUT] DATE: the integer selects the day and the absolute fractional part
+        // DATE: the integer selects the day and the absolute fractional part
         // selects the time. In particular, -0.5 and +0.5 are the same instant.
         for (days, expected) in [
             (-0.5, "1899-12-30T12:00:00.0000000Z"),

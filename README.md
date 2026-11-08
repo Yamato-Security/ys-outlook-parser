@@ -55,7 +55,8 @@ against panics on damaged input. So the fork:
 
 - reads the OSTs of Outlook 2013 and later (`wVer` 36: 4 KiB pages, 512-byte block alignment,
   24-byte block trailers, zlib-compressed blocks) and `wVerClient` 12, as `outlook-pst-ost` 1.3.0
-  (MIT) does;
+  (MIT) does, and decodes their heap ids (a 14-bit allocation index and a 13-bit block index),
+  which `outlook-pst-ost` reads as those of 512-byte pages;
 - takes the read fixes still open upstream (PRs #86, #87, #88, #89, #90, #94 and #95, MIT), and
   fixes the GUID of named properties (looked up 3 entries too far) and the data of OLE-object
   attachments (looked up in the wrong sub-node tree);
@@ -94,16 +95,10 @@ Compared with upstream `outlook-pst` on the same files, the fork reads 3,557 mes
 libpff's committed output.
 
 **`.msg` and `.oft`, against extract-msg** (0.58.2, used only as an external oracle): 214 public
-files, 2,404 messages, recipients and attachments, 41,002 properties. 110,114 facts are the same and
+files, 2,399 messages, recipients and attachments, 40,905 properties. 109,846 facts are the same and
 791 differ, each explained (`msg/tests/oracle/`): 601 are extract-msg's errors with FILETIMEs, 35 are
 ANSI files it decodes in the wrong code page, and the others are what it leaves out or adds.
-The RTF comparison covers every decompressed byte, including embedded zeroes and padding.
-
-The unified item model also has regression tests for recovered Unicode HTML. The date helpers
-cover negative fractional OLE Automation dates, and RTF tests exercise binary payloads in both
-LZFu and MELA, plus mismatched declared lengths.
-Heap lookup regressions cover the classic and Unicode4k HID layouts, including every nonzero
-fourteen-bit allocation index and lookups made after the reader's scope ends.
+Decompressed RTF bodies are compared byte for byte.
 
 **Damaged input**: crafted files and seeded mutations of the fixtures for each crate (more than
 260,000 mutated `.msg` files and 160,000 mutated PSTs), without a panic, an abort or an unbounded
