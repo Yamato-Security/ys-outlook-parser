@@ -297,6 +297,34 @@ fn property_value_of_two_properties() {
 }
 
 #[test]
+fn fixed_size_property_with_an_hnid_of_0() {
+    // PidTagDisplayName's record becomes a PtypTime with an HNID of 0, which has no empty value:
+    // it used to read as PtypNull.
+    let pst = edit_store_record(0x3001, |mut record| {
+        record[2..4].copy_from_slice(&0x0040_u16.to_le_bytes());
+        record[4..8].copy_from_slice(&0_u32.to_le_bytes());
+        record
+    });
+    let file = Rc::new(read(&pst, Validation::Strict).unwrap());
+    let Err(err) = UnicodeStore::read(file) else {
+        panic!("read strictly, the store opened");
+    };
+    assert!(err.to_string().contains("HNID of 0"), "{err}");
+
+    let file = Rc::new(read(&pst, Validation::Lenient).unwrap());
+    let store = UnicodeStore::read(file.clone()).unwrap();
+    use outlook_pst::messaging::store::Store;
+    assert!(store.properties().get(0x3001).is_none());
+    assert_eq!(walk(&store).folders, 6);
+    let problems = file.problems();
+    assert_eq!(kinds(&file), [ProblemKind::Property]);
+    assert_eq!(
+        problems[0].detail(),
+        "property 0x3001 (Time): HNID of 0 for a fixed-size value: Time"
+    );
+}
+
+#[test]
 fn folder_table_that_cannot_be_read() {
     // The contents table of a folder with messages gets the store's property context as its data:
     // its TCINFO does not read.

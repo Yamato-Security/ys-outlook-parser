@@ -80,6 +80,8 @@ pub enum LtpError {
     PropertySubNodeValueNotFound(u32),
     #[error("Invalid small PC value property type: {0:?}")]
     InvalidSmallPropertyType(prop_type::PropertyType),
+    #[error("HNID of 0 for a fixed-size value: {0:?}")]
+    EmptyFixedSizePropertyValue(prop_type::PropertyType),
     #[error("Invalid PC property tree key size: 0x{0:X}")]
     InvalidPropertyTreeKeySize(u8),
     #[error("Invalid PC property tree entry size: 0x{0:X}")]
@@ -114,8 +116,6 @@ pub enum LtpError {
     InvalidTableColumnSize(u8),
     #[error("Invalid TCOLDESC iBit: 0x{0:04X}")]
     InvalidTableColumnBitmaskOffset(u8),
-    #[error("Invalid TCOLDESC BOOL value: 0x{0:02X}")]
-    InvalidTableColumnBooleanValue(u8),
     #[error("Missing TCROWID: 0x{0:08X}")]
     TableRowIdNotFound(u32),
 }

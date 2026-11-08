@@ -800,18 +800,11 @@ impl TableRowData {
                             value,
                         ))))
                     }
+                    // Restricted to 0 or 1, but any other value is true, as in a property context.
                     (PropertyType::Boolean, offset, 1) => {
                         let value = self.read_1byte_offset(context, offset)?;
                         Ok(Some(TableRowColumnValue::Small(PropertyValue::Boolean(
-                            match value {
-                                0x00 => false,
-                                0x01 => true,
-                                _ => {
-                                    return Err(
-                                        LtpError::InvalidTableColumnBooleanValue(value).into()
-                                    );
-                                }
-                            },
+                            value != 0,
                         ))))
                     }
                     (PropertyType::Integer64, offset, 8) => {
@@ -1122,7 +1115,7 @@ where
         match value {
             TableRowColumnValue::Small(small) => Ok(small.clone()),
             TableRowColumnValue::Heap(heap_id) if <u32 as From<HeapId>>::from(*heap_id) == 0 => {
-                Ok(PropertyValue::empty(prop_type))
+                PropertyValue::empty(prop_type)
             }
             TableRowColumnValue::Heap(heap_id) => {
                 let data = self.heap.find_entry(*heap_id)?;
@@ -1473,5 +1466,38 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(value, PropertyValue::Unicode(value) if value.buffer().is_empty()));
+
+        // A fixed-size type has no empty value.
+        for prop_type in [PropertyType::Guid, PropertyType::Object] {
+            let err = table
+                .read_column(&TableRowColumnValue::Heap(HeapId::from(0)), prop_type)
+                .unwrap_err();
+            assert!(err.to_string().starts_with("HNID of 0"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_boolean_cell_other_than_0_or_1_is_true() {
+        let column = TableColumnDescriptor::new(PropertyType::Boolean, 0x0E1F, 8, 1, 0);
+        let context =
+            TableContextInfo::new(8, 8, 9, 10, HeapId::from(0), None, vec![column]).unwrap();
+        for (value, expected) in [(0, false), (1, true), (2, true), (0xFF, true)] {
+            let row = TableRowData::new(
+                TableRowId::new(1),
+                0,
+                vec![],
+                vec![],
+                vec![value],
+                vec![0x80],
+            );
+            assert!(
+                matches!(
+                    row.columns(&context).unwrap().as_slice(),
+                    [Some(TableRowColumnValue::Small(PropertyValue::Boolean(value)))]
+                        if *value == expected
+                ),
+                "{value}"
+            );
+        }
     }
 }

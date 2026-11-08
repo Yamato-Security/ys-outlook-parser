@@ -460,9 +460,11 @@ pub enum PropertyValue {
 
 impl PropertyValue {
     /// Outlook stores an empty variable-size or multi-valued property with an HNID of 0, so it
-    /// reads as the empty value of its type. Any other type reads as [PropertyValue::Null].
-    pub(crate) fn empty(prop_type: PropertyType) -> Self {
-        match prop_type {
+    /// reads as the empty value of its type. A fixed-size type (`PtypTime`, `PtypGuid`, ...) has
+    /// no empty value: an HNID of 0 for one is an error, which a property context or table makes a
+    /// problem.
+    pub(crate) fn empty(prop_type: PropertyType) -> io::Result<Self> {
+        Ok(match prop_type {
             PropertyType::String8 => Self::String8(Default::default()),
             PropertyType::Unicode => Self::Unicode(Default::default()),
             PropertyType::Binary => Self::Binary(Default::default()),
@@ -478,8 +480,8 @@ impl PropertyValue {
             PropertyType::MultipleTime => Self::MultipleTime(Vec::new()),
             PropertyType::MultipleGuid => Self::MultipleGuid(Vec::new()),
             PropertyType::MultipleBinary => Self::MultipleBinary(Vec::new()),
-            _ => Self::Null,
-        }
+            _ => return Err(LtpError::EmptyFixedSizePropertyValue(prop_type).into()),
+        })
     }
 
     /// The number of bytes the value holds: its fixed size, or the size of its variable-size
@@ -1086,7 +1088,7 @@ where
         match value.value() {
             PropertyValueRecord::Heap(heap_id) => {
                 if u32::from(heap_id) == 0 {
-                    return Ok(PropertyValue::empty(value.prop_type()));
+                    return PropertyValue::empty(value.prop_type());
                 }
 
                 let data = self.tree.heap().find_entry(heap_id)?;
