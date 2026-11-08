@@ -57,3 +57,7 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
   of an absolute time of day. (@YamatoSecurity)
 - Partially recovered Unicode HTML was kept in the properties but omitted from the unified
   item body's HTML field. (@YamatoSecurity)
+- Unicode4k heap identifiers were decoded with the classic layout, so references beyond the
+  first heap block or allocation 2047 could fail or resolve to the wrong data. The heap now
+  retains its format and uses fourteen allocation bits and thirteen block bits for Unicode4k.
+  (@YamatoSecurity)

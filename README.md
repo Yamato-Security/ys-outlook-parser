@@ -102,6 +102,8 @@ The RTF comparison covers every decompressed byte, including embedded zeroes and
 The unified item model also has regression tests for recovered Unicode HTML. The date helpers
 cover negative fractional OLE Automation dates, and RTF tests exercise binary payloads in both
 LZFu and MELA, plus mismatched declared lengths.
+Heap lookup regressions cover the classic and Unicode4k HID layouts, including every nonzero
+fourteen-bit allocation index and lookups made after the reader's scope ends.
 
 **Damaged input**: crafted files and seeded mutations of the fixtures for each crate (more than
 260,000 mutated `.msg` files and 160,000 mutated PSTs), without a panic, an abort or an unbounded

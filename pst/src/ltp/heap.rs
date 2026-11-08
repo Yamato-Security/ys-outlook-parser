@@ -43,6 +43,9 @@ pub const HEAP_INDEX_MASK: u32 = (1_u16.rotate_right(5) - 1) as u32;
 pub struct HeapId(NodeId);
 
 impl HeapId {
+    /// Constructs an HID in the ANSI/classic Unicode layout (eleven-bit allocation index,
+    /// sixteen-bit block index). Unicode4k on-disk HIDs can be retained with `HeapId::from`;
+    /// heap lookups decode their format automatically.
     pub fn new(index: u16, block_index: u16) -> LtpResult<Self> {
         let shifted_index = index.rotate_left(5);
         if shifted_index & 0x1F != 0 {
@@ -54,6 +57,8 @@ impl HeapId {
         Ok(Self(NodeId::new(NodeIdType::HeapNode, node_index)?))
     }
 
+    /// The zero-based allocation index in the ANSI/classic Unicode layout. Heap lookups
+    /// use fourteen allocation bits instead when the heap is Unicode4k.
     pub fn index(&self) -> LtpResult<u16> {
         let index = (self.0.index() & HEAP_INDEX_MASK) as u16;
         index
@@ -61,6 +66,8 @@ impl HeapId {
             .ok_or(LtpError::InvalidHeapIndex(index))
     }
 
+    /// The block index in the ANSI/classic Unicode layout. Heap lookups use thirteen
+    /// block bits instead when the heap is Unicode4k.
     pub fn block_index(&self) -> u16 {
         (self.0.index() >> 11) as u16
     }
@@ -531,6 +538,9 @@ where
     /// many properties looks a block up once for each, and a page map holds up to 65,535
     /// allocations. A page map that does not parse keeps its error's description.
     page_maps: Vec<OnceCell<Result<HeapNodePageMap, String>>>,
+    /// Unicode4k HIDs have a fourteen-bit allocation index and thirteen-bit block index.
+    /// Keep the layout with the heap: lookups can occur after the reader's scope has ended.
+    large_pages: bool,
 }
 
 impl<Pst> HeapNodeInner<Pst>
@@ -539,7 +549,11 @@ where
 {
     fn new(data: Vec<<Pst as PstFile>::DataBlock>) -> Self {
         let page_maps = data.iter().map(|_| OnceCell::new()).collect();
-        Self { data, page_maps }
+        Self {
+            data,
+            page_maps,
+            large_pages: crate::problems::large_pages() == Some(true),
+        }
     }
 }
 
@@ -623,7 +637,13 @@ where
     where
         <Pst as PstFile>::DataBlock: 'a,
     {
-        let block_index = heap_id.block_index();
+        let block_index = if self.large_pages {
+            // Unicode4k uses bits 19..31 for the block index and bits 5..18 for the
+            // allocation index (classic formats use bits 16..31 and 5..15).
+            heap_id.block_index() >> 3
+        } else {
+            heap_id.block_index()
+        };
         let not_found = || LtpError::HeapBlockIndexNotFound(block_index);
         let block = self
             .data
@@ -639,7 +659,14 @@ where
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.clone()))?;
         let allocations = page_map.allocations();
 
-        let index = heap_id.index()?;
+        let index = if self.large_pages {
+            let index = ((u32::from(heap_id) >> 5) & 0x3FFF) as u16;
+            index
+                .checked_sub(1)
+                .ok_or(LtpError::InvalidHeapIndex(index))?
+        } else {
+            heap_id.index()?
+        };
         let alloc = allocations
             .get(usize::from(index))
             .ok_or(LtpError::HeapAllocIndexNotFound(index))?;
@@ -779,6 +806,78 @@ mod tests {
         assert!(heap.find_entry(HeapId::new(3, 0).unwrap()).is_err());
         assert!(heap.find_entry(HeapId::new(1, 1).unwrap()).is_err());
         assert!(heap.find_entry(HeapId::from(0)).is_err());
+    }
+
+    #[test]
+    fn test_4k_heap_indexes_use_fourteen_and_thirteen_bits() {
+        use crate::problems::{ProblemLog, ScopeGuard, Validation};
+        use std::rc::Rc;
+
+        let mut data = heap_node(64, &[12, 20]).data;
+        // The second block has an HNPAGEHDR and one two-byte allocation.
+        let mut bytes = vec![0u8; 32];
+        bytes[..2].copy_from_slice(&16u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(b"ok");
+        bytes[16..18].copy_from_slice(&1u16.to_le_bytes());
+        bytes[20..22].copy_from_slice(&2u16.to_le_bytes());
+        bytes[22..24].copy_from_slice(&4u16.to_le_bytes());
+        let trailer = UnicodeBlockTrailer::new(32, 0, 0, UnicodeBlockId::from(8)).unwrap();
+        data.push(UnicodeDataBlock::new(NdbCryptMethod::None, bytes, trailer).unwrap());
+
+        let modern = {
+            let _scope = ScopeGuard::new(
+                Validation::Strict,
+                Rc::new(ProblemLog::default()),
+                Some(true),
+            );
+            HeapNodeInner::<UnicodePstFile>::new(data.clone())
+        };
+        // The heap must remember its format even when accessed outside the reader's scope.
+        assert_eq!(modern.find_entry(HeapId::from(0x0008_0020)).unwrap(), b"ok");
+        assert!(modern.find_entry(HeapId::from((2 << 19) | 0x20)).is_err());
+        assert!(modern.find_entry(HeapId::from(1 << 19)).is_err());
+
+        // ANSI and classic Unicode retain their sixteen-bit block index. In particular,
+        // the low three bits must not be cleared or shifted in these formats.
+        let classic = HeapNodeInner::<UnicodePstFile>::new(data);
+        assert_eq!(
+            classic.find_entry(HeapId::from(0x0001_0020)).unwrap(),
+            b"ok"
+        );
+        assert!(classic.find_entry(HeapId::from(0x0008_0020)).is_err());
+
+        // Bits 16..18 extend the allocation index: they are not flags. Exercise every
+        // nonzero fourteen-bit index, including those beyond the classic 2047 limit.
+        let count = 0x3FFFu16;
+        let page_map = 2 + count;
+        let mut bytes = page_map.to_le_bytes().to_vec();
+        bytes.extend((1..=count).map(|index| (index >> 11) as u8));
+        bytes.extend(count.to_le_bytes());
+        bytes.extend(0u16.to_le_bytes());
+        for offset in 2..=page_map {
+            bytes.extend(offset.to_le_bytes());
+        }
+        let trailer =
+            UnicodeBlockTrailer::new(bytes.len() as u16, 0, 0, UnicodeBlockId::from(8)).unwrap();
+        let second = UnicodeDataBlock::new(NdbCryptMethod::None, bytes, trailer).unwrap();
+        let mut blocks = heap_node(64, &[12, 20]).data;
+        blocks.push(second);
+        let modern = {
+            let _scope = ScopeGuard::new(
+                Validation::Strict,
+                Rc::new(ProblemLog::default()),
+                Some(true),
+            );
+            HeapNodeInner::<UnicodePstFile>::new(blocks)
+        };
+        for index in 1..=count {
+            let hid = HeapId::from((1 << 19) | (u32::from(index) << 5));
+            assert_eq!(
+                modern.find_entry(hid).unwrap(),
+                &[(index >> 11) as u8],
+                "index {index}"
+            );
+        }
     }
 
     #[test]
