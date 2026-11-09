@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs) and its copy outlook-pst-ost 1.3.0
+// (https://crates.io/crates/outlook-pst-ost), whose code is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! [Pages](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5774b4f2-cdc4-453e-996a-8c8230116930)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -6,12 +23,11 @@ use std::{
     fmt::Debug,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
-    ops::Range,
 };
 
 use super::{block_id::*, block_ref::*, byte_index::*, node_id::*, read_write::*, *};
 use crate::{
-    block_sig::compute_sig, crc::compute_crc, AnsiPstFile, PstFile, PstReader, UnicodePstFile,
+    AnsiPstFile, PstFile, PstReader, UnicodePstFile, block_sig::compute_sig, crc::compute_crc,
 };
 
 /// `ptype`
@@ -221,100 +237,11 @@ where
     fn trailer(&self) -> &Pst::PageTrailer;
 }
 
-const fn leading_zero_count(b: u8) -> u8 {
-    match b {
-        0x00 => 8,
-        b if b < 0x02 => 7,
-        b if b < 0x04 => 6,
-        b if b < 0x08 => 5,
-        b if b < 0x10 => 4,
-        b if b < 0x20 => 3,
-        b if b < 0x40 => 2,
-        b if b < 0x80 => 1,
-        _ => 0,
-    }
-}
-
-const fn trailing_zero_count(b: u8) -> u8 {
-    match b {
-        0x00 => 8,
-        b if b & 0x7F == 0 => 7,
-        b if b & 0x3F == 0 => 6,
-        b if b & 0x1F == 0 => 5,
-        b if b & 0x0F == 0 => 4,
-        b if b & 0x07 == 0 => 3,
-        b if b & 0x03 == 0 => 2,
-        b if b & 0x01 == 0 => 1,
-        _ => 0,
-    }
-}
-
 /// [AMAPPAGE](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/43d8f556-2c0e-4976-8ec7-84e57f8b1234)
 pub trait AllocationMapPage<Pst>: MapPage<Pst, { PageType::AllocationMap as u8 }>
 where
     Pst: PstFile,
 {
-    /// Scan the allocation map for contiguous free bits up to the specified max size.
-    fn find_free_bits(&self, max_size: u16) -> Range<u16> {
-        let mut max_free_slots = 0..0;
-        let mut current = 0..0;
-
-        for &page in self.map_bits() {
-            if page == 0 {
-                current.end += 8;
-                if current.end - current.start > max_free_slots.end - max_free_slots.start {
-                    max_free_slots = current.clone();
-                }
-            } else {
-                let leading_zero = u16::from(leading_zero_count(page));
-                let trailing_zero = u16::from(trailing_zero_count(page));
-                assert!(leading_zero + trailing_zero < 8, "leading_zero: {leading_zero}, trailing_zero: {trailing_zero} for page: 0x{page:02X}");
-
-                let page_offset = current.end + 8;
-                current.end += leading_zero;
-
-                if current.end - current.start > max_free_slots.end - max_free_slots.start {
-                    max_free_slots = current.clone();
-                }
-
-                if page != 0xFF
-                    && (max_free_slots.end - max_free_slots.start + 2)
-                        < (8 - trailing_zero - leading_zero)
-                {
-                    let mut current = (current.end + 1)..(current.end + 1);
-
-                    for i in (leading_zero + 1)..(7 - trailing_zero) {
-                        if page & (0x80 >> i) == 0 {
-                            current.end += 1;
-                        } else {
-                            if current.end - current.start
-                                > max_free_slots.end - max_free_slots.start
-                            {
-                                max_free_slots = current.clone();
-                            }
-                            current = (current.end + 1)..(current.end + 1);
-                        }
-                    }
-
-                    if current.end - current.start > max_free_slots.end - max_free_slots.start {
-                        max_free_slots = current;
-                    }
-                }
-
-                current = (page_offset - trailing_zero)..page_offset;
-            }
-
-            if max_free_slots.end - max_free_slots.start >= max_size {
-                break;
-            }
-        }
-
-        if current.end - current.start > max_free_slots.end - max_free_slots.start {
-            max_free_slots = current;
-        }
-
-        (max_free_slots.start)..(max_free_slots.end.min(max_free_slots.start + max_size))
-    }
 }
 
 impl<Pst, Page> AllocationMapPage<Pst> for Page
@@ -405,28 +332,24 @@ impl<const PAGE_TYPE: u8> MapPageReadWrite<UnicodePstFile, PAGE_TYPE>
         }
 
         let crc = compute_crc(0, &map_bits);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self { map_bits, trailer })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        f.write_all(&self.map_bits)?;
-
-        let crc = compute_crc(0, &self.map_bits);
-        let trailer = UnicodePageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
 pub struct AnsiMapPage<const P: u8> {
     map_bits: MapBits,
     trailer: AnsiPageTrailer,
+    // Kept as read.
+    #[allow(dead_code)]
     padding: u32,
 }
 
@@ -476,33 +399,20 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::AllocationMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
             trailer,
             padding,
         })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-        cursor.write_all(&self.map_bits)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -538,33 +448,20 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::AllocationPageMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
             trailer,
             padding,
         })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-        cursor.write_all(&self.map_bits)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -600,33 +497,20 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::FreeMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
             trailer,
             padding,
         })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_all(&self.map_bits)?;
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -662,33 +546,20 @@ impl MapPageReadWrite<AnsiPstFile, { PageType::FreePageMap as u8 }>
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             map_bits,
             trailer,
             padding,
         })
-    }
-
-    fn write(&self, f: &mut dyn Write) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        cursor.write_all(&self.map_bits)?;
-        cursor.write_u32::<LittleEndian>(self.padding)?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.write_all(&buffer)?;
-
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -759,7 +630,9 @@ impl DensityListPage<UnicodePstFile> for UnicodeDensityListPage {
     }
 
     fn entries(&self) -> &[DensityListPageEntry] {
-        &self.entries[..self.entry_count as usize]
+        self.entries
+            .get(..usize::from(self.entry_count))
+            .unwrap_or_default()
     }
 
     fn trailer(&self) -> &UnicodePageTrailer {
@@ -787,7 +660,9 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
         let entry_count = entries.len() as u8;
 
         let mut buffer = [DensityListPageEntry(0); Self::MAX_ENTRIES];
-        buffer[..entries.len()].copy_from_slice(entries);
+        for (entry, value) in buffer.iter_mut().zip(entries) {
+            *entry = *value;
+        }
         let entries = buffer;
 
         Ok(Self {
@@ -828,10 +703,10 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
         for entry in entries.iter_mut().take(entry_count as usize) {
             *entry = DensityListPageEntry::read(&mut cursor)?;
         }
-        cursor.seek(SeekFrom::Current(
-            ((Self::MAX_ENTRIES - entry_count as usize) * mem::size_of::<DensityListPageEntry>())
-                as i64,
-        ))?;
+        let skipped = Self::MAX_ENTRIES
+            .saturating_sub(usize::from(entry_count))
+            .saturating_mul(mem::size_of::<DensityListPageEntry>());
+        cursor.seek(SeekFrom::Current(skipped as i64))?;
 
         // rgPadding
         let mut padding = [0_u8; 12];
@@ -849,9 +724,14 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             backfill_complete,
@@ -860,43 +740,6 @@ impl DensityListPageReadWrite<UnicodePstFile> for UnicodeDensityListPage {
             entries,
             trailer,
         })
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 496]);
-
-        // bFlags
-        cursor.write_u8(if self.backfill_complete { 0x01 } else { 0 })?;
-
-        // cEntDList
-        cursor.write_u8(self.entry_count)?;
-
-        // wPadding
-        cursor.write_u16::<LittleEndian>(0)?;
-
-        // ulCurrentPage
-        cursor.write_u32::<LittleEndian>(self.current_page)?;
-
-        // rgDListPageEnt
-        for entry in self.entries.iter() {
-            entry.write(&mut cursor)?;
-        }
-
-        // rgPadding
-        cursor.write_all(&[0; 12])?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.seek(SeekFrom::Start(DENSITY_LIST_FILE_OFFSET))?;
-        f.write_all(&buffer)?;
-
-        // pageTrailer
-        let trailer = UnicodePageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -918,7 +761,9 @@ impl DensityListPage<AnsiPstFile> for AnsiDensityListPage {
     }
 
     fn entries(&self) -> &[DensityListPageEntry] {
-        &self.entries[..self.entry_count as usize]
+        self.entries
+            .get(..usize::from(self.entry_count))
+            .unwrap_or_default()
     }
 
     fn trailer(&self) -> &AnsiPageTrailer {
@@ -946,7 +791,9 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
         let entry_count = entries.len() as u8;
 
         let mut buffer = [DensityListPageEntry(0); Self::MAX_ENTRIES];
-        buffer[..entries.len()].copy_from_slice(entries);
+        for (entry, value) in buffer.iter_mut().zip(entries) {
+            *entry = *value;
+        }
         let entries = buffer;
 
         Ok(Self {
@@ -987,10 +834,10 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
         for entry in entries.iter_mut().take(entry_count as usize) {
             *entry = DensityListPageEntry::read(&mut cursor)?;
         }
-        cursor.seek(SeekFrom::Current(
-            ((Self::MAX_ENTRIES - entry_count as usize) * mem::size_of::<DensityListPageEntry>())
-                as i64,
-        ))?;
+        let skipped = Self::MAX_ENTRIES
+            .saturating_sub(usize::from(entry_count))
+            .saturating_mul(mem::size_of::<DensityListPageEntry>());
+        cursor.seek(SeekFrom::Current(skipped as i64))?;
 
         // rgPadding
         let mut padding = [0_u8; 12];
@@ -1008,9 +855,14 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
         }
 
         let crc = compute_crc(0, &buffer);
-        if crc != trailer.crc() {
-            return Err(NdbError::InvalidPageCrc(crc).into());
-        }
+        crate::problems::check_crc(
+            crate::problems::ProblemKind::PageCrc,
+            None,
+            &format!("{:?} page {:?}", trailer.page_type(), trailer.block_id()),
+            trailer.crc(),
+            crc,
+            || NdbError::InvalidPageCrc(crc).into(),
+        )?;
 
         Ok(Self {
             backfill_complete,
@@ -1019,43 +871,6 @@ impl DensityListPageReadWrite<AnsiPstFile> for AnsiDensityListPage {
             entries,
             trailer,
         })
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        let mut cursor = Cursor::new([0_u8; 500]);
-
-        // bFlags
-        cursor.write_u8(if self.backfill_complete { 0x01 } else { 0 })?;
-
-        // cEntDList
-        cursor.write_u8(self.entry_count)?;
-
-        // wPadding
-        cursor.write_u16::<LittleEndian>(0)?;
-
-        // ulCurrentPage
-        cursor.write_u32::<LittleEndian>(self.current_page)?;
-
-        // rgDListPageEnt
-        for entry in self.entries.iter() {
-            entry.write(&mut cursor)?;
-        }
-
-        // rgPadding
-        cursor.write_all(&[0; 12])?;
-
-        let buffer = cursor.into_inner();
-        let crc = compute_crc(0, &buffer);
-
-        f.seek(SeekFrom::Start(DENSITY_LIST_FILE_OFFSET))?;
-        f.write_all(&buffer)?;
-
-        // pageTrailer
-        let trailer = AnsiPageTrailer {
-            crc,
-            ..self.trailer
-        };
-        trailer.write(f)
     }
 }
 
@@ -1343,6 +1158,13 @@ pub trait BlockBTreeEntry: BTreeEntry {
     fn block(&self) -> Self::Block;
     fn size(&self) -> u16;
     fn ref_count(&self) -> u16;
+
+    /// For an entry from a page in the 4 KiB layout of Outlook 2013 and later OSTs, the block's
+    /// size once inflated. Such a block sits in a 512-byte aligned slot with a 24-byte trailer,
+    /// and is zlib-compressed when this differs from [`BlockBTreeEntry::size`].
+    fn inflated_size(&self) -> Option<u16> {
+        None
+    }
 }
 
 #[derive(Copy, Clone, Default, Debug)]
@@ -1351,6 +1173,8 @@ pub struct UnicodeBlockBTreeEntry {
     size: u16,
     ref_count: u16,
     padding: u32,
+    /// The block's size once inflated, for an entry from a page in the 4 KiB layout.
+    inflated_size: Option<u16>,
 }
 
 impl UnicodeBlockBTreeEntry {
@@ -1386,6 +1210,7 @@ impl BTreeEntryReadWrite for UnicodeBlockBTreeEntry {
             size,
             ref_count,
             padding,
+            inflated_size: None,
         })
     }
 
@@ -1394,6 +1219,24 @@ impl BTreeEntryReadWrite for UnicodeBlockBTreeEntry {
         f.write_u16::<LittleEndian>(self.size)?;
         f.write_u16::<LittleEndian>(self.ref_count)?;
         f.write_u32::<LittleEndian>(self.padding)
+    }
+
+    /// In the 4 KiB layout the entry is `BREF`, `cb`, the inflated size, `cRef` and two bytes of
+    /// padding.
+    fn read_4k(f: &mut dyn Read) -> io::Result<Self> {
+        let block = UnicodeBlockRef::read(f)?;
+        let size = f.read_u16::<LittleEndian>()?;
+        let inflated_size = f.read_u16::<LittleEndian>()?;
+        let ref_count = f.read_u16::<LittleEndian>()?;
+        let padding = u32::from(f.read_u16::<LittleEndian>()?);
+
+        Ok(Self {
+            block,
+            size,
+            ref_count,
+            padding,
+            inflated_size: Some(inflated_size),
+        })
     }
 }
 
@@ -1410,6 +1253,10 @@ impl BlockBTreeEntry for UnicodeBlockBTreeEntry {
 
     fn ref_count(&self) -> u16 {
         self.ref_count
+    }
+
+    fn inflated_size(&self) -> Option<u16> {
+        self.inflated_size
     }
 }
 
@@ -2045,16 +1892,16 @@ where
     Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>,
     LeafPage: RootBTreeLeafPage<Pst, Entry = Entry>,
     Self: BTreePage<
-        Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
-        Trailer = <Pst as PstFile>::PageTrailer,
-    >,
+            Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
+            Trailer = <Pst as PstFile>::PageTrailer,
+        >,
 {
     type Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>
         + BTreePageEntry<Block = <Pst as PstFile>::PageRef>;
     type Page: BTreePageReadWrite<
-        Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
-        Trailer = <Pst as PstFile>::PageTrailer,
-    >;
+            Entry = <Self as RootBTreeIntermediatePage<Pst, Entry, LeafPage>>::Entry,
+            Trailer = <Pst as PstFile>::PageTrailer,
+        >;
 }
 
 impl<Entry, LeafPage> RootBTreeIntermediatePage<UnicodePstFile, Entry, LeafPage>
@@ -2077,10 +1924,6 @@ where
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as UnicodeBTreePageReadWrite<UnicodeBTreePageEntry>>::read(f)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as UnicodeBTreePageReadWrite<UnicodeBTreePageEntry>>::write(self, f)
-    }
 }
 
 impl<Entry, LeafPage> RootBTreeIntermediatePage<AnsiPstFile, Entry, LeafPage> for AnsiBTreeEntryPage
@@ -2102,19 +1945,15 @@ where
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as AnsiBTreePageReadWrite<AnsiBTreePageEntry>>::read(f)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as AnsiBTreePageReadWrite<AnsiBTreePageEntry>>::write(self, f)
-    }
 }
 
 pub trait RootBTreeLeafPage<Pst>
 where
     Pst: PstFile,
     Self: BTreePage<
-        Entry = <Self as RootBTreeLeafPage<Pst>>::Entry,
-        Trailer = <Pst as PstFile>::PageTrailer,
-    >,
+            Entry = <Self as RootBTreeLeafPage<Pst>>::Entry,
+            Trailer = <Pst as PstFile>::PageTrailer,
+        >,
 {
     type Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>;
 }
@@ -2129,10 +1968,6 @@ impl RootBTreeLeafPageReadWrite<UnicodePstFile> for UnicodeBlockBTreePage {
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as UnicodeBTreePageReadWrite<UnicodeBlockBTreeEntry>>::read(f)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as UnicodeBTreePageReadWrite<UnicodeBlockBTreeEntry>>::write(self, f)
-    }
 }
 
 impl RootBTreeLeafPage<AnsiPstFile> for AnsiBlockBTreePage {
@@ -2144,10 +1979,6 @@ impl RootBTreeLeafPageReadWrite<AnsiPstFile> for AnsiBlockBTreePage {
 
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as AnsiBTreePageReadWrite<AnsiBlockBTreeEntry>>::read(f)
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as AnsiBTreePageReadWrite<AnsiBlockBTreeEntry>>::write(self, f)
     }
 }
 
@@ -2161,10 +1992,6 @@ impl RootBTreeLeafPageReadWrite<UnicodePstFile> for UnicodeNodeBTreePage {
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as UnicodeBTreePageReadWrite<UnicodeNodeBTreeEntry>>::read(f)
     }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as UnicodeBTreePageReadWrite<UnicodeNodeBTreeEntry>>::write(self, f)
-    }
 }
 
 impl RootBTreeLeafPage<AnsiPstFile> for AnsiNodeBTreePage {
@@ -2176,10 +2003,6 @@ impl RootBTreeLeafPageReadWrite<AnsiPstFile> for AnsiNodeBTreePage {
 
     fn read<R: PstReader>(f: &mut R) -> io::Result<Self> {
         <Self as AnsiBTreePageReadWrite<AnsiNodeBTreeEntry>>::read(f)
-    }
-
-    fn write<W: Write + Seek>(&self, f: &mut W) -> io::Result<()> {
-        <Self as AnsiBTreePageReadWrite<AnsiNodeBTreeEntry>>::write(self, f)
     }
 }
 
@@ -2233,13 +2056,57 @@ where
     <Self as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
 {
     fn read<R: PstReader>(f: &mut R, block: <Pst as PstFile>::PageRef) -> io::Result<Self> {
-        f.seek(SeekFrom::Start(block.index().index().into()))?;
+        let offset: u64 = block.index().index().into();
+        crate::problems::at_offset(offset, || Self::read_at(f, offset))
+    }
 
-        let mut buffer = [0_u8; PAGE_SIZE];
-        f.read_exact(&mut buffer)?;
+    fn find_entry<R: PstReader>(
+        &self,
+        f: &mut R,
+        key: <Pst as PstFile>::BTreeKey,
+        page_cache: &mut RootBTreePageCache<Self>,
+    ) -> io::Result<Entry> {
+        self.find_entry_on_path(f, key, page_cache, &mut Vec::new())
+    }
+}
+
+/// The most pages a BTree lookup goes through below the root page: MS-PST allows 8 levels.
+pub const MAX_BTREE_DEPTH: usize = 16;
+
+impl<Pst, Entry, IntermediatePage, LeafPage> RootBTreePage<Pst, Entry, IntermediatePage, LeafPage>
+where
+    Pst: PstFile,
+    <Pst as PstFile>::BlockId: BlockIdReadWrite,
+    <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
+    <Pst as PstFile>::BlockRef: BlockRefReadWrite,
+    <Pst as PstFile>::PageRef: BlockRefReadWrite,
+    <Pst as PstFile>::PageTrailer: PageTrailerReadWrite,
+    <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite + Into<u64>,
+    Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey> + BTreeEntryReadWrite,
+    IntermediatePage: RootBTreeIntermediatePage<Pst, Entry, LeafPage>,
+    LeafPage: RootBTreeLeafPage<Pst, Entry = Entry>,
+    <Self as RootBTree>::Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey> + BTreeEntryReadWrite,
+    <Self as RootBTree>::IntermediatePage: RootBTreeIntermediatePageReadWrite<Pst, Entry, LeafPage>,
+    <Self as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
+{
+    /// [`RootBTreeReadWrite::read`] of the page at `offset`.
+    fn read_at<R: PstReader>(f: &mut R, offset: u64) -> io::Result<Self> {
+        f.seek(SeekFrom::Start(offset))?;
+
+        // A Unicode page may be a 4 KiB page, whose cEnt and cEntMax are two bytes each.
+        let (buffer, level_offset) = if LeafPage::BTREE_ENTRIES_SIZE == UNICODE_BTREE_ENTRIES_SIZE {
+            match read_unicode_btree_page(f)? {
+                (page, true) => (page, UNICODE_4K_BTREE_ENTRIES_SIZE + 5),
+                (page, false) => (page, UNICODE_BTREE_ENTRIES_SIZE + 3),
+            }
+        } else {
+            let mut buffer = vec![0_u8; PAGE_SIZE];
+            f.read_exact(&mut buffer)?;
+            (buffer, LeafPage::BTREE_ENTRIES_SIZE.saturating_add(3))
+        };
         let mut cursor = Cursor::new(buffer);
 
-        cursor.seek(SeekFrom::Start(LeafPage::BTREE_ENTRIES_SIZE as u64 + 3))?;
+        cursor.seek(SeekFrom::Start(level_offset as u64))?;
         let level = cursor.read_u8()?;
 
         cursor.seek(SeekFrom::Start(0))?;
@@ -2250,50 +2117,83 @@ where
         })
     }
 
-    fn write<W: Write + Seek>(
-        &self,
-        f: &mut W,
-        block: <Pst as PstFile>::PageRef,
-    ) -> io::Result<()> {
-        f.seek(SeekFrom::Start(block.index().index().into()))?;
-
-        match self {
-            Self::Intermediate(page, ..) => page.write(f),
-            Self::Leaf(page) => page.write(f),
-        }
-    }
-
-    fn find_entry<R: PstReader>(
+    /// Look `key` up below this page. `path` holds the file offsets of the pages the lookup went
+    /// through: a page that is already on it (a page that refers to itself or to a page above it)
+    /// ends the lookup with an error, and so does a path longer than [`MAX_BTREE_DEPTH`]. A page
+    /// whose `cLevel` is not below its parent's is a [`Problem`](crate::Problem) (an error when
+    /// reading strictly) and is followed: files written by some tools hold such stale references,
+    /// and the path check is what guarantees the lookup ends.
+    fn find_entry_on_path<R: PstReader>(
         &self,
         f: &mut R,
         key: <Pst as PstFile>::BTreeKey,
         page_cache: &mut RootBTreePageCache<Self>,
+        path: &mut Vec<u64>,
     ) -> io::Result<Entry> {
         let search_key: u64 = key.into();
         match self {
             Self::Intermediate(page, ..) => {
-                let entries = <Self::IntermediatePage as BTreePage>::entries(page);
-                let index = entries.partition_point(|entry| entry.key().into() <= search_key);
+                let entries = <IntermediatePage as BTreePage>::entries(page);
+                let index =
+                    entries.partition_point(|entry| Into::<u64>::into(entry.key()) <= search_key);
                 let entry = index
                     .checked_sub(1)
                     .and_then(|index| entries.get(index))
                     .ok_or(NdbError::BTreePageNotFound(search_key))?;
                 let block = entry.block();
+                let offset: u64 = block.index().index().into();
+                if path.contains(&offset) {
+                    return Err(NdbError::BTreePageLoop(offset).into());
+                }
+                if path.len() >= MAX_BTREE_DEPTH {
+                    return Err(NdbError::BTreeTooDeep(offset).into());
+                }
                 let page = match page_cache.remove(&block.block()) {
                     Some(page) => page,
                     None => <Self as RootBTreeReadWrite>::read(f, block)?,
                 };
-                let entry = page.find_entry(f, key, page_cache);
+                if page.level() >= self.level() {
+                    let (child, parent) = (page.level(), self.level());
+                    let checked = crate::problems::check(
+                        crate::problems::ProblemKind::PageField,
+                        Some(offset),
+                        || format!("BTPAGE cLevel {child} under a page of cLevel {parent}"),
+                        || NdbError::InvalidBTreeChildPageLevel(offset, child, parent).into(),
+                    );
+                    if let Err(err) = checked {
+                        page_cache.insert(block.block(), page);
+                        return Err(err);
+                    }
+                }
+                path.push(offset);
+                let entry = page.find_entry_on_path(f, key, page_cache, path);
+                path.pop();
                 page_cache.insert(block.block(), page);
                 entry
             }
             Self::Leaf(page) => {
-                let entry = <Self::LeafPage as BTreePage>::entries(page)
+                let entry = <LeafPage as BTreePage>::entries(page)
                     .iter()
-                    .find(|entry| entry.key().into() == search_key)
+                    .find(|entry| Into::<u64>::into(entry.key()) == search_key)
                     .ok_or(NdbError::BTreePageNotFound(search_key))?;
                 Ok(*entry)
             }
+        }
+    }
+}
+
+impl<Pst, Entry, IntermediatePage, LeafPage> RootBTreePage<Pst, Entry, IntermediatePage, LeafPage>
+where
+    Pst: PstFile,
+    Entry: BTreeEntry<Key = <Pst as PstFile>::BTreeKey>,
+    IntermediatePage: RootBTreeIntermediatePage<Pst, Entry, LeafPage>,
+    LeafPage: RootBTreeLeafPage<Pst, Entry = Entry>,
+{
+    /// The page's `cLevel`: 0 for a leaf page, 1 to 8 for an intermediate page.
+    pub fn level(&self) -> u8 {
+        match self {
+            Self::Intermediate(page, ..) => page.level(),
+            Self::Leaf(_) => 0,
         }
     }
 }
@@ -2316,14 +2216,6 @@ where
 {
     pub fn read<R: PstReader>(f: &mut R, block: <Pst as PstFile>::PageRef) -> io::Result<Self> {
         <Self as RootBTreeReadWrite>::read(f, block)
-    }
-
-    pub fn write<W: Write + Seek>(
-        &self,
-        f: &mut W,
-        block: <Pst as PstFile>::PageRef,
-    ) -> io::Result<()> {
-        <Self as RootBTreeReadWrite>::write(self, f, block)
     }
 
     pub fn find_entry<R: PstReader>(
@@ -2379,3 +2271,99 @@ impl NodeBTreeReadWrite<UnicodePstFile, UnicodeNodeBTreeEntry> for UnicodeNodeBT
 pub type AnsiNodeBTree = AnsiBTree<AnsiNodeBTreeEntry, AnsiNodeBTreePage>;
 impl NodeBTree<AnsiPstFile, AnsiNodeBTreeEntry> for AnsiNodeBTree {}
 impl NodeBTreeReadWrite<AnsiPstFile, AnsiNodeBTreeEntry> for AnsiNodeBTree {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A 512-byte Unicode node BTree page at `offset` of `file`, with a valid CRC: an
+    /// intermediate page of `level` whose one entry leads to the page at `child`, or a leaf page
+    /// (`child` of `None`) with one entry for NID 0x21.
+    fn put_page(file: &mut Vec<u8>, offset: usize, level: u8, child: Option<usize>) {
+        if file.len() < offset + PAGE_SIZE {
+            file.resize(offset + PAGE_SIZE, 0);
+        }
+        let page = &mut file[offset..offset + PAGE_SIZE];
+        page.fill(0);
+        match child {
+            Some(child) => {
+                page[8..16].copy_from_slice(&(child as u64).to_le_bytes());
+                page[16..24].copy_from_slice(&(child as u64).to_le_bytes());
+                page[488..492].copy_from_slice(&[1, 20, 24, level]);
+            }
+            None => {
+                page[0..8].copy_from_slice(&0x21_u64.to_le_bytes());
+                page[488..492].copy_from_slice(&[1, 15, 32, 0]);
+            }
+        }
+        let crc = compute_crc(0, &page[..496]);
+        page[496] = PageType::NodeBTree as u8;
+        page[497] = PageType::NodeBTree as u8;
+        page[500..504].copy_from_slice(&crc.to_le_bytes());
+        page[504..512].copy_from_slice(&(offset as u64).to_le_bytes());
+    }
+
+    fn find(file: &[u8], root: usize) -> io::Result<UnicodeNodeBTreeEntry> {
+        let mut f = Cursor::new(file.to_vec());
+        let root = UnicodePageRef::new(
+            UnicodePageId::from(root as u64),
+            UnicodeByteIndex::new(root as u64),
+        );
+        let btree = UnicodeNodeBTree::read(&mut f, root)?;
+        btree.find_entry(&mut f, 0x21, &mut Default::default())
+    }
+
+    #[test]
+    fn test_btree_lookup() {
+        let mut file = Vec::new();
+        put_page(&mut file, 0x400, 2, Some(0x600));
+        put_page(&mut file, 0x600, 1, Some(0x800));
+        put_page(&mut file, 0x800, 0, None);
+        assert_eq!(u32::from(find(&file, 0x400).unwrap().node()), 0x21);
+    }
+
+    #[test]
+    fn test_btree_page_that_points_at_itself() {
+        let mut file = Vec::new();
+        put_page(&mut file, 0x400, 1, Some(0x400));
+        // Strictly, the page is not below itself; leniently, it is on its own path.
+        assert!(find(&file, 0x400).is_err());
+        let (_scope, _log) = crate::problems::lenient_scope();
+        let err = find(&file, 0x400).unwrap_err();
+        assert!(err.to_string().contains("lookup path"), "{err}");
+    }
+
+    #[test]
+    fn test_btree_level_that_goes_up() {
+        // A level-1 page over a level-2 page over a leaf: a stale reference some writers leave,
+        // followed because the path is finite.
+        let mut file = Vec::new();
+        put_page(&mut file, 0x400, 1, Some(0x600));
+        put_page(&mut file, 0x600, 2, Some(0x800));
+        put_page(&mut file, 0x800, 0, None);
+        let err = find(&file, 0x400).unwrap_err();
+        assert!(err.to_string().contains("cLevel"), "{err}");
+        let (_scope, log) = crate::problems::lenient_scope();
+        assert!(find(&file, 0x400).is_ok());
+        let problems = log.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind(), crate::ProblemKind::PageField);
+        assert_eq!(problems[0].offset(), Some(0x600));
+    }
+
+    #[test]
+    fn test_btree_deeper_than_the_limit() {
+        // Distinct pages, each the only child of the one before: deeper than any BTree.
+        let mut file = Vec::new();
+        let depth = MAX_BTREE_DEPTH + 4;
+        for i in 0..depth {
+            put_page(&mut file, 0x400 * (i + 1), 1, Some(0x400 * (i + 2)));
+        }
+        put_page(&mut file, 0x400 * (depth + 1), 0, None);
+        assert!(find(&file, 0x400).is_err());
+        let (_scope, _log) = crate::problems::lenient_scope();
+        let err = find(&file, 0x400).unwrap_err();
+        assert!(err.to_string().contains("deeper"), "{err}");
+    }
+}

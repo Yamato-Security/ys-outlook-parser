@@ -1,8 +1,11 @@
+# Yamato Security's fork of Microsoft's outlook-pst (https://github.com/microsoft/outlook-pst-rs),
+# read-only, for forensics: not published.
 [package]
-name = "outlook-pst"
-description = "Outlook PST Store Provider in Rust"
-version = "1.2.0"
+name = "ys-outlook-parser-pst"
+description = "PST and OST files (MS-PST, and the 4 KiB layout of Outlook 2013 and later OSTs) for forensics"
+publish = false
 
+version.workspace = true
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,16 +14,15 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+name = "outlook_pst"
+
 [dependencies]
 byteorder.workspace = true
+flate2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
-clap.workspace = true
-codepage-strings.workspace = true
+# The mutation test decompresses the RTF bodies it reads.
 compressed-rtf.workspace = true
-crossterm.workspace = true
-ratatui.workspace = true
-tracing-subscriber = { workspace = true, features = [ "env-filter" ] }

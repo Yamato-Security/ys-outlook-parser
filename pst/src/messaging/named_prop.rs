@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Named Property Lookup Map](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e17e195d-0454-4b9b-b398-c9127a26a678)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -10,6 +27,7 @@ use std::{
 
 use super::{read_write::*, store::*, *};
 use crate::{
+    AnsiPstFile, PstFile, PstFileInternal, UnicodePstFile,
     crc::compute_crc,
     ltp::{
         heap::HeapNode,
@@ -25,7 +43,6 @@ use crate::{
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,7 +65,7 @@ impl From<NamedPropertyGuid> for u16 {
             NamedPropertyGuid::None => 0x0000,
             NamedPropertyGuid::Mapi => 0x0001,
             NamedPropertyGuid::PublicStrings => 0x0002,
-            NamedPropertyGuid::GuidIndex(index) => index + 3,
+            NamedPropertyGuid::GuidIndex(index) => index.saturating_add(3),
         }
     }
 }
@@ -65,7 +82,7 @@ impl TryFrom<u16> for NamedPropertyGuid {
             0x0000 => Self::None,
             0x0001 => Self::Mapi,
             0x0002 => Self::PublicStrings,
-            index => Self::GuidIndex(index - 3),
+            index => Self::GuidIndex(index.saturating_sub(3)),
         })
     }
 }
@@ -81,7 +98,7 @@ impl NamedPropertyIndex {
 
 impl From<NamedPropertyIndex> for u16 {
     fn from(value: NamedPropertyIndex) -> Self {
-        value.0 - 0x8000
+        value.0.saturating_sub(0x8000)
     }
 }
 
@@ -94,7 +111,7 @@ impl TryFrom<u16> for NamedPropertyIndex {
                 value,
             ));
         }
-        Ok(Self(value + 0x8000))
+        Ok(Self(value | 0x8000))
     }
 }
 
@@ -120,7 +137,7 @@ pub struct StringEntry {
 
 impl StringEntry {
     pub fn new(size: u32, buffer: Vec<u8>) -> MessagingResult<Self> {
-        if size % 2 != 0 || size as usize != buffer.len() {
+        if !size.is_multiple_of(2) || size as usize != buffer.len() {
             Err(MessagingError::NamedPropertyMapStringEntryOutOfBounds)
         } else {
             Ok(Self { size, buffer })
@@ -146,8 +163,12 @@ impl NamedPropReadWrite for StringEntry {
             );
         }
 
-        let mut buffer = vec![0; size as usize];
-        f.read_exact(&mut buffer)?;
+        // No more than the stream holds: the size comes from the file.
+        let mut buffer = Vec::new();
+        f.take(u64::from(size)).read_to_end(&mut buffer)?;
+        if buffer.len() != size as usize {
+            return Err(MessagingError::NamedPropertyMapStringEntryOutOfBounds.into());
+        }
 
         Ok(Self::new(size, buffer)?)
     }
@@ -249,6 +270,12 @@ impl NamedPropReadWrite for NameIdEntry {
     }
 }
 
+fn read_nameid_entries(bytes: &[u8]) -> impl Iterator<Item = io::Result<NameIdEntry>> + '_ {
+    bytes
+        .chunks(8)
+        .map(|chunk| NameIdEntry::read(&mut Cursor::new(chunk)))
+}
+
 #[derive(Default, Debug)]
 pub struct NamedPropertyMapProperties {
     properties: BTreeMap<u16, PropertyValue>,
@@ -270,7 +297,7 @@ impl NamedPropertyMapProperties {
                 let string_entry = self.lookup_string(*offset)?;
                 let hash_value =
                     NamedPropertyId::StringOffset(compute_crc(0, string_entry.buffer()));
-                NameIdEntry::new(hash_value, NamedPropertyGuid::None, entry.prop_index)
+                NameIdEntry::new(hash_value, entry.guid, entry.prop_index)
             }
         })
     }
@@ -300,27 +327,22 @@ impl NamedPropertyMapProperties {
 
     pub fn hash_bucket(&self, name_id: &NameIdEntry) -> io::Result<Vec<NameIdEntry>> {
         let bucket_count = self.bucket_count()?;
-        let bucket_offset = name_id.hash_value() % u32::from(bucket_count);
+        let bucket_offset = name_id
+            .hash_value()
+            .checked_rem(u32::from(bucket_count))
+            .ok_or(MessagingError::NamedPropertyMapBucketCountOutOfBounds(0))?;
         let bucket_offset = u16::try_from(bucket_offset)
             .map_err(|_| MessagingError::NamedPropertyMapBucketOffsetOutOfBounds(bucket_offset))?;
-        if bucket_offset > u16::MAX - 0x1000 {
-            return Err(MessagingError::NamedPropertyMapBucketNotFound(bucket_offset).into());
-        }
-        let bucket_prop = 0x1000 + bucket_offset;
+        let bucket_prop = bucket_offset.checked_add(0x1000).ok_or(
+            MessagingError::NamedPropertyMapBucketNotFound(bucket_offset),
+        )?;
 
         let hash_bucket = self.properties.get(&bucket_prop).ok_or(
             MessagingError::NamedPropertyMapBucketNotFound(bucket_offset),
         )?;
 
         match hash_bucket {
-            PropertyValue::Binary(value) => {
-                let mut results = Vec::with_capacity(value.buffer().len() / 8);
-                let mut cursor = Cursor::new(value.buffer());
-                while let Ok(value) = NameIdEntry::read(&mut cursor) {
-                    results.push(value);
-                }
-                Ok(results)
-            }
+            PropertyValue::Binary(value) => read_nameid_entries(value.buffer()).collect(),
             invalid => Err(MessagingError::InvalidNamedPropertyMapStreamString(
                 PropertyType::from(invalid),
             )
@@ -328,7 +350,17 @@ impl NamedPropertyMapProperties {
         }
     }
 
+    /// The GUID of a NAMEID's `wGuid`: [`PS_MAPI`], [`PS_PUBLIC_STRINGS`], or the GUID at that
+    /// index of the GUID stream (`PidTagNameidStreamGuid`).
     pub fn lookup_guid(&self, index: NamedPropertyGuid) -> io::Result<GuidValue> {
+        let guid_index = match index {
+            NamedPropertyGuid::None => {
+                return Err(MessagingError::NamedPropertyMapGuidIndexOutOfBounds(0).into());
+            }
+            NamedPropertyGuid::Mapi => return Ok(PS_MAPI),
+            NamedPropertyGuid::PublicStrings => return Ok(PS_PUBLIC_STRINGS),
+            NamedPropertyGuid::GuidIndex(guid_index) => guid_index,
+        };
         let stream_guid = self
             .properties
             .get(&0x0002)
@@ -336,9 +368,15 @@ impl NamedPropertyMapProperties {
 
         match stream_guid {
             PropertyValue::Binary(value) => {
-                let start = u16::from(index) as usize * 16;
-                let end = start + 16;
-                let mut cursor = Cursor::new(&value.buffer()[start..end]);
+                // wGuid 3 and up index the GUID stream from its start (MS-PST 2.4.7.1).
+                let start = usize::from(guid_index) * 16;
+                let Some(guid) = value.buffer().get(start..start.saturating_add(16)) else {
+                    return Err(
+                        MessagingError::NamedPropertyMapGuidIndexOutOfBounds(u16::from(index))
+                            .into(),
+                    );
+                };
+                let mut cursor = Cursor::new(guid);
                 let entry = PropertyValue::read(&mut cursor, PropertyType::Guid)?;
                 match entry {
                     PropertyValue::Guid(guid) => Ok(guid),
@@ -372,7 +410,7 @@ impl NamedPropertyMapProperties {
                             return Err(MessagingError::InvalidNamedPropertyMapStreamGuid(
                                 PropertyType::from(&invalid),
                             )
-                            .into())
+                            .into());
                         }
                     }
                 }
@@ -386,20 +424,20 @@ impl NamedPropertyMapProperties {
     }
 
     pub fn stream_entry(&self) -> io::Result<Vec<NameIdEntry>> {
+        self.stream_entries()?.collect()
+    }
+
+    /// Each NAMEID record as its own result, including a partial final record. A forensic
+    /// reader can report a bad record and continue with later records; `stream_entry()`
+    /// instead fails if any record is bad.
+    pub fn stream_entries(&self) -> io::Result<impl Iterator<Item = io::Result<NameIdEntry>> + '_> {
         let stream_entry = self
             .properties
             .get(&0x0003)
             .ok_or(MessagingError::NamedPropertyMapStreamEntryNotFound)?;
 
         match stream_entry {
-            PropertyValue::Binary(value) => {
-                let mut results = Vec::with_capacity(value.buffer().len() / 8);
-                let mut cursor = Cursor::new(value.buffer());
-                while let Ok(value) = NameIdEntry::read(&mut cursor) {
-                    results.push(value);
-                }
-                Ok(results)
-            }
+            PropertyValue::Binary(value) => Ok(read_nameid_entries(value.buffer())),
             invalid => Err(
                 MessagingError::InvalidNamedPropertyMapStreamEntry(PropertyType::from(invalid))
                     .into(),
@@ -408,6 +446,12 @@ impl NamedPropertyMapProperties {
     }
 
     pub fn lookup_string(&self, offset: u32) -> io::Result<StringEntry> {
+        let bytes = self.lookup_string_bytes(offset)?;
+        Ok(StringEntry::new(bytes.len() as u32, bytes.to_vec())?)
+    }
+
+    /// Borrow a name's UTF-16LE bytes without allocating an owned `StringEntry`.
+    pub fn lookup_string_bytes(&self, offset: u32) -> io::Result<&[u8]> {
         let stream_string = self
             .properties
             .get(&0x0004)
@@ -415,9 +459,23 @@ impl NamedPropertyMapProperties {
 
         match stream_string {
             PropertyValue::Binary(value) => {
-                let mut cursor = Cursor::new(&value.buffer()[offset as usize..]);
-                let entry = StringEntry::read(&mut cursor)?;
-                Ok(entry)
+                let data = value
+                    .buffer()
+                    .get(offset as usize..)
+                    .ok_or(MessagingError::NamedPropertyMapStringEntryOutOfBounds)?;
+                let (size, bytes) = data
+                    .split_first_chunk::<4>()
+                    .ok_or(MessagingError::NamedPropertyMapStringEntryOutOfBounds)?;
+                let size = u32::from_le_bytes(*size);
+                if !size.is_multiple_of(2) {
+                    return Err(MessagingError::InvalidNamedPropertyMapStreamString(
+                        PropertyType::Binary,
+                    )
+                    .into());
+                }
+                bytes
+                    .get(..size as usize)
+                    .ok_or_else(|| MessagingError::NamedPropertyMapStringEntryOutOfBounds.into())
             }
             invalid => Err(MessagingError::InvalidNamedPropertyMapStreamString(
                 PropertyType::from(invalid),
@@ -437,7 +495,8 @@ impl NamedPropertyMapProperties {
                 let mut results = Vec::new();
                 let mut cursor = Cursor::new(value.buffer());
                 while let Ok(value) = StringEntry::read(&mut cursor) {
-                    let padding = ((i64::from(value.size()) + 3) / 4) * 4;
+                    // Each length and string pair ends on a 4-byte boundary.
+                    let padding = i64::from(value.size().wrapping_neg() & 0x03);
                     results.push(value);
 
                     if padding > 0 && cursor.seek(SeekFrom::Current(padding)).is_err() {
@@ -469,16 +528,16 @@ where
 
 impl<Pst> NamedPropertyMapInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <Pst as PstFile>::NodeBTreeEntry,
-            <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <Pst as PstFile>::NodeBTreeEntry,
+                <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
+            >,
     <<<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage as BTreePage>::Entry:
         BTreePageEntryReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
@@ -487,10 +546,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
@@ -505,10 +564,7 @@ where
         let root = header.root();
 
         let properties = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let encoding = header.crypt_method();
@@ -521,11 +577,11 @@ where
                 *root.block_btree(),
             )?;
 
-            let mut page_cache = pst.node_cache();
+            let mut page_cache = pst.node_cache()?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(NID_NAME_TO_ID_MAP).into();
             let node = node_btree.find_entry(file, node_key, &mut page_cache)?;
 
-            let mut page_cache = pst.block_cache();
+            let mut page_cache = pst.block_cache()?;
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
                 file,
@@ -540,15 +596,16 @@ where
             let prop_context = <<Pst as PstFile>::PropertyContext as PropertyContextReadWrite<
                 Pst,
             >>::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let properties =
+                read_properties(pst, node.node(), prop_context.properties()?, |record| {
+                    prop_context.read_property(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut page_cache,
+                        record,
+                    )
+                })?;
             NamedPropertyMapProperties { properties }
         };
 
@@ -595,5 +652,247 @@ impl NamedPropertyMapReadWrite<AnsiPstFile> for AnsiNamedPropertyMap {
     fn read(store: Rc<AnsiStore>) -> io::Result<Rc<Self>> {
         let inner = NamedPropertyMapInner::read(store)?;
         Ok(Rc::new(Self { inner }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ltp::prop_context::BinaryValue;
+
+    #[test]
+    fn test_invalid_nameid_records_are_not_silently_accepted_as_a_prefix() {
+        let entry = |index| {
+            NameIdEntry::new(
+                NamedPropertyId::Number(0x8501),
+                NamedPropertyGuid::PublicStrings,
+                NamedPropertyIndex::try_from(index).unwrap(),
+            )
+        };
+        let mut bytes = Vec::new();
+        entry(0).write(&mut bytes).unwrap();
+        let mut bad = vec![0u8; 8];
+        bad[6..].copy_from_slice(&0x8000u16.to_le_bytes());
+        bytes.extend(bad);
+        entry(1).write(&mut bytes).unwrap();
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([
+                (0x0001, PropertyValue::Integer32(1)),
+                (
+                    0x0003,
+                    PropertyValue::Binary(BinaryValue::new(bytes.clone())),
+                ),
+                (0x1000, PropertyValue::Binary(BinaryValue::new(bytes))),
+            ]),
+        };
+        assert!(
+            map.stream_entry().is_err(),
+            "a bad middle record was silently ignored"
+        );
+        assert!(
+            map.hash_bucket(&entry(0)).is_err(),
+            "a bad bucket record was silently ignored"
+        );
+    }
+
+    #[test]
+    fn test_nameid_iteration_recovers_after_a_bad_record_and_reports_a_partial_tail() {
+        let entry = |index| {
+            NameIdEntry::new(
+                NamedPropertyId::Number(0x8501),
+                NamedPropertyGuid::PublicStrings,
+                NamedPropertyIndex::try_from(index).unwrap(),
+            )
+        };
+        let mut bytes = Vec::new();
+        entry(0).write(&mut bytes).unwrap();
+        bytes.extend([0, 0, 0, 0, 0, 0, 0, 0x80]);
+        entry(1).write(&mut bytes).unwrap();
+        bytes.extend([0, 0]);
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(0x0003, PropertyValue::Binary(BinaryValue::new(bytes)))]),
+        };
+        let records: Vec<_> = map.stream_entries().unwrap().collect();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].as_ref().unwrap().prop_id(), 0x8000);
+        assert!(records[1].is_err());
+        assert_eq!(records[2].as_ref().unwrap().prop_id(), 0x8001);
+        assert!(records[3].is_err());
+    }
+
+    #[test]
+    fn test_borrowed_names_validate_offsets_lengths_and_even_code_units() {
+        let valid = [4u32.to_le_bytes().as_slice(), b"O\0K\0"].concat();
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(0x0004, PropertyValue::Binary(BinaryValue::new(valid)))]),
+        };
+        assert_eq!(map.lookup_string_bytes(0).unwrap(), b"O\0K\0");
+        assert_eq!(map.lookup_string(0).unwrap().to_string(), "OK");
+        assert!(map.lookup_string_bytes(4).is_err());
+        assert!(map.lookup_string_bytes(u32::MAX).is_err());
+        for raw in [
+            3u32.to_le_bytes().to_vec(),
+            u32::MAX.to_le_bytes().to_vec(),
+            vec![0, 0, 0],
+        ] {
+            let map = NamedPropertyMapProperties {
+                properties: BTreeMap::from([(
+                    0x0004,
+                    PropertyValue::Binary(BinaryValue::new(raw)),
+                )]),
+            };
+            assert!(map.lookup_string_bytes(0).is_err());
+        }
+    }
+
+    #[test]
+    fn test_stream_string_reads_every_name() {
+        // Every name the entry stream of Empty.pst points at should be in stream_string().
+        let store = crate::open_store(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Empty.pst"
+        ))
+        .unwrap();
+        let map = store.named_property_map().unwrap();
+        let properties = map.properties();
+        let offsets: std::collections::BTreeSet<u32> = properties
+            .stream_entry()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| match entry.id() {
+                NamedPropertyId::StringOffset(offset) => Some(offset),
+                NamedPropertyId::Number(_) => None,
+            })
+            .collect();
+        let expected: Vec<String> = offsets
+            .iter()
+            .map(|offset| properties.lookup_string(*offset).unwrap().to_string())
+            .collect();
+        let names: Vec<String> = properties
+            .stream_string()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(names.len() > 1);
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn test_string_sizes_from_the_file() {
+        // A name of 2 GiB in a 6-byte stream: this reserved the 2 GiB before.
+        let stream = [0xFE, 0xFF, 0xFF, 0x7F, b'a', 0];
+        assert!(StringEntry::read(&mut stream.as_slice()).is_err());
+        let stream = [2, 0, 0, 0, b'a', 0];
+        assert_eq!(
+            StringEntry::read(&mut stream.as_slice())
+                .unwrap()
+                .to_string(),
+            "a"
+        );
+
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(
+                0x0004,
+                PropertyValue::Binary(BinaryValue::new(stream.to_vec())),
+            )]),
+        };
+        assert!(map.lookup_string(0).is_ok());
+        assert!(map.lookup_string(6).is_err());
+        assert!(map.lookup_string(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn test_bucket_count_of_zero_is_an_error() {
+        // The bucket is the hash modulo the bucket count: a count of 0 divided by zero.
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(0x0001, PropertyValue::Integer32(0))]),
+        };
+        let entry = NameIdEntry::new(
+            NamedPropertyId::Number(0x8001),
+            NamedPropertyGuid::PublicStrings,
+            NamedPropertyIndex::try_from(1).unwrap(),
+        );
+        assert!(map.hash_bucket(&entry).is_err());
+    }
+
+    #[test]
+    fn test_lookup_guid() {
+        let guid = |data1: u32| {
+            let mut bytes = data1.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&[0; 12]);
+            bytes
+        };
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(
+                0x0002,
+                PropertyValue::Binary(BinaryValue::new([guid(0x11), guid(0x22)].concat())),
+            )]),
+        };
+        let data1 = |index| map.lookup_guid(index).map(|guid| guid.data1());
+        // wGuid 3 is the first GUID of the stream, wGuid 4 the second.
+        assert_eq!(data1(NamedPropertyGuid::GuidIndex(0)).unwrap(), 0x11);
+        assert_eq!(data1(NamedPropertyGuid::GuidIndex(1)).unwrap(), 0x22);
+        assert!(data1(NamedPropertyGuid::GuidIndex(2)).is_err());
+        assert!(data1(NamedPropertyGuid::GuidIndex(u16::MAX)).is_err());
+        assert!(data1(NamedPropertyGuid::None).is_err());
+        assert_eq!(data1(NamedPropertyGuid::Mapi).unwrap(), PS_MAPI.data1());
+        assert_eq!(
+            data1(NamedPropertyGuid::PublicStrings).unwrap(),
+            PS_PUBLIC_STRINGS.data1()
+        );
+    }
+
+    #[test]
+    fn test_lookup_guid_of_every_entry() {
+        // Every NAMEID of Empty.pst names a GUID that lookup_guid finds.
+        let store = crate::open_store(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Empty.pst"
+        ))
+        .unwrap();
+        let map = store.named_property_map().unwrap();
+        let properties = map.properties();
+        let guids = properties.stream_guid().unwrap();
+        let mut indexed = 0;
+        for entry in properties.stream_entry().unwrap() {
+            let guid = properties.lookup_guid(entry.guid()).unwrap();
+            if let NamedPropertyGuid::GuidIndex(index) = entry.guid() {
+                assert_eq!(
+                    format!("{guid:?}"),
+                    format!("{:?}", guids[usize::from(index)])
+                );
+                indexed += 1;
+            }
+        }
+        assert!(indexed > 0);
+    }
+
+    #[test]
+    fn test_hash_entry_keeps_guid() {
+        let name: Vec<u8> = "Keywords"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let mut stream = (name.len() as u32).to_le_bytes().to_vec();
+        stream.extend_from_slice(&name);
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(0x0004, PropertyValue::Binary(BinaryValue::new(stream)))]),
+        };
+
+        let prop_index = NamedPropertyIndex::try_from(0).unwrap();
+        let entry = NameIdEntry::new(
+            NamedPropertyId::StringOffset(0),
+            NamedPropertyGuid::PublicStrings,
+            prop_index,
+        );
+        assert_eq!(
+            map.hash_entry(entry).unwrap(),
+            NameIdEntry::new(
+                NamedPropertyId::StringOffset(compute_crc(0, &name)),
+                NamedPropertyGuid::PublicStrings,
+                prop_index,
+            )
+        );
     }
 }

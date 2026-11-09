@@ -1,9 +1,32 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Folders](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/dee5b9d0-5513-4c5e-94aa-8bd28a9350b2)
 
-use std::{cell::OnceCell, collections::BTreeMap, io, rc::Rc};
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet},
+    io,
+    rc::Rc,
+};
 
 use super::{read_write::*, store::*, *};
 use crate::{
+    AnsiPstFile, PstFile, PstFileInternal, UnicodePstFile, Validation,
     ltp::{
         heap::HeapNode,
         prop_context::{BinaryValue, PropertyContext, PropertyValue},
@@ -14,12 +37,11 @@ use crate::{
     ndb::{
         block_id::BlockId,
         header::Header,
-        node_id::{NodeId, NodeIdType, NID_ROOT_FOLDER},
+        node_id::{NID_ROOT_FOLDER, NodeId, NodeIdType},
         page::{BTreePage, NodeBTreeEntry, RootBTree},
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
 };
 
 #[derive(Default, Debug)]
@@ -99,12 +121,94 @@ impl FolderProperties {
     }
 }
 
+/// A folder. Its tables are `None` when it has none. Read leniently, they are read when first
+/// asked for, and a table that cannot be read is `None` and a [`Problem`]; read strictly
+/// ([`Validation::Strict`]), they are read when the folder is opened, which fails if one cannot be
+/// read.
 pub trait Folder {
     fn store(&self) -> Rc<dyn Store>;
     fn properties(&self) -> &FolderProperties;
     fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn contents_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn associated_table(&self) -> Option<&Rc<dyn TableContext>>;
+}
+
+/// The most levels of sub-folders [`walk_folders`] goes down from the root folder.
+pub const MAX_FOLDER_DEPTH: usize = 256;
+
+/// A folder [`walk_folders`] reached.
+pub struct FolderWalkEntry {
+    /// The folder's node ID.
+    pub node_id: NodeId,
+    /// The folder whose hierarchy table lists it: `None` for the root folder.
+    pub parent: Option<NodeId>,
+    /// How many levels below the root folder it is.
+    pub depth: usize,
+    /// The folder, or why it could not be opened.
+    pub folder: io::Result<Rc<dyn Folder>>,
+}
+
+/// Every folder reachable from the root folder ([`NID_ROOT_FOLDER`]) through the hierarchy
+/// tables, depth first and in table order: see [`walk_folders`].
+pub struct FolderWalk<'a> {
+    store: &'a dyn Store,
+    stack: Vec<(NodeId, Option<NodeId>, usize)>,
+    visited: BTreeSet<u32>,
+}
+
+/// Walk every folder reachable from the root folder through the hierarchy tables, depth first
+/// and in table order.
+///
+/// Each folder comes once, even when hierarchy tables list it more than once or a corrupt table
+/// lists a folder above it (a loop). A folder that cannot be opened comes with its error, and its
+/// sub-folders are not walked; neither are those of a folder [`MAX_FOLDER_DEPTH`] levels down.
+pub fn walk_folders(store: &dyn Store) -> FolderWalk<'_> {
+    FolderWalk {
+        store,
+        stack: vec![(NID_ROOT_FOLDER, None, 0)],
+        visited: Default::default(),
+    }
+}
+
+impl Iterator for FolderWalk<'_> {
+    type Item = FolderWalkEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((node_id, parent, depth)) = self.stack.pop() {
+            if !self.visited.insert(u32::from(node_id)) {
+                continue;
+            }
+            let folder = self
+                .store
+                .properties()
+                .make_entry_id(node_id)
+                .and_then(|entry_id| self.store.open_folder(&entry_id));
+            if let Ok(folder) = &folder
+                && depth < MAX_FOLDER_DEPTH
+                && let Some(table) = folder.hierarchy_table()
+            {
+                let children: Vec<_> = table
+                    .rows_matrix()
+                    .map(|row| NodeId::from(u32::from(row.id())))
+                    .filter(|child| !self.visited.contains(&u32::from(*child)))
+                    .collect();
+                let depth = depth.saturating_add(1);
+                self.stack.extend(
+                    children
+                        .into_iter()
+                        .rev()
+                        .map(|child| (child, Some(node_id), depth)),
+                );
+            }
+            return Some(FolderWalkEntry {
+                node_id,
+                parent,
+                depth,
+                folder,
+            });
+        }
+        None
+    }
 }
 
 struct FolderInner<Pst>
@@ -120,16 +224,16 @@ where
 
 impl<Pst> FolderInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <Pst as PstFile>::NodeBTreeEntry,
-            <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <Pst as PstFile>::NodeBTreeEntry,
+                <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
+            >,
     <<<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage as BTreePage>::Entry:
         BTreePageEntryReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
@@ -138,10 +242,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
@@ -169,10 +273,7 @@ where
         let root = header.root();
 
         let properties = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let encoding = header.crypt_method();
@@ -185,10 +286,10 @@ where
                 *root.block_btree(),
             )?;
 
-            let mut node_page_cache = pst.node_cache();
+            let mut node_page_cache = pst.node_cache()?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
             let node = node_btree.find_entry(file, node_key, &mut node_page_cache)?;
-            let mut block_page_cache = pst.block_cache();
+            let mut block_page_cache = pst.block_cache()?;
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
                 file,
@@ -209,19 +310,18 @@ where
                 1
             };
             let entry_id = entry_id.try_into()?;
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut block_page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .chain([
-                    Ok((0x0FFF, PropertyValue::Binary(BinaryValue::new(entry_id)))),
-                    Ok((0x3601, PropertyValue::Integer32(folder_type))),
-                ])
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let mut properties =
+                read_properties(pst, node.node(), prop_context.properties()?, |record| {
+                    prop_context.read_property(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut block_page_cache,
+                        record,
+                    )
+                })?;
+            properties.insert(0x0FFF, PropertyValue::Binary(BinaryValue::new(entry_id)));
+            properties.insert(0x3601, PropertyValue::Integer32(folder_type));
 
             FolderProperties {
                 node_id,
@@ -229,13 +329,49 @@ where
             }
         };
 
-        Ok(Self {
+        let folder = Self {
             store,
             properties,
             hierarchy_table: Default::default(),
             contents_table: Default::default(),
             associated_table: Default::default(),
-        })
+        };
+
+        // Read strictly, a table that cannot be read is an error: the table methods return an
+        // Option, so the tables are read now, and opening the folder fails instead.
+        if folder.store.pst().validation() == Validation::Strict {
+            for (cell, node_id_type) in [
+                (&folder.hierarchy_table, NodeIdType::HierarchyTable),
+                (&folder.contents_table, NodeIdType::ContentsTable),
+                (
+                    &folder.associated_table,
+                    NodeIdType::AssociatedContentsTable,
+                ),
+            ] {
+                let table = folder.read_table(node_id_type)?;
+                let _ = cell.set(table);
+            }
+        }
+
+        Ok(folder)
+    }
+
+    /// [`Self::read_table`], with a table that cannot be read a [`Problem`](crate::Problem): the
+    /// folder's table methods return an `Option`. Read strictly, the tables are read when the
+    /// folder is opened, and this is not called.
+    fn read_table_or_problem(&self, node_id_type: NodeIdType) -> Option<Rc<dyn TableContext>> {
+        match self.read_table(node_id_type) {
+            Ok(table) => table,
+            Err(err) => {
+                self.store.pst().problem_log().record(crate::Problem::new(
+                    crate::ProblemKind::Table,
+                    None,
+                    Some(self.properties.node_id),
+                    format!("{node_id_type:?}: {err}"),
+                ));
+                None
+            }
+        }
     }
 
     fn read_table(&self, node_id_type: NodeIdType) -> io::Result<Option<Rc<dyn TableContext>>> {
@@ -244,10 +380,7 @@ where
         let root = header.root();
 
         let node = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let node_btree = <<Pst as PstFile>::NodeBTree as RootBTreeReadWrite>::read(
@@ -257,12 +390,14 @@ where
 
             let node_id = NodeId::new(node_id_type, self.properties.node_id.index())?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
-            let mut node_page_cache = pst.node_cache();
+            let mut node_page_cache = pst.node_cache()?;
 
-            let Ok(node) = node_btree.find_entry(file, node_key, &mut node_page_cache) else {
-                return Ok(None);
-            };
-            node
+            match node_btree.find_entry(file, node_key, &mut node_page_cache) {
+                Ok(node) => node,
+                // The folder has no such table.
+                Err(err) if crate::ndb::is_not_found(&err) => return Ok(None),
+                Err(err) => return Err(err),
+            }
         };
 
         Ok(Some(
@@ -275,19 +410,19 @@ where
 
     fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.hierarchy_table
-            .get_or_init(|| self.read_table(NodeIdType::HierarchyTable).ok()?)
+            .get_or_init(|| self.read_table_or_problem(NodeIdType::HierarchyTable))
             .as_ref()
     }
 
     fn contents_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.contents_table
-            .get_or_init(|| self.read_table(NodeIdType::ContentsTable).ok()?)
+            .get_or_init(|| self.read_table_or_problem(NodeIdType::ContentsTable))
             .as_ref()
     }
 
     fn associated_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.associated_table
-            .get_or_init(|| self.read_table(NodeIdType::AssociatedContentsTable).ok()?)
+            .get_or_init(|| self.read_table_or_problem(NodeIdType::AssociatedContentsTable))
             .as_ref()
     }
 }
@@ -367,5 +502,212 @@ impl FolderReadWrite<AnsiPstFile> for AnsiFolder {
     fn read(store: Rc<AnsiStore>, entry_id: &EntryId) -> io::Result<Rc<Self>> {
         let inner = FolderInner::read(store, entry_id)?;
         Ok(Rc::new(Self { inner }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ltp::{
+        heap::HeapId,
+        table_context::{TableContextInfo, TableRowColumnValue, TableRowData, TableRowId},
+    };
+    use crate::messaging::{
+        message::Message, named_prop::NamedPropertyMap, search::SearchUpdateQueue,
+    };
+
+    /// A store whose folders are only node IDs and hierarchy tables.
+    struct MockStore {
+        properties: StoreProperties,
+        children: BTreeMap<u32, Vec<u32>>,
+    }
+
+    struct MockFolder {
+        properties: FolderProperties,
+        hierarchy_table: Option<Rc<dyn TableContext>>,
+    }
+
+    struct MockTable {
+        context: TableContextInfo,
+        rows: Vec<TableRowData>,
+    }
+
+    impl TableContext for MockTable {
+        fn context(&self) -> &TableContextInfo {
+            &self.context
+        }
+
+        fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a TableRowData>> {
+            Box::new(self.rows.iter())
+        }
+
+        fn find_row(&self, id: TableRowId) -> crate::ltp::LtpResult<&TableRowData> {
+            Err(crate::ltp::LtpError::TableRowIdNotFound(u32::from(id)))
+        }
+
+        fn read_column(
+            &self,
+            _value: &TableRowColumnValue,
+            _prop_type: PropertyType,
+        ) -> io::Result<PropertyValue> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    impl Folder for MockFolder {
+        fn store(&self) -> Rc<dyn Store> {
+            unimplemented!()
+        }
+
+        fn properties(&self) -> &FolderProperties {
+            &self.properties
+        }
+
+        fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>> {
+            self.hierarchy_table.as_ref()
+        }
+
+        fn contents_table(&self) -> Option<&Rc<dyn TableContext>> {
+            None
+        }
+
+        fn associated_table(&self) -> Option<&Rc<dyn TableContext>> {
+            None
+        }
+    }
+
+    impl Store for MockStore {
+        fn properties(&self) -> &StoreProperties {
+            &self.properties
+        }
+
+        fn root_hierarchy_table(&self) -> io::Result<Rc<dyn TableContext>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        fn unique_value(&self) -> u32 {
+            0
+        }
+
+        fn open_folder(&self, entry_id: &EntryId) -> io::Result<Rc<dyn Folder>> {
+            let node_id = u32::from(entry_id.node_id());
+            let children = self
+                .children
+                .get(&node_id)
+                .ok_or(io::Error::from(io::ErrorKind::NotFound))?;
+            let rows = children
+                .iter()
+                .map(|child| {
+                    TableRowData::new(TableRowId::new(*child), 0, vec![], vec![], vec![], vec![])
+                })
+                .collect();
+            let context = TableContextInfo::new(8, 8, 8, 8, HeapId::from(0), None, vec![]).unwrap();
+            Ok(Rc::new(MockFolder {
+                properties: FolderProperties {
+                    node_id: entry_id.node_id(),
+                    properties: Default::default(),
+                },
+                hierarchy_table: Some(Rc::new(MockTable { context, rows })),
+            }))
+        }
+
+        fn open_message(
+            &self,
+            _entry_id: &EntryId,
+            _prop_ids: Option<&[u16]>,
+        ) -> io::Result<Rc<dyn Message>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        fn named_property_map(&self) -> io::Result<Rc<dyn NamedPropertyMap>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        fn search_update_queue(&self) -> io::Result<Rc<dyn SearchUpdateQueue>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    fn mock_store(children: &[(u32, &[u32])]) -> MockStore {
+        MockStore {
+            properties: StoreProperties::for_test([7; 16]),
+            children: children
+                .iter()
+                .map(|(folder, children)| (*folder, children.to_vec()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_walk_folders_with_a_loop() {
+        // The root lists 0x8022 twice; 0x8022 lists 0x8042, itself and the root; 0x8042 lists
+        // 0x8022 again and a folder that cannot be opened.
+        let store = mock_store(&[
+            (0x122, &[0x8022, 0x8022]),
+            (0x8022, &[0x8042, 0x8022, 0x122]),
+            (0x8042, &[0x8022, 0x8062]),
+        ]);
+        let folders: Vec<_> = walk_folders(&store)
+            .map(|entry| {
+                (
+                    u32::from(entry.node_id),
+                    entry.parent.map(u32::from),
+                    entry.depth,
+                    entry.folder.is_ok(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            folders,
+            [
+                (0x122, None, 0, true),
+                (0x8022, Some(0x122), 1, true),
+                (0x8042, Some(0x8022), 2, true),
+                (0x8062, Some(0x8042), 3, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_walk_folders_depth_limit() {
+        // A chain of folders deeper than MAX_FOLDER_DEPTH.
+        let chain: Vec<(u32, Vec<u32>)> = (0..MAX_FOLDER_DEPTH as u32 + 10)
+            .map(|i| {
+                let folder = if i == 0 { 0x122 } else { 0x8002 + 0x20 * i };
+                (folder, vec![0x8002 + 0x20 * (i + 1)])
+            })
+            .collect();
+        let children: Vec<(u32, &[u32])> = chain
+            .iter()
+            .map(|(folder, children)| (*folder, children.as_slice()))
+            .collect();
+        let store = mock_store(&children);
+        let depths: Vec<_> = walk_folders(&store).map(|entry| entry.depth).collect();
+        assert_eq!(depths.len(), MAX_FOLDER_DEPTH + 1);
+        assert_eq!(depths.last(), Some(&MAX_FOLDER_DEPTH));
+    }
+
+    #[test]
+    fn test_walk_folders() {
+        let store = crate::open_store(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Empty.pst"
+        ))
+        .unwrap();
+        let folders: Vec<_> = walk_folders(store.as_ref()).collect();
+        assert_eq!(folders.len(), 6);
+        assert_eq!(folders[0].node_id, NID_ROOT_FOLDER);
+        assert_eq!((folders[0].parent, folders[0].depth), (None, 0));
+        for entry in &folders[1..] {
+            assert!(entry.folder.is_ok());
+            assert!(entry.parent.is_some() && entry.depth > 0);
+        }
+        let mut ids: Vec<_> = folders
+            .iter()
+            .map(|entry| u32::from(entry.node_id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 6);
     }
 }

@@ -2,10 +2,56 @@
 
 The PST file format is publicly documented in the [MS-PST](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/141923d5-15ab-4ef1-a524-6dce75aae546) open specification. Data structures and type names generally mimic the concepts and names in that document, with some adjustment for readability and to match Rust language conventions. As much as possible, everything in this crate should have a deep link to the documentation it is based on in the doc comments. 
 
-## Unimplemented: PST file modification
+## Read-only
 
-This project is suitable for read-only access to PST files, but as with previous public implementations of the PST format, we've decided to avoid complicating it with full write support.
+This fork is for forensics and never writes to the file it reads: `UnicodePstFile::open`,
+`AnsiPstFile::open` and `open_store` open the file read-only, and `read_from` only reads from and
+seeks the reader it is given. Upstream's write support (transactions, the [AMap
+rebuild](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/d9bcc1fd-c66a-41b3-b6d7-ed09d2a25ced)
+and the writers of pages and blocks) is removed.
 
-However, this version does support [Crash Recovery and AMap Rebuilding](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/d9bcc1fd-c66a-41b3-b6d7-ed09d2a25ced), which is a step towards supporting [Transactional Semantics](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/bc5a92df-7fc1-4dc2-9c7c-5677237dd73a) when modifying a PST file. If you plan on implementing PST file modification, you can use this as a reference for those features.
+## Lenient reading
 
-If you choose to modify the PST files, please be careful to follow all of the guidance in the [Maintaining Data Integrity](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5e1a4d6b-ebbf-4658-9aa7-824929233044) section of the specification to avoid corrupting your PST files in a way that prevents Outlook (or this library) from opening them anymore.
+Evidence is often damaged, so a file is read leniently by default (`Validation::Lenient`): each
+defect reading can go past is recorded as a `Problem` and reading goes on.
+
+- A CRC that does not match (header, B-tree page, block).
+- A header field with a value MS-PST does not allow (`wMagicClient`, `wVerClient`,
+  `bPlatformCreate`, `bPlatformAccess`, `dwAlign`, `bSentinel`, reserved bytes). `wVerClient` 12,
+  which Outlook writes in OSTs, is allowed.
+- A stray value in a page or block (`dwPadding`), and a B-tree page or intermediate block whose
+  `cLevel` is not below its parent's.
+- A part of an object that cannot be read is left out of it, not the whole object: a BTH record or
+  a table column that does not parse, a property, a message's sub-node tree, recipient table or
+  attachment table, an attachment's data, a table's row index.
+- A store without a usable `PidTagRecordKey` makes entry IDs with a record key of zeros, so its
+  folders and messages still open by node ID.
+- A folder's hierarchy, contents or associated contents table that cannot be read is `None` (read
+  strictly, the tables are read when the folder is opened, and opening it fails instead).
+
+`PstFile::problems()` lists the problems found so far, each once, in the order found, each with its
+kind (`ProblemKind`), the file offset or node it was found in when known, and a description; at most
+`problems::MAX_PROBLEMS`. `UnicodePstFile::read_from_with`, `open_with` (and the same on
+`AnsiPstFile`) and `open_store_with` take `Validation::Strict` instead, which makes the first such
+defect an error, as upstream outlook-pst does. Either way, a defect that reading cannot go past (a
+truncated file, a block of the wrong size, a loop) is an error.
+
+The named-property map's entry stream can be read record by record with
+`NamedPropertyMapProperties::stream_entries`, which gives each record's result (a partial last
+record included), so that a reader can go past a bad record; `stream_entry` and `hash_bucket` fail
+on one.
+
+## Limits
+
+No input makes this crate panic, abort or allocate without bound: sizes and offsets from the file
+are checked before use, and every walk ends. A B-tree lookup goes through each page at most once and
+at most `MAX_BTREE_DEPTH` pages deep; a data tree or sub-node tree reads each block at most once
+(and no two blocks from the same file offset), at most `MAX_BLOCK_TREE_DEPTH` levels deep, and no
+more bytes than the file holds, nor, once the zlib-compressed blocks of a 4 KiB-page OST are
+inflated, more than `MAX_BLOCK_TREE_INFLATION` (8) times that; a BTree-on-heap reads each heap
+allocation at most once; an object's properties read each heap allocation or sub-node at most once
+(a second property naming it is a problem), and their values hold no more than
+`MAX_BLOCK_TREE_INFLATION` times the file's size (a property past that is a problem); embedded
+messages are read at most `MAX_EMBEDDED_MESSAGE_DEPTH` levels down, and none with the data and
+sub-node blocks of a message it is embedded in; and `messaging::folder::walk_folders` walks the
+folder hierarchy with each folder at most once, at most `MAX_FOLDER_DEPTH` levels down.

@@ -1,6 +1,23 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Node Database (NDB) Layer](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e4efaad0-1876-446e-9d34-bb921588f924)
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use std::io;
 use thiserror::Error;
 
@@ -89,6 +106,12 @@ pub enum NdbError {
     InvalidBTreePagePadding(u32),
     #[error("BTENTRY not found: 0x{0:X}")]
     BTreePageNotFound(u64),
+    #[error("BTree page at 0x{0:X} is on its own lookup path: a loop or a corrupt page")]
+    BTreePageLoop(u64),
+    #[error("BTree page at 0x{0:X} has cLevel {1}, not below its parent's {2}")]
+    InvalidBTreeChildPageLevel(u64, u8, u8),
+    #[error("BTree lookup deeper than MAX_BTREE_DEPTH, at the page at 0x{0:X}")]
+    BTreeTooDeep(u64),
     #[error("Invalid NBTENTRY nid: 0x{0:X}")]
     InvalidNodeBTreeEntryNodeId(u64),
     #[error("Invalid BLOCKTRAILER cb: 0x{0:X}")]
@@ -113,6 +136,25 @@ pub enum NdbError {
     InvalidSubNodeBlockPadding(u32),
     #[error("Sub-node not found: {0:?}")]
     SubNodeNotFound(NodeId),
+    #[error("Block 0x{0:X} is in its data or sub-node tree twice: a loop or a corrupt block")]
+    BlockTreeLoop(u64),
+    #[error(
+        "Data or sub-node tree holds more than the file (or, inflated, more than MAX_BLOCK_TREE_INFLATION times it), at block 0x{0:X}"
+    )]
+    BlockTreeTooLarge(u64),
+    #[error(
+        "Block 0x{0:X} is at file offset 0x{1:X} with another block of its data or sub-node tree"
+    )]
+    BlockTreeSharedOffset(u64, u64),
+    #[error("Data or sub-node tree deeper than MAX_BLOCK_TREE_DEPTH, at block 0x{0:X}")]
+    BlockTreeTooDeep(u64),
+}
+
+/// Whether `err` is a BTree lookup that found no entry for its key.
+pub(crate) fn is_not_found(err: &io::Error) -> bool {
+    err.get_ref()
+        .and_then(|err| err.downcast_ref::<NdbError>())
+        .is_some_and(|err| matches!(err, NdbError::BTreePageNotFound(_)))
 }
 
 impl From<NdbError> for io::Error {

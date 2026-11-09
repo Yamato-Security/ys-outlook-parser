@@ -1,14 +1,35 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [BTree-on-Heap (BTH)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/2dd1a95a-c8b1-4ac5-87d1-10cb8de64053)
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use core::mem;
 use std::{
+    collections::BTreeSet,
     io::{self, Cursor, Read, Write},
     marker::PhantomData,
 };
 
 use super::{heap::*, read_write::*, *};
-use crate::{AnsiPstFile, PstFile, UnicodePstFile};
+use crate::{
+    AnsiPstFile, PstFile, UnicodePstFile,
+    problems::{self, ProblemKind},
+};
 
 /// [BTHHEADER](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/8e4ae05c-3c24-4103-b7e5-ffef6f244834)
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +79,47 @@ impl HeapTreeHeader {
     pub fn root(&self) -> HeapId {
         self.root
     }
+}
+
+/// Read every record of a BTH page. A record that doesn't parse is an error, because stopping at
+/// it would silently drop every record after it; when reading leniently it is a
+/// [`Problem`](crate::Problem) instead, and only that record is left out. So are the bytes of a
+/// page that is not a whole number of records.
+fn read_records<T: HeapNodePageReadWrite>(
+    data: &[u8],
+    key_size: u8,
+    entry_size: u8,
+) -> io::Result<Vec<T>> {
+    let record_size = usize::from(key_size).saturating_add(usize::from(entry_size));
+    if record_size == 0 {
+        return Err(LtpError::InvalidHeapTreeDataSize(entry_size).into());
+    }
+    if !data.len().is_multiple_of(record_size) {
+        problems::check(
+            ProblemKind::HeapRecord,
+            None,
+            || {
+                format!(
+                    "BTH node of {} bytes is not a whole number of {record_size}-byte records",
+                    data.len()
+                )
+            },
+            || LtpError::InvalidHeapTreeDataSize(entry_size).into(),
+        )?;
+    }
+
+    let mut records = Vec::new();
+    for (index, mut record) in data.chunks_exact(record_size).enumerate() {
+        let bytes = record;
+        match T::read(&mut record) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                let detail = format!("BTH record {index} ({bytes:02X?}): {err}");
+                problems::check(ProblemKind::HeapRecord, None, || detail, || err)?;
+            }
+        }
+    }
+    Ok(records)
 }
 
 pub trait HeapTreeEntryKey: Copy + Sized + PartialEq + PartialOrd {
@@ -239,26 +301,55 @@ where
             return Ok(Default::default());
         }
 
-        let mut level = header.levels();
-        let mut next_level = vec![header.root()];
-
-        while level > 0 {
-            for heap_id in mem::take(&mut next_level).into_iter() {
-                let mut cursor = Cursor::new(self.heap.find_entry(heap_id)?);
-                while let Ok(row) = HeapTreeIntermediateEntry::<K>::read(&mut cursor) {
-                    next_level.push(row.next_level());
+        // Each heap allocation at most once, whatever bIdxLevels says: a record that points at a
+        // node already read (its own, one above it, or another record's) would read it again, so
+        // the walk reads no more than the heap holds. When reading leniently, such a record and a
+        // record whose node cannot be found are problems and are skipped; the others are read.
+        let mut visited = BTreeSet::from([u32::from(self.user_root)]);
+        let mut visit = |heap_id: HeapId| -> io::Result<Option<HeapId>> {
+            if visited.insert(u32::from(heap_id)) {
+                return Ok(Some(heap_id));
+            }
+            let err = LtpError::HeapTreeLoop(u32::from(heap_id));
+            let detail = format!("{err}: it is read once");
+            problems::check(ProblemKind::HeapRecord, None, || detail, || err.into())?;
+            Ok(None)
+        };
+        let node = |heap_id: HeapId| -> io::Result<Option<&[u8]>> {
+            match self.heap.find_entry(heap_id) {
+                Ok(data) => Ok(Some(data)),
+                Err(err) => {
+                    let detail = format!("BTH node 0x{:08X}: {err}", u32::from(heap_id));
+                    problems::check(ProblemKind::HeapRecord, None, || detail, || err)?;
+                    Ok(None)
                 }
             }
+        };
+        let mut next_level: Vec<HeapId> = visit(header.root())?.into_iter().collect();
 
-            level -= 1;
+        for _ in 0..header.levels() {
+            for heap_id in mem::take(&mut next_level).into_iter() {
+                let Some(data) = node(heap_id)? else {
+                    continue;
+                };
+                // An intermediate record's value is an HID.
+                let rows = read_records::<HeapTreeIntermediateEntry<K>>(data, K::SIZE, 4)?;
+                for row in rows {
+                    next_level.extend(visit(row.next_level())?);
+                }
+            }
         }
 
         let mut results = Vec::new();
         for heap_id in mem::take(&mut next_level).into_iter() {
-            let mut cursor = Cursor::new(self.heap.find_entry(heap_id)?);
-            while let Ok(row) = HeapTreeLeafEntry::<K, V>::read(&mut cursor) {
-                results.push(row);
-            }
+            let Some(data) = node(heap_id)? else {
+                continue;
+            };
+            results.extend(read_records::<HeapTreeLeafEntry<K, V>>(
+                data,
+                K::SIZE,
+                V::SIZE,
+            )?);
         }
 
         Ok(results)
@@ -370,5 +461,146 @@ where
 {
     fn from(value: AnsiHeapTree<K, V>) -> Self {
         value.inner.heap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::prop_context::{PropertyTreeRecordKey, PropertyTreeRecordValue};
+    use super::*;
+    use crate::ltp::read_write::HeapTreeReadWrite;
+
+    type Record = HeapTreeLeafEntry<PropertyTreeRecordKey, PropertyTreeRecordValue>;
+
+    fn record(prop_id: u16, prop_type: u16, value: u32) -> Vec<u8> {
+        let mut bytes = prop_id.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&prop_type.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    /// A BTH header (BTHHEADER) for property records.
+    fn bth_header(levels: u8, root: u32) -> Vec<u8> {
+        let mut header = vec![HeapNodeType::Tree as u8, 2, 6, levels];
+        header.extend_from_slice(&root.to_le_bytes());
+        header
+    }
+
+    fn heap_tree(
+        allocations: &[Vec<u8>],
+    ) -> UnicodeHeapTree<PropertyTreeRecordKey, PropertyTreeRecordValue> {
+        let heap = UnicodeHeapNode::for_test(allocations);
+        <UnicodeHeapTree<_, _> as HeapTreeReadWrite<UnicodePstFile>>::new(heap, HeapId::from(0x20))
+    }
+
+    #[test]
+    fn test_bth_levels() {
+        // One index level over a leaf of two records.
+        let leaf = [record(0x0E07, 0x0003, 1), record(0x0E08, 0x0003, 2)].concat();
+        let index = [0x07_u8, 0x0E, 0x60, 0, 0, 0].to_vec();
+        let tree = heap_tree(&[bth_header(1, 0x40), index, leaf]);
+        assert_eq!(tree.entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_bth_index_record_that_points_at_itself() {
+        // An index record whose HID is its own node: before, each level re-read it, and a
+        // bIdxLevels of 255 multiplied the records 255 times over.
+        let index = [0x07_u8, 0x0E, 0x40, 0, 0, 0].to_vec();
+        let tree = heap_tree(&[bth_header(255, 0x40), index]);
+        let err = tree.entries().unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
+
+        // Two index records for the same node below.
+        let leaf = record(0x0E07, 0x0003, 1);
+        let index = [0x07_u8, 0x0E, 0x60, 0, 0, 0, 0x08, 0x0E, 0x60, 0, 0, 0].to_vec();
+        let tree = heap_tree(&[bth_header(1, 0x40), index, leaf]);
+        assert!(tree.entries().is_err());
+    }
+
+    #[test]
+    fn test_bth_repeated_or_missing_node_is_skipped_when_lenient() {
+        // Three index records: one for each leaf, then the first leaf again (which lost every
+        // record of the object, even when reading leniently), then a node that does not exist.
+        let index = [
+            [0x01_u8, 0x00, 0x60, 0, 0, 0],
+            [0x02, 0x00, 0x80, 0, 0, 0],
+            [0x03, 0x00, 0x60, 0, 0, 0],
+            [0x04, 0x00, 0xE0, 0x0F, 0, 0],
+        ]
+        .concat();
+        let first = [record(0x0001, 0x0003, 1), record(0x0002, 0x0003, 2)].concat();
+        let second = record(0x0E07, 0x0003, 3);
+        let allocations = [bth_header(1, 0x40), index, first, second];
+        assert!(heap_tree(&allocations).entries().is_err());
+
+        let (_scope, log) = crate::problems::lenient_scope();
+        let entries = heap_tree(&allocations).entries().unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.key()).collect::<Vec<_>>(),
+            [0x0001, 0x0002, 0x0E07]
+        );
+        let problems = log.problems();
+        assert_eq!(problems.len(), 2);
+        assert!(problems.iter().all(|p| p.kind() == ProblemKind::HeapRecord));
+        assert!(problems[0].detail().contains("twice"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn test_read_every_record() {
+        let data = [record(0x0E07, 0x0003, 1), record(0x0E08, 0x0003, 2)].concat();
+        let records = read_records::<Record>(&data, 2, 6).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn test_record_that_does_not_parse_is_an_error() {
+        // 0x0099 is not a property type; the record after it must not be dropped silently.
+        let data = [
+            record(0x0E07, 0x0003, 1),
+            record(0x0E08, 0x0099, 2),
+            record(0x0E17, 0x0003, 3),
+        ]
+        .concat();
+        assert!(read_records::<Record>(&data, 2, 6).is_err());
+    }
+
+    #[test]
+    fn test_record_that_does_not_parse_is_a_problem_when_lenient() {
+        use crate::problems::{ProblemLog, ScopeGuard, Validation};
+        use std::rc::Rc;
+
+        let data = [
+            record(0x0E07, 0x0003, 1),
+            record(0x0E08, 0x0000, 2),
+            record(0x0E17, 0x0003, 3),
+        ]
+        .concat();
+        let log = Rc::new(ProblemLog::default());
+        let _scope = ScopeGuard::new(Validation::Lenient, log.clone(), None);
+        // The record before and the record after are kept.
+        let records = read_records::<Record>(&data, 2, 6).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.key())
+                .collect::<Vec<_>>(),
+            [0x0E07, 0x0E17]
+        );
+        let problems = log.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind(), ProblemKind::HeapRecord);
+
+        let mut data = record(0x0E07, 0x0003, 1);
+        data.extend_from_slice(&[0x08, 0x0E, 0x03]);
+        assert_eq!(read_records::<Record>(&data, 2, 6).unwrap().len(), 1);
+        assert_eq!(log.problems().len(), 2);
+    }
+
+    #[test]
+    fn test_partial_record_is_an_error() {
+        let mut data = record(0x0E07, 0x0003, 1);
+        data.extend_from_slice(&[0x08, 0x0E, 0x03]);
+        assert!(read_records::<Record>(&data, 2, 6).is_err());
     }
 }

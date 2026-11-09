@@ -1,0 +1,26 @@
+[package]
+name = "ys-outlook-parser"
+description = "Outlook artifacts for forensics: PST and OST stores, MSG and OFT items"
+publish = false
+authors = ["Zach Mathis (@yamatosecurity)"]
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+# Our own code, so the RPL only (the pst and rtf crates it uses are under the RPL and MIT)
+license = "RPL-1.5"
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "outlook"
+
+[dependencies]
+outlook-msg = { package = "ys-outlook-parser-msg", version = "1.0.0", path = "../msg" }
+outlook-pst = { package = "ys-outlook-parser-pst", version = "1.0.0", path = "../pst" }
+
+[dev-dependencies]
+cfb.workspace = true
+flate2.workspace = true
+sha2.workspace = true

@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! [BID (Block ID)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/d3155aa1-ccdd-4dee-a0a9-5363ccca5352)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -56,7 +73,11 @@ impl BlockId for UnicodeBlockId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Self::new(self.is_internal(), self.index() + 1)
+        let index = self.index();
+        let next = index
+            .checked_add(1)
+            .ok_or(NdbError::InvalidUnicodeBlockIndex(index))?;
+        Self::new(self.is_internal(), next)
     }
 }
 
@@ -117,7 +138,11 @@ impl BlockId for UnicodePageId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Ok(Self::from(u64::from(self) + 1))
+        let value = u64::from(self);
+        let next = value
+            .checked_add(1)
+            .ok_or(NdbError::InvalidUnicodeBlockIndex(value))?;
+        Ok(Self::from(next))
     }
 }
 
@@ -184,7 +209,11 @@ impl BlockId for AnsiBlockId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Self::new(self.is_internal(), self.index() + 1)
+        let index = self.index();
+        let next = index
+            .checked_add(1)
+            .ok_or(NdbError::InvalidAnsiBlockIndex(index))?;
+        Self::new(self.is_internal(), next)
     }
 }
 
@@ -245,7 +274,11 @@ impl BlockId for AnsiPageId {
     }
 
     fn next(self) -> NdbResult<Self> {
-        Ok(Self::from(u32::from(self) + 1))
+        let value = u32::from(self);
+        let next = value
+            .checked_add(1)
+            .ok_or(NdbError::InvalidAnsiBlockIndex(value))?;
+        Ok(Self::from(next))
     }
 }
 
@@ -290,6 +323,29 @@ mod tests {
             panic!("UnicodeBlockId should be out of range");
         };
         assert_eq!(value, MAX_UNICODE_BLOCK_INDEX + 1);
+    }
+
+    #[test]
+    fn test_next_does_not_overflow() {
+        assert!(UnicodePageId::from(u64::MAX).next().is_err());
+        assert!(AnsiPageId::from(u32::MAX).next().is_err());
+        assert!(
+            UnicodeBlockId::new(true, MAX_UNICODE_BLOCK_INDEX)
+                .unwrap()
+                .next()
+                .is_err()
+        );
+        assert!(
+            AnsiBlockId::new(false, MAX_ANSI_BLOCK_INDEX)
+                .unwrap()
+                .next()
+                .is_err()
+        );
+        assert_eq!(
+            u64::from(UnicodePageId::from(7).next().unwrap()),
+            8,
+            "a page ID counts up by one"
+        );
     }
 
     #[test]

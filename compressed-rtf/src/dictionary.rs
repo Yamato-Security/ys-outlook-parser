@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! [Dictionary](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxrtfcp/4238b0e2-7147-42da-88c9-ea45a1243e67)
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -18,6 +35,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 const INITIAL_DICTIONARY: &[u8] = b"{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman \\fswiss \\fmodern \\fscript \\fdecor MS Sans SerifSymbolArialTimes New RomanCourier{\\colortbl\\red0\\green0\\blue0\r\n\\par \\pard\\plain\\f0\\fs20\\b\\i\\u\\tab\\tx";
 
+/// The dictionary is 4096 bytes, so every offset into it is taken modulo 4096 with this mask.
+const OFFSET_MASK: usize = 0x0FFF;
+
 pub struct TokenDictionary {
     buffer: [u8; 4096],
     size: usize,
@@ -34,27 +54,37 @@ impl TokenDictionary {
 
         let mut result = Vec::with_capacity(length);
 
-        self.read_offset = offset;
+        self.read_offset = offset & OFFSET_MASK;
         for _ in 0..length {
-            let byte = self.buffer[self.read_offset];
+            let byte = self.byte_at(self.read_offset);
             result.push(byte);
-            self.read_offset = (self.read_offset + 1) % self.buffer.len();
+            self.read_offset = self.read_offset.wrapping_add(1) & OFFSET_MASK;
             self.write_byte(byte);
         }
 
         Some(result)
     }
 
+    /// The byte at an offset, which is masked to the dictionary's size.
+    fn byte_at(&self, offset: usize) -> u8 {
+        self.buffer
+            .get(offset & OFFSET_MASK)
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub fn write_byte(&mut self, byte: u8) {
-        self.buffer[self.write_offset] = byte;
-        self.size = self.buffer.len().min(self.size + 1);
-        self.write_offset = (self.write_offset + 1) % self.buffer.len();
+        if let Some(slot) = self.buffer.get_mut(self.write_offset & OFFSET_MASK) {
+            *slot = byte;
+        }
+        self.size = self.buffer.len().min(self.size.saturating_add(1));
+        self.write_offset = self.write_offset.wrapping_add(1) & OFFSET_MASK;
     }
 
     /// [Finding the Longest Match to Input](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxrtfcp/eb4b209b-f2f0-4876-a28b-1cfa1827423c)
     pub fn find_longest_match(&mut self, rtf: &[u8]) -> Result<Option<DictionaryReference>> {
         // SET finalOffset to the Write Offset of the Dictionary modulo 4096
-        let final_offset = self.write_offset % self.buffer.len();
+        let final_offset = self.write_offset & OFFSET_MASK;
 
         // IF the Dictionary's End Offset is not equal to the Dictionary buffer size THEN
         let mut match_offset = if self.size != self.buffer.len() {
@@ -62,7 +92,7 @@ impl TokenDictionary {
             0
         } else {
             // SET matchOffset to (the Dictionary's Write Offset + 1) modulo 4096
-            ((self.write_offset + 1) % self.buffer.len()) as u16
+            (self.write_offset.wrapping_add(1) & OFFSET_MASK) as u16
         };
 
         // SET bestMatchLength to 0
@@ -76,7 +106,7 @@ impl TokenDictionary {
                 .or(best_match);
 
             // SET matchOffset to (matchOffset + 1) modulo 4096
-            match_offset = (match_offset + 1) % self.buffer.len() as u16;
+            match_offset = match_offset.wrapping_add(1) & OFFSET_MASK as u16;
 
             // UNTIL matchOffset equals finalOffset
             if match_offset as usize == final_offset {
@@ -84,17 +114,19 @@ impl TokenDictionary {
             }
 
             // OR until bestMatchLength is 17 bytes long
-            if let Some(best_match) = best_match {
-                if best_match.length == 17 {
-                    break;
-                }
+            if let Some(best_match) = best_match
+                && best_match.length == 17
+            {
+                break;
             }
         }
 
         // IF bestMatchLength is 0 THEN
-        if best_match.map(|m| m.length).unwrap_or_default() == 0 {
+        if best_match.map(|m| m.length).unwrap_or_default() == 0
+            && let Some(&byte) = rtf.first()
+        {
             // CALL AddByteToDictionary with the byte at Input Cursor
-            self.write_byte(rtf[0]);
+            self.write_byte(byte);
         }
 
         // RETURN offset of bestMatchOffset and bestMatchLength
@@ -116,14 +148,16 @@ impl TokenDictionary {
 
         // WHILE matchLength is less than maxLength AND
         while (match_length as usize) < max_length {
-            let byte = rtf[match_length as usize];
+            let Some(&byte) = rtf.get(usize::from(match_length)) else {
+                break;
+            };
             // the byte in the Dictionary at dictionaryOffset is equal to the byte in Input at the inputOffset
-            if self.buffer[dictionary_offset] != byte {
+            if self.byte_at(dictionary_offset) != byte {
                 break;
             }
 
             // INCREMENT matchLength
-            match_length += 1;
+            match_length = match_length.saturating_add(1);
 
             // IF matchLength is greater than bestMatchLength THEN
             if match_length > best_match_length {
@@ -132,7 +166,7 @@ impl TokenDictionary {
             }
 
             // SET dictionaryOffset to (dictionaryOffset + 1) modulo 4096
-            dictionary_offset = (dictionary_offset + 1) % self.buffer.len();
+            dictionary_offset = dictionary_offset.wrapping_add(1) & OFFSET_MASK;
         }
 
         // IF matchLength is greater than bestMatchLength THEN
@@ -156,7 +190,9 @@ impl TokenDictionary {
 impl Default for TokenDictionary {
     fn default() -> Self {
         let mut buffer = [0; 4096];
-        buffer[..INITIAL_DICTIONARY.len()].copy_from_slice(INITIAL_DICTIONARY);
+        for (slot, byte) in buffer.iter_mut().zip(INITIAL_DICTIONARY) {
+            *slot = *byte;
+        }
         Self {
             buffer,
             size: INITIAL_DICTIONARY.len(),
@@ -187,7 +223,8 @@ impl DictionaryReference {
     }
 
     pub fn length(&self) -> u8 {
-        (self.0 & 0x0F) as u8 + 2
+        // At most 15 + 2.
+        ((self.0 & 0x0F) as u8).saturating_add(2)
     }
 
     pub fn read(f: &mut dyn Read) -> io::Result<Self> {
@@ -210,6 +247,6 @@ impl TryFrom<DictionaryMatch> for DictionaryReference {
             return Err(Error::InvalidDictionaryReferenceLength(value.length));
         }
 
-        Ok(Self::new(value.offset, value.length - 2))
+        Ok(Self::new(value.offset, value.length.saturating_sub(2)))
     }
 }

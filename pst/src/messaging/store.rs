@@ -1,8 +1,24 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Message Store](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/aa0539bd-e7bf-4cec-8bde-0b87c2a86baf)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::{
-    cell::OnceCell,
     collections::BTreeMap,
     fmt::Debug,
     io::{self, Read, Write},
@@ -11,6 +27,7 @@ use std::{
 
 use super::{folder::*, message::*, read_write::*, *};
 use crate::{
+    Validation,
     ltp::{
         heap::HeapNode,
         prop_context::{PropertyContext, PropertyValue},
@@ -21,11 +38,12 @@ use crate::{
     ndb::{
         block_id::BlockId,
         header::Header,
-        node_id::{NodeId, NodeIdType, NID_MESSAGE_STORE, NID_ROOT_FOLDER},
+        node_id::{NID_MESSAGE_STORE, NID_ROOT_FOLDER, NodeId, NodeIdType},
         page::*,
         read_write::*,
         root::Root,
     },
+    problems::{Problem, ProblemKind},
     *,
 };
 
@@ -72,12 +90,8 @@ impl TryFrom<&[u8]> for StoreRecordKey {
     type Error = MessagingError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() != 16 {
-            return Err(MessagingError::InvalidStoreRecordKeySize(value.len()));
-        }
-
-        let mut record_key = [0; 16];
-        record_key.copy_from_slice(value);
+        let record_key = <[u8; 16]>::try_from(value)
+            .map_err(|_| MessagingError::InvalidStoreRecordKeySize(value.len()))?;
         Ok(Self::new(record_key))
     }
 }
@@ -162,9 +176,26 @@ impl TryFrom<&EntryId> for Vec<u8> {
 #[derive(Default, Debug)]
 pub struct StoreProperties {
     properties: BTreeMap<u16, PropertyValue>,
+    /// The record key of entry IDs when the store has no usable `PidTagRecordKey` and is read
+    /// leniently: zeros.
+    fallback_record_key: Option<StoreRecordKey>,
 }
 
 impl StoreProperties {
+    /// Store properties with only a PidTagRecordKey, for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(record_key: [u8; 16]) -> Self {
+        Self {
+            properties: BTreeMap::from([(
+                0x0FF9,
+                PropertyValue::Binary(crate::ltp::prop_context::BinaryValue::new(
+                    record_key.to_vec(),
+                )),
+            )]),
+            fallback_record_key: None,
+        }
+    }
+
     pub fn get(&self, id: u16) -> Option<&PropertyValue> {
         self.properties.get(&id)
     }
@@ -187,14 +218,25 @@ impl StoreProperties {
         }
     }
 
+    /// An entry ID for a node of this store. A store read leniently without a usable
+    /// `PidTagRecordKey` makes entry IDs with a record key of zeros, so its folders and messages
+    /// still open by node ID.
     pub fn make_entry_id(&self, node_id: NodeId) -> io::Result<EntryId> {
-        let record_key = self.record_key()?;
+        let record_key = match (self.record_key(), self.fallback_record_key) {
+            (Ok(record_key), _) | (Err(_), Some(record_key)) => record_key,
+            (Err(err), None) => return Err(err),
+        };
         Ok(EntryId::new(record_key, node_id))
     }
 
+    /// Whether an entry ID is of this store. Any is, for a store read leniently without a usable
+    /// `PidTagRecordKey`.
     pub fn matches_record_key(&self, entry_id: &EntryId) -> io::Result<bool> {
-        let store_record_key = self.record_key()?;
-        Ok(store_record_key == entry_id.record_key)
+        match (self.record_key(), self.fallback_record_key) {
+            (Ok(record_key), _) => Ok(record_key == entry_id.record_key),
+            (Err(_), Some(_)) => Ok(true),
+            (Err(err), None) => Err(err),
+        }
     }
 
     pub fn display_name(&self) -> io::Result<String> {
@@ -272,28 +314,27 @@ pub trait Store {
 
 struct StoreInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst> + 'static,
+    Pst: PstFile + PstFileInternal<Pst> + 'static,
 {
     pst: Rc<Pst>,
     node_btree: PstFileReadWriteNodeBTree<Pst>,
     block_btree: PstFileReadWriteBlockBTree<Pst>,
     properties: StoreProperties,
     store: Weak<Pst::Store>,
-    root_hierarchy_table: OnceCell<io::Result<Rc<dyn TableContext>>>,
 }
 
 impl<Pst> StoreInner<Pst>
 where
-    Pst: PstFile + PstFileLock<Pst>,
+    Pst: PstFile + PstFileInternal<Pst>,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::NodeBTreeEntry: NodeBTreeEntryReadWrite,
     <Pst as PstFile>::NodeBTree: RootBTreeReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <Pst as PstFile>::NodeBTreeEntry,
-            <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <Pst as PstFile>::NodeBTreeEntry,
+                <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage,
+            >,
     <<<Pst as PstFile>::NodeBTree as RootBTree>::IntermediatePage as BTreePage>::Entry:
         BTreePageEntryReadWrite,
     <<Pst as PstFile>::NodeBTree as RootBTree>::LeafPage: RootBTreeLeafPageReadWrite<Pst>,
@@ -302,10 +343,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
@@ -323,10 +364,7 @@ where
         let root = header.root();
 
         let (node_btree, block_btree, properties) = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
+            let mut file = pst.lock_reader()?;
             let file = &mut *file;
 
             let encoding = header.crypt_method();
@@ -339,11 +377,11 @@ where
                 *root.block_btree(),
             )?;
 
-            let mut page_cache = pst.node_cache();
+            let mut page_cache = pst.node_cache()?;
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(NID_MESSAGE_STORE).into();
             let node = node_btree.find_entry(file, node_key, &mut page_cache)?;
 
-            let mut page_cache = pst.block_cache();
+            let mut page_cache = pst.block_cache()?;
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
                 file,
@@ -356,16 +394,35 @@ where
 
             let tree = <Pst as PstFile>::PropertyTree::new(heap, header.user_root());
             let prop_context = <Pst as PstFile>::PropertyContext::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
-            let properties = StoreProperties { properties };
+            let properties = read_properties(
+                pst.as_ref(),
+                node.node(),
+                prop_context.properties()?,
+                |record| {
+                    prop_context.read_property(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut page_cache,
+                        record,
+                    )
+                },
+            )?;
+            let mut properties = StoreProperties {
+                properties,
+                fallback_record_key: None,
+            };
+            if let Err(err) = properties.record_key()
+                && pst.validation() == Validation::Lenient
+            {
+                pst.problem_log().record(Problem::new(
+                    ProblemKind::StoreRecordKey,
+                    None,
+                    Some(NID_MESSAGE_STORE),
+                    format!("{err}: entry IDs are made with a record key of zeros"),
+                ));
+                properties.fallback_record_key = Some(StoreRecordKey::new([0; 16]));
+            }
 
             (node_btree, block_btree, properties)
         };
@@ -376,46 +433,35 @@ where
             block_btree,
             properties,
             store: Default::default(),
-            root_hierarchy_table: Default::default(),
         })
     }
 
+    /// Read the root folder's hierarchy table. It is not kept: the table holds the store, so a
+    /// store that kept it would hold itself, and neither would ever be dropped (nor the file).
     fn root_hierarchy_table(&self) -> io::Result<Rc<dyn TableContext>> {
-        let hierarchy_table = self
-            .root_hierarchy_table
-            .get_or_init(|| {
-                let store =
-                    self.store
-                        .upgrade()
-                        .ok_or(MessagingError::StoreRootHierarchyTableFailed(
-                            "Store has been dropped".to_string(),
-                        ))?;
-                let node = {
-                    let mut file = self
-                        .pst
-                        .reader()
-                        .lock()
-                        .map_err(|_| MessagingError::FailedToLockFile)?;
+        let read = || {
+            let store =
+                self.store
+                    .upgrade()
+                    .ok_or(MessagingError::StoreRootHierarchyTableFailed(
+                        "Store has been dropped".to_string(),
+                    ))?;
+            let node = {
+                let mut file = self.pst.lock_reader()?;
 
-                    let file = &mut *file;
-                    let node_id = NodeId::new(NodeIdType::HierarchyTable, NID_ROOT_FOLDER.index())?;
-                    let mut page_cache = self.pst.node_cache();
-                    let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
-                    self.node_btree
-                        .find_entry(file, node_key, &mut page_cache)?
-                };
+                let file = &mut *file;
+                let node_id = NodeId::new(NodeIdType::HierarchyTable, NID_ROOT_FOLDER.index())?;
+                let mut page_cache = self.pst.node_cache()?;
+                let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
+                self.node_btree
+                    .find_entry(file, node_key, &mut page_cache)?
+            };
 
-                <<Pst as PstFile>::TableContext as TableContextReadWrite<Pst>>::read(
-                    store.clone(),
-                    node,
-                )
-            })
-            .as_ref()
-            .map_err(|err| format!("{err:?}"))
-            .cloned()
-            .map_err(MessagingError::StoreRootHierarchyTableFailed)?;
-
-        Ok(hierarchy_table)
+            <<Pst as PstFile>::TableContext as TableContextReadWrite<Pst>>::read(store, node)
+        };
+        read().map_err(|err: io::Error| {
+            MessagingError::StoreRootHierarchyTableFailed(format!("{err:?}")).into()
+        })
     }
 
     fn open_folder(&self, entry_id: &EntryId) -> io::Result<Rc<dyn Folder>> {
@@ -598,5 +644,25 @@ impl StoreReadWrite<AnsiPstFile> for AnsiStore {
 
     fn block_btree(&self) -> &PstFileReadWriteBlockBTree<AnsiPstFile> {
         &self.inner.block_btree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_store_is_dropped_after_its_root_hierarchy_table() {
+        // The store kept its root hierarchy table, which holds the store: neither, nor the file,
+        // was ever dropped.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Empty.pst");
+        let pst = Rc::new(UnicodePstFile::open(path).unwrap());
+        let store = UnicodeStore::read(pst.clone()).unwrap();
+        let table = store.root_hierarchy_table().unwrap();
+        assert!(table.rows_matrix().count() > 0);
+        assert!(store.root_hierarchy_table().is_ok());
+        drop(table);
+        drop(store);
+        assert_eq!(Rc::strong_count(&pst), 1);
     }
 }

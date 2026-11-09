@@ -1,10 +1,31 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs) and its copy outlook-pst-ost 1.3.0
+// (https://crates.io/crates/outlook-pst-ost), whose code is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [HN (Heap-on-Node)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/77ce49a3-3772-4d8d-bb2c-2f7520a238a6)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::{
+    cell::OnceCell,
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+};
 
 use super::{read_write::*, *};
 use crate::{
+    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
     ndb::{
         block::*,
         block_id::BlockId,
@@ -13,7 +34,6 @@ use crate::{
         page::{AnsiBlockBTree, RootBTree, UnicodeBlockBTree},
         read_write::*,
     },
-    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
 };
 
 pub const HEAP_INDEX_MASK: u32 = (1_u16.rotate_right(5) - 1) as u32;
@@ -23,6 +43,9 @@ pub const HEAP_INDEX_MASK: u32 = (1_u16.rotate_right(5) - 1) as u32;
 pub struct HeapId(NodeId);
 
 impl HeapId {
+    /// Constructs an HID in the ANSI/classic Unicode layout (eleven-bit allocation index,
+    /// sixteen-bit block index). Unicode4k on-disk HIDs can be retained with `HeapId::from`;
+    /// heap lookups decode their format automatically.
     pub fn new(index: u16, block_index: u16) -> LtpResult<Self> {
         let shifted_index = index.rotate_left(5);
         if shifted_index & 0x1F != 0 {
@@ -34,14 +57,17 @@ impl HeapId {
         Ok(Self(NodeId::new(NodeIdType::HeapNode, node_index)?))
     }
 
+    /// The zero-based allocation index in the ANSI/classic Unicode layout. Heap lookups
+    /// use fourteen allocation bits instead when the heap is Unicode4k.
     pub fn index(&self) -> LtpResult<u16> {
         let index = (self.0.index() & HEAP_INDEX_MASK) as u16;
-        if index < 1 {
-            return Err(LtpError::InvalidHeapIndex(index));
-        }
-        Ok(index - 1)
+        index
+            .checked_sub(1)
+            .ok_or(LtpError::InvalidHeapIndex(index))
     }
 
+    /// The block index in the ANSI/classic Unicode layout. Heap lookups use thirteen
+    /// block bits instead when the heap is Unicode4k.
     pub fn block_index(&self) -> u16 {
         (self.0.index() >> 11) as u16
     }
@@ -197,17 +223,13 @@ impl TryFrom<u8> for HeapFillLevel {
 }
 
 impl HeapFillLevel {
+    /// The fill level of a nibble: every value of 0 to 15 is one.
+    fn from_nibble(value: u32) -> HeapFillLevel {
+        HeapFillLevel::try_from((value & 0x0F) as u8).unwrap_or(HeapFillLevel::Level15)
+    }
+
     fn unpack_fill_levels(value: u32) -> [HeapFillLevel; 8] {
-        [
-            HeapFillLevel::try_from((value & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 4) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 8) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 12) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 16) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 20) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 24) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-            HeapFillLevel::try_from(((value >> 28) & 0x0F) as u8).expect("Invalid HeapFillLevel"),
-        ]
+        [0, 4, 8, 12, 16, 20, 24, 28].map(|shift| Self::from_nibble(value >> shift))
     }
 
     fn pack_fill_levels(fill_levels: &[HeapFillLevel; 8]) -> u32 {
@@ -344,9 +366,8 @@ impl HeapNodePageReadWrite for HeapNodeBitmapHeader {
         let page_map_offset = f.read_u16::<LittleEndian>()?;
 
         let mut fill_levels = [HeapFillLevel::Empty; 128];
-        for i in 0..16 {
-            let unpacked = HeapFillLevel::unpack_fill_levels(f.read_u32::<LittleEndian>()?);
-            fill_levels[i * 8..(i + 1) * 8].copy_from_slice(&unpacked);
+        for chunk in fill_levels.as_chunks_mut::<8>().0 {
+            *chunk = HeapFillLevel::unpack_fill_levels(f.read_u32::<LittleEndian>()?);
         }
 
         Ok(Self::new(page_map_offset, fill_levels))
@@ -354,10 +375,8 @@ impl HeapNodePageReadWrite for HeapNodeBitmapHeader {
 
     fn write(&self, f: &mut dyn Write) -> io::Result<()> {
         f.write_u16::<LittleEndian>(self.page_map_offset)?;
-        for i in 0..16 {
-            let mut packed = [HeapFillLevel::Empty; 8];
-            packed.copy_from_slice(&self.fill_levels[i * 8..(i + 1) * 8]);
-            f.write_u32::<LittleEndian>(HeapFillLevel::pack_fill_levels(&packed))?;
+        for chunk in self.fill_levels.as_chunks::<8>().0 {
+            f.write_u32::<LittleEndian>(HeapFillLevel::pack_fill_levels(chunk))?;
         }
         Ok(())
     }
@@ -407,9 +426,11 @@ impl HeapNodePageMap {
             return Err(LtpError::InvalidHeapPageAllocCount(alloc_count));
         }
 
-        if free_count != page_map.free_count {
-            return Err(LtpError::InvalidHeapPageFreeCount(free_count));
-        }
+        // markdown-extract: cFree only counts freed allocations, which a reader
+        // never needs, and writers leave it stale (the EDRM Enron PSTs have
+        // freed items with cFree = 0). Trust the allocation table instead of
+        // refusing the whole heap node.
+        let _ = free_count;
 
         Ok(page_map)
     }
@@ -438,11 +459,9 @@ impl TryFrom<HeapNodePageAllocOffsets> for HeapNodePageMap {
                     return None;
                 };
 
-                if next_offset < last_offset {
+                let Some(size) = next_offset.checked_sub(last_offset) else {
                     return Some(Err(LtpError::InvalidHeapPageAllocOffset(next_offset)));
-                }
-
-                let size = next_offset - last_offset;
+                };
                 let alloc = HeapNodePageAlloc {
                     offset: last_offset,
                     size,
@@ -497,7 +516,9 @@ impl HeapNodePageReadWrite for HeapNodePageMap {
         let mut last_offset = 0;
         for HeapNodePageAlloc { offset, size } in &self.allocations {
             f.write_u16::<LittleEndian>(*offset)?;
-            last_offset = *offset + *size;
+            last_offset = offset
+                .checked_add(*size)
+                .ok_or(LtpError::HeapPageOutOfSpace)?;
         }
         f.write_u16::<LittleEndian>(last_offset)
     }
@@ -513,6 +534,27 @@ where
     Pst: PstFile,
 {
     data: Vec<<Pst as PstFile>::DataBlock>,
+    /// Each block's page map (HNPAGEMAP), parsed on its first lookup and kept: an object with
+    /// many properties looks a block up once for each, and a page map holds up to 65,535
+    /// allocations. A page map that does not parse keeps its error's description.
+    page_maps: Vec<OnceCell<Result<HeapNodePageMap, String>>>,
+    /// Unicode4k HIDs have a fourteen-bit allocation index and thirteen-bit block index.
+    /// Keep the layout with the heap: lookups can occur after the reader's scope has ended.
+    large_pages: bool,
+}
+
+impl<Pst> HeapNodeInner<Pst>
+where
+    Pst: PstFile,
+{
+    fn new(data: Vec<<Pst as PstFile>::DataBlock>) -> Self {
+        let page_maps = data.iter().map(|_| OnceCell::new()).collect();
+        Self {
+            data,
+            page_maps,
+            large_pages: crate::problems::large_pages() == Some(true),
+        }
+    }
 }
 
 impl<Pst> HeapNodeInner<Pst>
@@ -527,10 +569,10 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
     <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
         RootBTreeIntermediatePageReadWrite<
-            Pst,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
-            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
-        >,
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
@@ -558,27 +600,11 @@ where
             )?
             .collect();
 
-        Ok(Self { data })
+        Ok(Self::new(data))
     }
 
-    fn header(&self) -> io::Result<HeapNodeHeader> {
-        let data = self.data.first().ok_or(io::ErrorKind::UnexpectedEof)?;
-        let mut cursor = Cursor::new(data.data());
-        let header = HeapNodeHeader::read(&mut cursor)?;
-        Ok(header)
-    }
-
-    fn find_entry<'a>(&'a self, heap_id: HeapId) -> io::Result<&'a [u8]>
-    where
-        <Pst as PstFile>::DataBlock: 'a,
-    {
-        let block_index = heap_id.block_index();
-        let block = self
-            .data
-            .get(block_index as usize)
-            .ok_or(LtpError::HeapBlockIndexNotFound(block_index))?
-            .data();
-
+    /// The page map (HNPAGEMAP) of block `block_index` of the heap, `block`.
+    fn page_map(block_index: u16, block: &[u8]) -> io::Result<HeapNodePageMap> {
         let mut cursor = Cursor::new(block);
 
         let page_map_offset = match block_index {
@@ -597,18 +623,58 @@ where
         };
 
         cursor.seek(SeekFrom::Start(u64::from(page_map_offset)))?;
-        let page_map = HeapNodePageMap::read(&mut cursor)?;
+        HeapNodePageMap::read(&mut cursor)
+    }
+
+    fn header(&self) -> io::Result<HeapNodeHeader> {
+        let data = self.data.first().ok_or(io::ErrorKind::UnexpectedEof)?;
+        let mut cursor = Cursor::new(data.data());
+        let header = HeapNodeHeader::read(&mut cursor)?;
+        Ok(header)
+    }
+
+    fn find_entry<'a>(&'a self, heap_id: HeapId) -> io::Result<&'a [u8]>
+    where
+        <Pst as PstFile>::DataBlock: 'a,
+    {
+        let block_index = if self.large_pages {
+            // Unicode4k uses bits 19..31 for the block index and bits 5..18 for the
+            // allocation index (classic formats use bits 16..31 and 5..15).
+            heap_id.block_index() >> 3
+        } else {
+            heap_id.block_index()
+        };
+        let not_found = || LtpError::HeapBlockIndexNotFound(block_index);
+        let block = self
+            .data
+            .get(usize::from(block_index))
+            .ok_or_else(not_found)?
+            .data();
+        let page_map = self
+            .page_maps
+            .get(usize::from(block_index))
+            .ok_or_else(not_found)?
+            .get_or_init(|| Self::page_map(block_index, block).map_err(|err| err.to_string()))
+            .as_ref()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.clone()))?;
         let allocations = page_map.allocations();
 
-        let index = heap_id.index()?;
-        if index as usize >= allocations.len() {
-            return Err(LtpError::HeapAllocIndexNotFound(index).into());
-        }
-
-        let alloc = &allocations[index as usize];
-        let start = alloc.offset() as usize;
-        let end = start + alloc.size() as usize;
-        Ok(&block[start..end])
+        let index = if self.large_pages {
+            let index = ((u32::from(heap_id) >> 5) & 0x3FFF) as u16;
+            index
+                .checked_sub(1)
+                .ok_or(LtpError::InvalidHeapIndex(index))?
+        } else {
+            heap_id.index()?
+        };
+        let alloc = allocations
+            .get(usize::from(index))
+            .ok_or(LtpError::HeapAllocIndexNotFound(index))?;
+        let start = usize::from(alloc.offset());
+        let end = start.saturating_add(usize::from(alloc.size()));
+        block.get(start..end).ok_or_else(|| {
+            LtpError::HeapAllocOutOfBounds(index, alloc.offset(), alloc.size()).into()
+        })
     }
 }
 
@@ -639,6 +705,38 @@ impl HeapNodeReadWrite<UnicodePstFile> for UnicodeHeapNode {
     }
 }
 
+#[cfg(test)]
+impl UnicodeHeapNode {
+    /// A heap node of one block holding `allocations`, at HIDs 0x20, 0x40 and so on, with the
+    /// first as its user root.
+    pub(crate) fn for_test(allocations: &[Vec<u8>]) -> Self {
+        use crate::ndb::{block::UnicodeBlockTrailer, block_id::UnicodeBlockId};
+
+        let mut data = vec![0_u8; 12];
+        data[2] = 0xEC;
+        data[3] = HeapNodeType::Properties as u8;
+        data[4..8].copy_from_slice(&0x20_u32.to_le_bytes());
+        let mut offsets = vec![data.len() as u16];
+        for allocation in allocations {
+            data.extend_from_slice(allocation);
+            offsets.push(data.len() as u16);
+        }
+        let page_map = data.len() as u16;
+        data[0..2].copy_from_slice(&page_map.to_le_bytes());
+        data.extend_from_slice(&(allocations.len() as u16).to_le_bytes());
+        data.extend_from_slice(&0_u16.to_le_bytes());
+        for offset in offsets {
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+        let trailer =
+            UnicodeBlockTrailer::new(data.len() as u16, 0, 0, UnicodeBlockId::from(4)).unwrap();
+        let block = UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer).unwrap();
+        Self {
+            inner: HeapNodeInner::new(vec![block]),
+        }
+    }
+}
+
 pub struct AnsiHeapNode {
     inner: HeapNodeInner<AnsiPstFile>,
 }
@@ -663,5 +761,165 @@ impl HeapNodeReadWrite<AnsiPstFile> for AnsiHeapNode {
     ) -> io::Result<Self> {
         let inner = HeapNodeInner::read(f, block_btree, page_cache, encoding, key)?;
         Ok(Self { inner })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ndb::{
+        block::{UnicodeBlockTrailer, UnicodeDataBlock},
+        block_id::UnicodeBlockId,
+    };
+
+    /// A heap node of one block: an HNHDR, then `offsets` as its HNPAGEMAP's rgibAlloc.
+    fn heap_node(block_len: usize, offsets: &[u16]) -> HeapNodeInner<UnicodePstFile> {
+        let mut data = vec![0_u8; block_len];
+        let page_map = block_len - (4 + 2 * offsets.len());
+        data[0..2].copy_from_slice(&(page_map as u16).to_le_bytes());
+        data[2] = 0xEC;
+        data[3] = HeapNodeType::Properties as u8;
+        data[4..8].copy_from_slice(&0x20_u32.to_le_bytes());
+        let alloc_count = offsets.len() as u16 - 1;
+        data[page_map..page_map + 2].copy_from_slice(&alloc_count.to_le_bytes());
+        for (i, offset) in offsets.iter().enumerate() {
+            let at = page_map + 4 + 2 * i;
+            data[at..at + 2].copy_from_slice(&offset.to_le_bytes());
+        }
+        let trailer =
+            UnicodeBlockTrailer::new(block_len as u16, 0, 0, UnicodeBlockId::from(4)).unwrap();
+        let block = UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer).unwrap();
+        HeapNodeInner::new(vec![block])
+    }
+
+    #[test]
+    fn test_find_entry() {
+        let heap = heap_node(64, &[12, 20, 30]);
+        assert_eq!(
+            heap.find_entry(HeapId::new(1, 0).unwrap()).unwrap().len(),
+            8
+        );
+        assert_eq!(
+            heap.find_entry(HeapId::new(2, 0).unwrap()).unwrap().len(),
+            10
+        );
+        assert!(heap.find_entry(HeapId::new(3, 0).unwrap()).is_err());
+        assert!(heap.find_entry(HeapId::new(1, 1).unwrap()).is_err());
+        assert!(heap.find_entry(HeapId::from(0)).is_err());
+    }
+
+    #[test]
+    fn test_4k_heap_indexes_use_fourteen_and_thirteen_bits() {
+        use crate::problems::{ProblemLog, ScopeGuard, Validation};
+        use std::rc::Rc;
+
+        let mut data = heap_node(64, &[12, 20]).data;
+        // The second block has an HNPAGEHDR and one two-byte allocation.
+        let mut bytes = vec![0u8; 32];
+        bytes[..2].copy_from_slice(&16u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(b"ok");
+        bytes[16..18].copy_from_slice(&1u16.to_le_bytes());
+        bytes[20..22].copy_from_slice(&2u16.to_le_bytes());
+        bytes[22..24].copy_from_slice(&4u16.to_le_bytes());
+        let trailer = UnicodeBlockTrailer::new(32, 0, 0, UnicodeBlockId::from(8)).unwrap();
+        data.push(UnicodeDataBlock::new(NdbCryptMethod::None, bytes, trailer).unwrap());
+
+        let modern = {
+            let _scope = ScopeGuard::new(
+                Validation::Strict,
+                Rc::new(ProblemLog::default()),
+                Some(true),
+            );
+            HeapNodeInner::<UnicodePstFile>::new(data.clone())
+        };
+        // The heap must remember its format even when accessed outside the reader's scope.
+        assert_eq!(modern.find_entry(HeapId::from(0x0008_0020)).unwrap(), b"ok");
+        assert!(modern.find_entry(HeapId::from((2 << 19) | 0x20)).is_err());
+        assert!(modern.find_entry(HeapId::from(1 << 19)).is_err());
+
+        // ANSI and classic Unicode retain their sixteen-bit block index. In particular,
+        // the low three bits must not be cleared or shifted in these formats.
+        let classic = HeapNodeInner::<UnicodePstFile>::new(data);
+        assert_eq!(
+            classic.find_entry(HeapId::from(0x0001_0020)).unwrap(),
+            b"ok"
+        );
+        assert!(classic.find_entry(HeapId::from(0x0008_0020)).is_err());
+
+        // Bits 16..18 extend the allocation index: they are not flags. Exercise every
+        // nonzero fourteen-bit index, including those beyond the classic 2047 limit.
+        let count = 0x3FFFu16;
+        let page_map = 2 + count;
+        let mut bytes = page_map.to_le_bytes().to_vec();
+        bytes.extend((1..=count).map(|index| (index >> 11) as u8));
+        bytes.extend(count.to_le_bytes());
+        bytes.extend(0u16.to_le_bytes());
+        for offset in 2..=page_map {
+            bytes.extend(offset.to_le_bytes());
+        }
+        let trailer =
+            UnicodeBlockTrailer::new(bytes.len() as u16, 0, 0, UnicodeBlockId::from(8)).unwrap();
+        let second = UnicodeDataBlock::new(NdbCryptMethod::None, bytes, trailer).unwrap();
+        let mut blocks = heap_node(64, &[12, 20]).data;
+        blocks.push(second);
+        let modern = {
+            let _scope = ScopeGuard::new(
+                Validation::Strict,
+                Rc::new(ProblemLog::default()),
+                Some(true),
+            );
+            HeapNodeInner::<UnicodePstFile>::new(blocks)
+        };
+        for index in 1..=count {
+            let hid = HeapId::from((1 << 19) | (u32::from(index) << 5));
+            assert_eq!(
+                modern.find_entry(hid).unwrap(),
+                &[(index >> 11) as u8],
+                "index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_allocation_past_its_block_is_an_error() {
+        // The second allocation ends at 0x2000, far past the 64-byte block: this sliced out of
+        // bounds before.
+        let heap = heap_node(64, &[12, 20, 0x2000]);
+        assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_ok());
+        let err = heap.find_entry(HeapId::new(2, 0).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("past the end"), "{err}");
+        // Offsets that go down.
+        let heap = heap_node(64, &[20, 12, 30]);
+        assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_page_map_is_parsed_once() {
+        // 30,000 empty allocations and 60,000 lookups, as an object with many properties makes:
+        // the page map was parsed on every lookup (65,535 lookups of 32,000 allocations took
+        // 14.5 s in a release build).
+        let heap = heap_node(12 + 4 + 2 * 30_001, &[12; 30_001]);
+        let start = std::time::Instant::now();
+        for i in 0..60_000_u16 {
+            let entry = heap.find_entry(HeapId::new(1 + i % 2047, 0).unwrap());
+            assert_eq!(entry.unwrap().len(), 0);
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert!(heap.page_maps[0].get().is_some_and(|map| map.is_ok()));
+
+        // A page map that does not parse is an error on every lookup.
+        let heap = heap_node(64, &[20, 12, 30]);
+        for _ in 0..2 {
+            assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_err());
+        }
+        assert!(heap.page_maps[0].get().is_some_and(|map| map.is_err()));
+    }
+
+    #[test]
+    fn test_fill_levels() {
+        let levels = HeapFillLevel::unpack_fill_levels(0xFEDC_BA98);
+        assert_eq!(levels[0], HeapFillLevel::Level8);
+        assert_eq!(levels[7], HeapFillLevel::Level15);
+        assert!(HeapId::from(0).index().is_err());
     }
 }

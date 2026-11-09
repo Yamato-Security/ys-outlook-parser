@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! [CRC](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxrtfcp/c9bccea9-03f0-4594-8b77-a8c508d5c4f3)
 
 /// [CRC Lookup Table](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxrtfcp/2500f63e-a1ec-4605-a80d-d41ab63e80e9)
@@ -42,7 +59,12 @@ pub fn calculate_crc(previous: u32, data: &[u8]) -> u32 {
     for byte in data.iter().copied() {
         let table_position = ((crc_value ^ u32::from(byte)) & 0xff) as usize;
         let intermediate_value = crc_value >> 8;
-        crc_value = CRC_LOOKUP_TABLE[table_position] ^ intermediate_value;
+        // The position is masked to a byte, and the table has 256 entries.
+        let table_value = CRC_LOOKUP_TABLE
+            .get(table_position)
+            .copied()
+            .unwrap_or_default();
+        crc_value = table_value ^ intermediate_value;
     }
     crc_value
 }

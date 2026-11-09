@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Cyclic Encoding](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/9979fc01-0a3e-496f-900f-a6a867951f23)
 //!
 //! This is a direct port of the [crate::ndb::NdbCryptMethod::Cyclic] code from the PST specification.
@@ -17,11 +34,11 @@ pub fn encode_decode_block(data: &mut [u8], key: u32) {
         let high_key = (key >> 8) as u8;
 
         *b = (*b).wrapping_add(low_key);
-        *b = r_table[*b as usize];
+        *b = lookup(r_table, *b);
         *b = (*b).wrapping_add(high_key);
-        *b = s_table[*b as usize];
+        *b = lookup(s_table, *b);
         *b = (*b).wrapping_sub(high_key);
-        *b = i_table[*b as usize];
+        *b = lookup(i_table, *b);
         *b = (*b).wrapping_sub(low_key);
 
         key = key.wrapping_add(1);

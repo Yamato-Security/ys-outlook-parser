@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Data Types](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/1d61ee78-4466-4141-8276-f45153484619)
 
 use std::fmt::Debug;
@@ -102,6 +119,7 @@ impl TryFrom<u16> for PropertyType {
             0x0007 => Ok(Self::FloatingTime),
             0x000A => Ok(Self::ErrorCode),
             0x000B => Ok(Self::Boolean),
+            0x000D => Ok(Self::Object),
             0x0014 => Ok(Self::Integer64),
             0x001E => Ok(Self::String8),
             0x001F => Ok(Self::Unicode),
@@ -130,5 +148,19 @@ impl TryFrom<u16> for PropertyType {
 impl From<PropertyType> for u16 {
     fn from(value: PropertyType) -> Self {
         value as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_object_round_trip() {
+        assert_eq!(
+            PropertyType::try_from(0x000D).unwrap(),
+            PropertyType::Object
+        );
+        assert_eq!(u16::from(PropertyType::Object), 0x000D);
     }
 }

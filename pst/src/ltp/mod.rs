@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) Microsoft Corporation.
+//
+// This file is changed from microsoft/outlook-pst-rs (https://github.com/microsoft/outlook-pst-rs), whose code
+// is under the MIT License (LICENSE-MIT).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! ## [Lists, Tables, and Properties (LTP) Layer](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/4c24c7d2-5c5a-4b99-88b2-f4b84cc293ae)
 
 use std::io;
@@ -41,10 +58,16 @@ pub enum LtpError {
     InvalidHeapTreeKeySize(u8),
     #[error("Invalid BTHHEADER cbEnt: 0x{0:02X}")]
     InvalidHeapTreeDataSize(u8),
+    #[error("BTH node 0x{0:08X} is in its tree twice: a loop or a corrupt heap")]
+    HeapTreeLoop(u32),
     #[error("Missing HID hidBlockIndex: {0}")]
     HeapBlockIndexNotFound(u16),
     #[error("Missing HID hidIndex: {0}")]
     HeapAllocIndexNotFound(u16),
+    #[error(
+        "HNPAGEMAP allocation {0} (offset 0x{1:04X}, size 0x{2:04X}) is past the end of its block"
+    )]
+    HeapAllocOutOfBounds(u16, u16, u16),
     #[error("Invalid PC BTH Record wPropType: 0x{0:04X}")]
     InvalidPropertyType(u16),
     #[error("Invalid variable length PC value property type: {0:?}")]
@@ -57,6 +80,8 @@ pub enum LtpError {
     PropertySubNodeValueNotFound(u32),
     #[error("Invalid small PC value property type: {0:?}")]
     InvalidSmallPropertyType(prop_type::PropertyType),
+    #[error("HNID of 0 for a fixed-size value: {0:?}")]
+    EmptyFixedSizePropertyValue(prop_type::PropertyType),
     #[error("Invalid PC property tree key size: 0x{0:X}")]
     InvalidPropertyTreeKeySize(u8),
     #[error("Invalid PC property tree entry size: 0x{0:X}")]
@@ -91,8 +116,6 @@ pub enum LtpError {
     InvalidTableColumnSize(u8),
     #[error("Invalid TCOLDESC iBit: 0x{0:04X}")]
     InvalidTableColumnBitmaskOffset(u8),
-    #[error("Invalid TCOLDESC BOOL value: 0x{0:02X}")]
-    InvalidTableColumnBooleanValue(u8),
     #[error("Missing TCROWID: 0x{0:08X}")]
     TableRowIdNotFound(u32),
 }
