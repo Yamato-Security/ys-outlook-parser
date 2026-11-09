@@ -967,7 +967,8 @@ fn visit_texts(value: &PropertyValue, f: &mut impl FnMut(&Text)) {
     }
 }
 
-/// A non-zero `PtypInteger32` property stream entry.
+/// A positive `PtypInteger32` encoding/locale entry. Negative values must not become
+/// enormous unsigned code pages that hide a usable locale or parent encoding.
 fn entry_u32(entries: &[RawEntry], id: u16) -> Option<u32> {
     entries
         .iter()
@@ -980,7 +981,7 @@ fn entry_u32(entries: &[RawEntry], id: u16) -> Option<u32> {
                 e.entry.value[3],
             ])
         })
-        .filter(|&v| v != 0)
+        .filter(|&v| v != 0 && v <= i32::MAX as u32)
 }
 
 /// The HTML body: `PidTagHtml` decoded in `html_code_page`, else `PidTagBodyHtml`.

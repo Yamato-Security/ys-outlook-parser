@@ -41,6 +41,8 @@
 //! example, is recovered with U+FFFD in its place, and text with an odd number of bytes without
 //! its last byte. The `as_` methods of [`Value`] and [`Value::best_effort`] read the recovered
 //! value.
+//! String8 values with invalid byte sequences or an unsupported code page are also marked
+//! damaged; their recovered text, original bytes and decoding reason remain available.
 //!
 //! A string name ([`NameId::Text`]) is shared by every property that has it. A store's names are
 //! decoded once each, and to at most twice the size of its string stream (plus 4 KiB) in all,

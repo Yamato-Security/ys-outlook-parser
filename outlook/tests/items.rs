@@ -152,6 +152,102 @@ fn unified_unicode_properties_preserve_malformed_bytes() {
 }
 
 #[test]
+fn lossy_string8_does_not_hide_a_recovered_unicode_subject() {
+    let bytes = synthetic_msg(&[
+        ("/__substg1.0_0037001E", b"\xff"),
+        ("/__substg1.0_0037001F", b"A\0\0\xd8"),
+    ]);
+    let msg = MsgItem::from_bytes(
+        &bytes,
+        &outlook::msg::Options {
+            default_code_page: 65001,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(msg.item.subject.as_deref(), Some("A\u{FFFD}"));
+    let ansi = msg
+        .item
+        .properties
+        .iter()
+        .find(|p| p.kind == 0x001E)
+        .unwrap();
+    assert!(matches!(&ansi.value, outlook::Value::Damaged { raw, .. } if raw == b"\xff"));
+    assert_eq!(ansi.value.as_str(), Some("\u{FFFD}"));
+}
+
+#[test]
+fn unsupported_string8_codepages_are_not_presented_as_clean_text() {
+    let bytes = synthetic_msg(&[("/__substg1.0_0037001E", b"fallback")]);
+    let msg = MsgItem::from_bytes(
+        &bytes,
+        &outlook::msg::Options {
+            default_code_page: 99999,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(msg.item.subject.as_deref(), Some("fallback"));
+    let value = &msg.item.properties[0].value;
+    assert!(
+        matches!(value, outlook::Value::Damaged { raw, reason, .. } if raw == b"fallback" && reason.contains("99999"))
+    );
+}
+
+#[test]
+fn multivalue_string8_preserves_each_elements_decoding_quality() {
+    let raw = b"B\xffC";
+    let lengths = [1u32.to_le_bytes(), (raw.len() as u32).to_le_bytes()].concat();
+    let bytes = synthetic_msg(&[
+        ("/__substg1.0_3001101E", &lengths),
+        ("/__substg1.0_3001101E-00000000", b"A"),
+        ("/__substg1.0_3001101E-00000001", raw),
+    ]);
+    let msg = MsgItem::from_bytes(
+        &bytes,
+        &outlook::msg::Options {
+            default_code_page: 65001,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let values = msg.item.properties[0].value.as_multiple().unwrap();
+    assert_eq!(values[0].as_str(), Some("A"));
+    assert!(matches!(values[0], outlook::Value::String8 { .. }));
+    assert_eq!(values[1].as_str(), Some("B\u{FFFD}C"));
+    assert!(matches!(&values[1], outlook::Value::Damaged { raw: stored, .. } if stored == raw));
+}
+
+#[test]
+fn negative_message_codepages_do_not_hide_the_locale_fallback() {
+    let mut properties = vec![0; 32];
+    for (tag, value) in [(0x3FFD_0003u32, -1i32), (0x3FF1_0003, 1041)] {
+        properties.extend(tag.to_le_bytes());
+        properties.extend(6u32.to_le_bytes());
+        properties.extend(value.to_le_bytes());
+        properties.extend([0; 4]);
+    }
+    let bytes = synthetic_msg(&[
+        ("/__properties_version1.0", &properties),
+        ("/__substg1.0_0037001E", b"\x93\xfa\x96{"),
+    ]);
+    let low = outlook::outlook_msg::MsgFile::from_bytes(&bytes).unwrap();
+    assert_eq!(low.message.code_page.code_page, 932);
+    let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+    assert_eq!(msg.item.subject.as_deref(), Some("日本"));
+    assert_eq!(
+        msg.item
+            .properties
+            .iter()
+            .find(|p| p.id == 0x3FFD)
+            .unwrap()
+            .value
+            .as_i64(),
+        Some(-1)
+    );
+}
+
+#[test]
 fn unified_multivalue_unicode_preserves_each_malformed_element() {
     let raw = b"B\0\xff";
     let lengths = [2u32.to_le_bytes(), (raw.len() as u32).to_le_bytes()].concat();

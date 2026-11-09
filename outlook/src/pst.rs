@@ -473,10 +473,23 @@ impl Reader<'_> {
     fn message<K: Kind>(&self, message: &Rc<K::Message>, parent: Option<CodePage>) -> Item {
         let mut problems = Vec::new();
         let code_page = self.code_page(|id| message.properties().get(id), parent);
+        let html_code_page =
+            self.html_code_page(|id| message.properties().get(id), code_page.code_page);
         let properties = message
             .properties()
             .iter()
-            .map(|(&id, value)| property(id, value, self.names, code_page.code_page))
+            .map(|(&id, value)| {
+                property(
+                    id,
+                    value,
+                    self.names,
+                    if id == tags::HTML {
+                        html_code_page
+                    } else {
+                        code_page.code_page
+                    },
+                )
+            })
             .collect();
         let recipients = match message.recipient_table() {
             Some(table) => self.rows(table.as_ref(), code_page.code_page, &mut problems),
@@ -570,6 +583,22 @@ impl Reader<'_> {
             rows.push(properties);
         }
         rows
+    }
+
+    /// HTML uses its Internet encoding, not the Windows code page used by the other
+    /// String8 properties. Match the MSG reader when it is absent or unset.
+    fn html_code_page<'p>(
+        &self,
+        get: impl Fn(u16) -> Option<&'p PropertyValue>,
+        fallback: u32,
+    ) -> u32 {
+        match get(tags::INTERNET_CODEPAGE) {
+            Some(PropertyValue::Integer32(value)) => u32::try_from(*value)
+                .ok()
+                .filter(|&cp| cp != 0)
+                .unwrap_or(fallback),
+            _ => fallback,
+        }
     }
 
     /// `PidTagMessageCodepage`, then the ANSI code page of `PidTagMessageLocaleId`, then the
@@ -769,10 +798,7 @@ fn property(
 
 fn string8(bytes: &[u8], code_page: u32) -> Value {
     let text = outlook_msg::Text::from_code_page(bytes.to_vec(), code_page);
-    Value::String8 {
-        text: text.as_str().to_owned(),
-        bytes: text.raw().to_vec(),
-    }
+    crate::mapi::decoded_string8(&text)
 }
 
 fn unicode(units: &[u16], trailing_byte: Option<u8>) -> Value {
@@ -845,6 +871,45 @@ fn value(value: &PropertyValue, code_page: u32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_uses_the_internet_encoding_without_changing_message_text() {
+        let names = BTreeMap::new();
+        let reader = Reader {
+            names: &names,
+            default_code_page: 1252,
+            embedded: Cell::new(0),
+        };
+        let properties = BTreeMap::from([
+            (tags::MESSAGE_CODEPAGE, PropertyValue::Integer32(1252)),
+            (tags::INTERNET_CODEPAGE, PropertyValue::Integer32(65001)),
+        ]);
+        let cp = reader.code_page(|id| properties.get(&id), None);
+        let html_cp = reader.html_code_page(|id| properties.get(&id), cp.code_page);
+        assert_eq!(
+            string8("<p>日本語</p>".as_bytes(), html_cp).as_str(),
+            Some("<p>日本語</p>")
+        );
+        assert_eq!(string8(b"caf\xe9", cp.code_page).as_str(), Some("café"));
+        for declared in [0, -1] {
+            let properties =
+                BTreeMap::from([(tags::INTERNET_CODEPAGE, PropertyValue::Integer32(declared))]);
+            assert_eq!(reader.html_code_page(|id| properties.get(&id), 1252), 1252);
+        }
+        assert_eq!(reader.html_code_page(|_| None, 932), 932);
+    }
+
+    #[test]
+    fn lossy_or_unsupported_string8_is_marked_and_keeps_its_bytes() {
+        for (bytes, cp, expected) in [
+            (b"A\xffB".as_slice(), 65001, "A\u{FFFD}B"),
+            (b"fallback".as_slice(), 99999, "fallback"),
+        ] {
+            let value = string8(bytes, cp);
+            assert_eq!(value.as_str(), Some(expected));
+            assert!(matches!(value, Value::Damaged { raw, .. } if raw == bytes));
+        }
+    }
 
     #[test]
     fn named_string_reuse_does_not_exhaust_the_overlap_budget() {

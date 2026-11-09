@@ -47,14 +47,37 @@ pub fn format_filetime(ticks: i64) -> String {
 /// of the FILETIME range.
 pub fn floating_time_to_filetime(days: f64) -> Option<i64> {
     // 1899-12-30 is 109205 days after 1601-01-01.
-    const OLE_EPOCH_TICKS: f64 = 109_205.0 * 864_000_000_000.0;
+    const TICKS_PER_DAY: i128 = 864_000_000_000;
+    const OLE_EPOCH_TICKS: i128 = 94_353_120_000_000_000;
     // The whole part is a signed day number and the absolute value of the fraction the time of
     // day (https://learn.microsoft.com/en-us/cpp/atl-mfc-shared/date-type): the timeline is not
     // continuous before 1899-12-30, where -1.25 is 06:00 on 1899-12-29, not 18:00 on 1899-12-28.
-    let date = days.trunc() + days.fract().abs();
-    let ticks = (date * 864_000_000_000.0 + OLE_EPOCH_TICKS).round();
-    (ticks.is_finite() && ticks >= i64::MIN as f64 && ticks < i64::MAX as f64)
-        .then_some(ticks as i64)
+    if !days.is_finite() {
+        return None;
+    }
+    // Keep the day and epoch arithmetic exact. Adding the epoch as f64 first loses
+    // several ticks even when the source DATE represents that fraction precisely.
+    let whole = (days.trunc() as i128).checked_mul(TICKS_PER_DAY)?;
+    // A binary fraction is significand / 2^shift. Scale and round it with integers:
+    // a floating multiplication can round a value just below .5 up to .5 first.
+    let bits = days.fract().abs().to_bits();
+    let exponent = ((bits >> 52) & 0x7FF) as u32;
+    let significand = bits & 0x000F_FFFF_FFFF_FFFF;
+    let (significand, shift) = if exponent == 0 {
+        (significand, 1074)
+    } else {
+        (significand | (1 << 52), 1075u32.checked_sub(exponent)?)
+    };
+    let numerator = u128::from(significand).checked_mul(TICKS_PER_DAY as u128)?;
+    let fraction = if shift >= 128 {
+        // The numerator has at most 93 bits, so this is well below half a tick.
+        0
+    } else {
+        let half = 1u128.checked_shl(shift.checked_sub(1)?)?;
+        i128::try_from(numerator.checked_add(half)?.checked_shr(shift)?).ok()?
+    };
+    let ticks = OLE_EPOCH_TICKS.checked_add(whole)?.checked_add(fraction)?;
+    i64::try_from(ticks).ok()
 }
 
 /// Days since 1970-01-01 to a proleptic Gregorian (year, month, day).
@@ -75,6 +98,42 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fractional_ole_dates_do_not_lose_ticks_when_the_epoch_is_added() {
+        // One f64 step at 25569 days is 2^-38 days = 3.143213689... FILETIME ticks.
+        let day = 25_569.0f64;
+        assert_eq!(
+            floating_time_to_filetime(f64::from_bits(day.to_bits() + 1)),
+            Some(UNIX_EPOCH_TICKS + 3)
+        );
+        assert_eq!(
+            floating_time_to_filetime(f64::from_bits(day.to_bits() + 3)),
+            Some(UNIX_EPOCH_TICKS + 9)
+        );
+        assert_eq!(
+            floating_time_to_filetime(f64::from_bits(day.to_bits() - 1)),
+            Some(UNIX_EPOCH_TICKS - 3)
+        );
+        // Modern dates have a 2^-37-day step, which rounds to six ticks.
+        let day = 45_000.0f64;
+        assert_eq!(
+            floating_time_to_filetime(f64::from_bits(day.to_bits() + 1)),
+            Some(133_233_120_000_000_006)
+        );
+        // The exact binary fraction is just below a half tick. Multiplying it in f64
+        // rounds it to .5 before the integer rounding, incorrectly adding another tick.
+        assert_eq!(
+            floating_time_to_filetime(45_000.94533170203),
+            Some(133_233_936_766_590_554)
+        );
+        // The absolute fractional-time rule still applies before the OLE epoch.
+        let day = -25_569.0f64;
+        assert_eq!(
+            floating_time_to_filetime(f64::from_bits(day.to_bits() + 1)),
+            Some(72_261_504_000_000_003)
+        );
+    }
 
     #[test]
     fn floating_times_use_the_absolute_fraction_for_the_time_of_day() {

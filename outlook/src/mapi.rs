@@ -149,6 +149,30 @@ impl Value {
     }
 }
 
+/// Preserve decoding quality for 8-bit text as well as its bytes. A fallback for an
+/// unsupported code page must not outrank a known, recovered Unicode representation.
+pub(crate) fn decoded_string8(text: &outlook_msg::Text) -> Value {
+    let value = Value::String8 {
+        bytes: text.raw().to_vec(),
+        text: text.as_str().to_owned(),
+    };
+    let reason = match text.encoding() {
+        outlook_msg::TextEncoding::Unsupported { requested } => Some(format!(
+            "code page {requested} is unsupported; recovered as Windows-1252"
+        )),
+        encoding if text.is_lossy() => Some(format!("text is not valid in {encoding:?}")),
+        _ => None,
+    };
+    match reason {
+        Some(reason) => Value::Damaged {
+            recovered: Some(Box::new(value)),
+            raw: text.raw().to_vec(),
+            reason,
+        },
+        None => value,
+    }
+}
+
 /// A named property's identity: its property set and its numeric id (LID) or string name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PropertyName {

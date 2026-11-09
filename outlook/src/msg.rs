@@ -143,13 +143,6 @@ fn properties(properties: &outlook_msg::Properties) -> Vec<Property> {
         .collect()
 }
 
-fn text(text: &outlook_msg::Text) -> Value {
-    Value::String8 {
-        bytes: text.raw().to_vec(),
-        text: text.as_str().to_owned(),
-    }
-}
-
 fn unicode(text: &outlook_msg::Text) -> Value {
     let value = Value::String(text.as_str().to_owned());
     if text.is_lossy() {
@@ -177,7 +170,7 @@ fn value(value: &outlook_msg::Value) -> Value {
         V::ErrorCode(v) => Value::ErrorCode(*v as u32),
         V::Boolean(v) => Value::Boolean(*v),
         V::Integer64(v) => Value::Integer64(*v),
-        V::String8(t) => text(t),
+        V::String8(t) => crate::mapi::decoded_string8(t),
         V::Unicode(t) => unicode(t),
         V::Time(v) => Value::Time(*v),
         V::Guid(g) => Value::Guid(g.0),
@@ -190,7 +183,7 @@ fn value(value: &outlook_msg::Value) -> Value {
         V::MultipleCurrency(v) => many(v.iter().map(|&v| Value::Currency(v)).collect()),
         V::MultipleFloatingTime(v) => many(v.iter().map(|&v| Value::FloatingTime(v)).collect()),
         V::MultipleInteger64(v) => many(v.iter().map(|&v| Value::Integer64(v)).collect()),
-        V::MultipleString8(v) => many(v.iter().map(text).collect()),
+        V::MultipleString8(v) => many(v.iter().map(crate::mapi::decoded_string8).collect()),
         V::MultipleUnicode(v) => many(v.iter().map(unicode).collect()),
         V::MultipleTime(v) => many(v.iter().map(|&v| Value::Time(v)).collect()),
         V::MultipleGuid(v) => many(v.iter().map(|g| Value::Guid(g.0)).collect()),
