@@ -156,12 +156,16 @@ pub(crate) fn decoded_string8(text: &outlook_msg::Text) -> Value {
         bytes: text.raw().to_vec(),
         text: text.as_str().to_owned(),
     };
+    use outlook_msg::TextEncoding;
     let reason = match text.encoding() {
-        outlook_msg::TextEncoding::Unsupported { requested } => Some(format!(
+        TextEncoding::Unsupported { requested } => Some(format!(
             "code page {requested} is unsupported; recovered as Windows-1252"
         )),
-        encoding if text.is_lossy() => Some(format!("text is not valid in {encoding:?}")),
-        _ => None,
+        _ if !text.is_lossy() => None,
+        TextEncoding::CodePage(code_page) => {
+            Some(format!("text is not valid in code page {code_page}"))
+        }
+        TextEncoding::Utf16Le => Some("text is not valid UTF-16LE".into()),
     };
     match reason {
         Some(reason) => Value::Damaged {

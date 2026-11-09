@@ -901,13 +901,26 @@ mod tests {
 
     #[test]
     fn lossy_or_unsupported_string8_is_marked_and_keeps_its_bytes() {
-        for (bytes, cp, expected) in [
-            (b"A\xffB".as_slice(), 65001, "A\u{FFFD}B"),
-            (b"fallback".as_slice(), 99999, "fallback"),
+        for (bytes, cp, expected, why) in [
+            (
+                b"A\xffB".as_slice(),
+                65001,
+                "A\u{FFFD}B",
+                "text is not valid in code page 65001",
+            ),
+            (
+                b"fallback".as_slice(),
+                99999,
+                "fallback",
+                "code page 99999 is unsupported; recovered as Windows-1252",
+            ),
         ] {
             let value = string8(bytes, cp);
             assert_eq!(value.as_str(), Some(expected));
-            assert!(matches!(value, Value::Damaged { raw, .. } if raw == bytes));
+            assert!(
+                matches!(&value, Value::Damaged { raw, reason, .. } if raw == bytes && reason == why),
+                "{value:?}"
+            );
         }
     }
 
