@@ -42,11 +42,9 @@
 //! its last byte. The `as_` methods of [`Value`] and [`Value::best_effort`] read the recovered
 //! value.
 //!
-//! String-named properties use [`NameId::Text`] with a shared `std::sync::Arc<str>` so that
-//! a long name referenced by many properties is not copied for each one. Construct it with
-//! `NameId::Text("Keywords".into())`, or use `.into()` on an owned `String`. PST/OST names are
-//! decoded once per string offset; overlapping names exceeding twice the string stream's
-//! byte length plus 4096 bytes are reported as problems rather than expanded without bound.
+//! A string name ([`NameId::Text`]) is shared by every property that has it. A store's names are
+//! decoded once each, and to at most twice the size of its string stream (plus 4 KiB) in all,
+//! which only overlapping names can reach; a name past that is left out and reported as a problem.
 //!
 //! When a property is stored more than once (a `.msg` file can hold it both as Unicode and as
 //! ANSI text), an item's fields take a clean value before a damaged one, then Unicode before

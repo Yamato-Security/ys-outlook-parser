@@ -27,23 +27,17 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
   and `.oft` files, both used only as external oracles. (@YamatoSecurity)
 
 ### Changed
-- String-named properties in the unified model use shared `Arc<str>` names, constructed with
-  `.into()` from strings. PST/OST name decoding is cached and bounded by the string stream's
-  size so repeated or overlapping names cannot expand into quadratic memory use.
-  (@YamatoSecurity)
 - Read-only: a file is never opened for writing, and upstream's write support is removed.
   (@YamatoSecurity)
 - No input makes the crates panic, abort or allocate without bound, and every walk ends: B-tree,
   block, heap, folder and embedded-message walks have loop and depth limits; a walk's blocks may
   inflate to at most 8 times the file's size; each heap allocation or sub-node is the value of one
   property only, and an object's values are limited; an embedded message that has the blocks of a
-  message it is embedded in is refused; and an item reads at most 1024 embedded messages.
-  (@YamatoSecurity)
+  message it is embedded in is refused; an item reads at most 1024 embedded messages; and a
+  store's named-property names are decoded once each, and to at most twice the size of its string
+  stream (plus 4 KiB) in all. (@YamatoSecurity)
 
 ### Fixed
-- A malformed record in a PST named-property entry stream or hash bucket silently hid every
-  following record. Record iteration now reports each invalid entry and lets the forensic
-  reader continue; the strict collecting methods return an error. (@YamatoSecurity)
 - From upstream pull requests (MIT): `PtypObject` property records (#86), every BTH record read
   instead of stopping at the first bad one (#87), an embedded message read from the attachment's
   own sub-nodes (#88), the GUID kept when hashing a string-named property (#89), an HNID of 0 read
@@ -62,3 +56,6 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
   block or 2,047th allocation was not found or was read from the wrong place. (@YamatoSecurity)
 - The last byte of a Unicode value with an odd length and no terminator was dropped without a
   trace; it is kept as `UnicodeValue::trailing_byte`. (@YamatoSecurity)
+- A bad record in the named-property map's entry stream or in a hash bucket hid every record after
+  it: `NamedPropertyMapProperties::stream_entries` gives each record's result, and `stream_entry`
+  and `hash_bucket` fail on a bad record. (@YamatoSecurity)

@@ -36,14 +36,12 @@ kind (`ProblemKind`), the file offset or node it was found in when known, and a 
 defect an error, as upstream outlook-pst does. Either way, a defect that reading cannot go past (a
 truncated file, a block of the wrong size, a loop) is an error.
 
-## Limits
+The named-property map's entry stream can be read record by record with
+`NamedPropertyMapProperties::stream_entries`, which gives each record's result (a partial last
+record included), so that a reader can go past a bad record; `stream_entry` and `hash_bucket` fail
+on one.
 
-The named-property entry stream can be read with `NamedPropertyMapProperties::stream_entries`,
-which returns one result per record, including a partial final record. This lets a forensic
-reader report a damaged entry and continue with later entries. `stream_entry` and `hash_bucket`
-return an error if any record is invalid, instead of silently returning only the valid prefix.
-`lookup_string_bytes` validates a name's offset and length and borrows its UTF-16LE bytes without
-allocating a copy.
+## Limits
 
 No input makes this crate panic, abort or allocate without bound: sizes and offsets from the file
 are checked before use, and every walk ends. A B-tree lookup goes through each page at most once and
