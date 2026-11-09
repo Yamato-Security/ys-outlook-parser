@@ -27,6 +27,10 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
   and `.oft` files, both used only as external oracles. (@YamatoSecurity)
 
 ### Changed
+- String-named properties in the unified model use shared `Arc<str>` names, constructed with
+  `.into()` from strings. PST/OST name decoding is cached and bounded by the string stream's
+  size so repeated or overlapping names cannot expand into quadratic memory use.
+  (@YamatoSecurity)
 - Read-only: a file is never opened for writing, and upstream's write support is removed.
   (@YamatoSecurity)
 - No input makes the crates panic, abort or allocate without bound, and every walk ends: B-tree,
@@ -37,6 +41,9 @@ crates, `ys-outlook-parser-msg` and `ys-outlook-parser`. (@YamatoSecurity)
   (@YamatoSecurity)
 
 ### Fixed
+- A malformed record in a PST named-property entry stream or hash bucket silently hid every
+  following record. Record iteration now reports each invalid entry and lets the forensic
+  reader continue; the strict collecting methods return an error. (@YamatoSecurity)
 - From upstream pull requests (MIT): `PtypObject` property records (#86), every BTH record read
   instead of stopping at the first bad one (#87), an embedded message read from the attachment's
   own sub-nodes (#88), the GUID kept when hashing a string-named property (#89), an HNID of 0 read

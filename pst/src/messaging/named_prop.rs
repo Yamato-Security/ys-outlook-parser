@@ -270,6 +270,12 @@ impl NamedPropReadWrite for NameIdEntry {
     }
 }
 
+fn read_nameid_entries(bytes: &[u8]) -> impl Iterator<Item = io::Result<NameIdEntry>> + '_ {
+    bytes
+        .chunks(8)
+        .map(|chunk| NameIdEntry::read(&mut Cursor::new(chunk)))
+}
+
 #[derive(Default, Debug)]
 pub struct NamedPropertyMapProperties {
     properties: BTreeMap<u16, PropertyValue>,
@@ -336,14 +342,7 @@ impl NamedPropertyMapProperties {
         )?;
 
         match hash_bucket {
-            PropertyValue::Binary(value) => {
-                let mut results = Vec::with_capacity(value.buffer().len() / 8);
-                let mut cursor = Cursor::new(value.buffer());
-                while let Ok(value) = NameIdEntry::read(&mut cursor) {
-                    results.push(value);
-                }
-                Ok(results)
-            }
+            PropertyValue::Binary(value) => read_nameid_entries(value.buffer()).collect(),
             invalid => Err(MessagingError::InvalidNamedPropertyMapStreamString(
                 PropertyType::from(invalid),
             )
@@ -425,20 +424,20 @@ impl NamedPropertyMapProperties {
     }
 
     pub fn stream_entry(&self) -> io::Result<Vec<NameIdEntry>> {
+        self.stream_entries()?.collect()
+    }
+
+    /// Each NAMEID record as its own result, including a partial final record. A forensic
+    /// reader can report a bad record and continue with later records; `stream_entry()`
+    /// instead fails if any record is bad.
+    pub fn stream_entries(&self) -> io::Result<impl Iterator<Item = io::Result<NameIdEntry>> + '_> {
         let stream_entry = self
             .properties
             .get(&0x0003)
             .ok_or(MessagingError::NamedPropertyMapStreamEntryNotFound)?;
 
         match stream_entry {
-            PropertyValue::Binary(value) => {
-                let mut results = Vec::with_capacity(value.buffer().len() / 8);
-                let mut cursor = Cursor::new(value.buffer());
-                while let Ok(value) = NameIdEntry::read(&mut cursor) {
-                    results.push(value);
-                }
-                Ok(results)
-            }
+            PropertyValue::Binary(value) => Ok(read_nameid_entries(value.buffer())),
             invalid => Err(
                 MessagingError::InvalidNamedPropertyMapStreamEntry(PropertyType::from(invalid))
                     .into(),
@@ -447,6 +446,12 @@ impl NamedPropertyMapProperties {
     }
 
     pub fn lookup_string(&self, offset: u32) -> io::Result<StringEntry> {
+        let bytes = self.lookup_string_bytes(offset)?;
+        Ok(StringEntry::new(bytes.len() as u32, bytes.to_vec())?)
+    }
+
+    /// Borrow a name's UTF-16LE bytes without allocating an owned `StringEntry`.
+    pub fn lookup_string_bytes(&self, offset: u32) -> io::Result<&[u8]> {
         let stream_string = self
             .properties
             .get(&0x0004)
@@ -458,8 +463,19 @@ impl NamedPropertyMapProperties {
                     .buffer()
                     .get(offset as usize..)
                     .ok_or(MessagingError::NamedPropertyMapStringEntryOutOfBounds)?;
-                let entry = StringEntry::read(&mut Cursor::new(data))?;
-                Ok(entry)
+                let (size, bytes) = data
+                    .split_first_chunk::<4>()
+                    .ok_or(MessagingError::NamedPropertyMapStringEntryOutOfBounds)?;
+                let size = u32::from_le_bytes(*size);
+                if !size.is_multiple_of(2) {
+                    return Err(MessagingError::InvalidNamedPropertyMapStreamString(
+                        PropertyType::Binary,
+                    )
+                    .into());
+                }
+                bytes
+                    .get(..size as usize)
+                    .ok_or_else(|| MessagingError::NamedPropertyMapStringEntryOutOfBounds.into())
             }
             invalid => Err(MessagingError::InvalidNamedPropertyMapStreamString(
                 PropertyType::from(invalid),
@@ -643,6 +659,91 @@ impl NamedPropertyMapReadWrite<AnsiPstFile> for AnsiNamedPropertyMap {
 mod tests {
     use super::*;
     use crate::ltp::prop_context::BinaryValue;
+
+    #[test]
+    fn test_invalid_nameid_records_are_not_silently_accepted_as_a_prefix() {
+        let entry = |index| {
+            NameIdEntry::new(
+                NamedPropertyId::Number(0x8501),
+                NamedPropertyGuid::PublicStrings,
+                NamedPropertyIndex::try_from(index).unwrap(),
+            )
+        };
+        let mut bytes = Vec::new();
+        entry(0).write(&mut bytes).unwrap();
+        let mut bad = vec![0u8; 8];
+        bad[6..].copy_from_slice(&0x8000u16.to_le_bytes());
+        bytes.extend(bad);
+        entry(1).write(&mut bytes).unwrap();
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([
+                (0x0001, PropertyValue::Integer32(1)),
+                (
+                    0x0003,
+                    PropertyValue::Binary(BinaryValue::new(bytes.clone())),
+                ),
+                (0x1000, PropertyValue::Binary(BinaryValue::new(bytes))),
+            ]),
+        };
+        assert!(
+            map.stream_entry().is_err(),
+            "a bad middle record was silently ignored"
+        );
+        assert!(
+            map.hash_bucket(&entry(0)).is_err(),
+            "a bad bucket record was silently ignored"
+        );
+    }
+
+    #[test]
+    fn test_nameid_iteration_recovers_after_a_bad_record_and_reports_a_partial_tail() {
+        let entry = |index| {
+            NameIdEntry::new(
+                NamedPropertyId::Number(0x8501),
+                NamedPropertyGuid::PublicStrings,
+                NamedPropertyIndex::try_from(index).unwrap(),
+            )
+        };
+        let mut bytes = Vec::new();
+        entry(0).write(&mut bytes).unwrap();
+        bytes.extend([0, 0, 0, 0, 0, 0, 0, 0x80]);
+        entry(1).write(&mut bytes).unwrap();
+        bytes.extend([0, 0]);
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(0x0003, PropertyValue::Binary(BinaryValue::new(bytes)))]),
+        };
+        let records: Vec<_> = map.stream_entries().unwrap().collect();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].as_ref().unwrap().prop_id(), 0x8000);
+        assert!(records[1].is_err());
+        assert_eq!(records[2].as_ref().unwrap().prop_id(), 0x8001);
+        assert!(records[3].is_err());
+    }
+
+    #[test]
+    fn test_borrowed_names_validate_offsets_lengths_and_even_code_units() {
+        let valid = [4u32.to_le_bytes().as_slice(), b"O\0K\0"].concat();
+        let map = NamedPropertyMapProperties {
+            properties: BTreeMap::from([(0x0004, PropertyValue::Binary(BinaryValue::new(valid)))]),
+        };
+        assert_eq!(map.lookup_string_bytes(0).unwrap(), b"O\0K\0");
+        assert_eq!(map.lookup_string(0).unwrap().to_string(), "OK");
+        assert!(map.lookup_string_bytes(4).is_err());
+        assert!(map.lookup_string_bytes(u32::MAX).is_err());
+        for raw in [
+            3u32.to_le_bytes().to_vec(),
+            u32::MAX.to_le_bytes().to_vec(),
+            vec![0, 0, 0],
+        ] {
+            let map = NamedPropertyMapProperties {
+                properties: BTreeMap::from([(
+                    0x0004,
+                    PropertyValue::Binary(BinaryValue::new(raw)),
+                )]),
+            };
+            assert!(map.lookup_string_bytes(0).is_err());
+        }
+    }
 
     #[test]
     fn test_stream_string_reads_every_name() {

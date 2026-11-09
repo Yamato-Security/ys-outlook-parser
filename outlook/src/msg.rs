@@ -136,7 +136,7 @@ fn properties(properties: &outlook_msg::Properties) -> Vec<Property> {
                 set: named.guid.0,
                 id: match &named.name {
                     outlook_msg::PropertyName::Id(lid) => NameId::Number(*lid),
-                    outlook_msg::PropertyName::Name(name) => NameId::Text(name.to_string()),
+                    outlook_msg::PropertyName::Name(name) => NameId::Text(name.clone()),
                 },
             }),
         })

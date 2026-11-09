@@ -38,6 +38,13 @@ truncated file, a block of the wrong size, a loop) is an error.
 
 ## Limits
 
+The named-property entry stream can be read with `NamedPropertyMapProperties::stream_entries`,
+which returns one result per record, including a partial final record. This lets a forensic
+reader report a damaged entry and continue with later entries. `stream_entry` and `hash_bucket`
+return an error if any record is invalid, instead of silently returning only the valid prefix.
+`lookup_string_bytes` validates a name's offset and length and borrows its UTF-16LE bytes without
+allocating a copy.
+
 No input makes this crate panic, abort or allocate without bound: sizes and offsets from the file
 are checked before use, and every walk ends. A B-tree lookup goes through each page at most once and
 at most `MAX_BTREE_DEPTH` pages deep; a data tree or sub-node tree reads each block at most once

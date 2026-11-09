@@ -22,6 +22,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use outlook_pst::ltp::prop_context::PropertyValue;
 use outlook_pst::ltp::prop_type::PropertyType;
@@ -646,7 +647,7 @@ fn names(
         }
     };
     let map = map.properties();
-    let entries = match map.stream_entry() {
+    let entries = match map.stream_entries() {
         Ok(entries) => entries,
         Err(e) => {
             problems.push(format!("named-property map: entry stream: {e}"));
@@ -655,7 +656,20 @@ fn names(
     };
     let mut failed = 0usize;
     let mut first = None;
-    for entry in entries {
+    let string_bytes = match map.get(0x0004) {
+        Some(PropertyValue::Binary(value)) => value.buffer().len(),
+        _ => 0,
+    };
+    let mut strings = NamedStrings::new(string_bytes);
+    for (index, entry) in entries.enumerate() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                failed = failed.saturating_add(1);
+                first.get_or_insert_with(|| format!("entry {index}: {e}"));
+                continue;
+            }
+        };
         let set = match map.lookup_guid(entry.guid()) {
             Ok(g) => guid(g.data1(), g.data2(), g.data3(), *g.data4()),
             Err(e) => {
@@ -666,8 +680,10 @@ fn names(
         };
         let id = match entry.id() {
             NamedPropertyId::Number(lid) => NameId::Number(lid),
-            NamedPropertyId::StringOffset(offset) => match map.lookup_string(offset) {
-                Ok(name) => NameId::Text(utf16(name.buffer())),
+            NamedPropertyId::StringOffset(offset) => match strings
+                .get(offset, || map.lookup_string_bytes(offset))
+            {
+                Ok(name) => NameId::Text(name),
                 Err(e) => {
                     failed = failed.saturating_add(1);
                     first.get_or_insert_with(|| format!("0x{:04X}: name: {e}", entry.prop_id()));
@@ -683,6 +699,43 @@ fn names(
         ));
     }
     names
+}
+
+/// Decode each string offset once and share it across identities and items. Overlapping
+/// offsets must not turn one string stream into a quadratic amount of decoded text.
+struct NamedStrings {
+    names: BTreeMap<u32, Arc<str>>,
+    left: usize,
+}
+
+impl NamedStrings {
+    fn new(bytes: usize) -> Self {
+        Self {
+            names: BTreeMap::new(),
+            left: bytes.saturating_mul(2).saturating_add(4096),
+        }
+    }
+
+    fn get<'a>(
+        &mut self,
+        offset: u32,
+        read: impl FnOnce() -> io::Result<&'a [u8]>,
+    ) -> io::Result<Arc<str>> {
+        if let Some(name) = self.names.get(&offset) {
+            return Ok(name.clone());
+        }
+        let bytes = read()?;
+        if bytes.len() > self.left {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overlapping named-property strings exceeded the decode budget",
+            ));
+        }
+        self.left = self.left.saturating_sub(bytes.len());
+        let name: Arc<str> = utf16(bytes).into();
+        self.names.insert(offset, name.clone());
+        Ok(name)
+    }
 }
 
 fn utf16(bytes: &[u8]) -> String {
@@ -792,6 +845,32 @@ fn value(value: &PropertyValue, code_page: u32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_string_reuse_does_not_exhaust_the_overlap_budget() {
+        let bytes = [b'N', 0].repeat(4096);
+        let mut names = NamedStrings::new(bytes.len());
+        let expected = "N".repeat(4096);
+        assert_eq!(&*names.get(0, || Ok(&bytes)).unwrap(), expected);
+        for _ in 0..1500 {
+            assert_eq!(
+                &*names
+                    .get(0, || panic!("cached name was read again"))
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(&*names.get(1, || Ok(&bytes)).unwrap(), expected);
+        let error = names.get(2, || Ok(&bytes)).unwrap_err();
+        assert!(error.to_string().contains("decode budget"));
+        assert_eq!(
+            &*names
+                .get(0, || panic!("cached name was read again"))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(&*names.get(3, || Ok(b"x\0")).unwrap(), "x");
+    }
 
     #[test]
     fn zero_message_codepage_does_not_hide_the_locale_or_parent() {

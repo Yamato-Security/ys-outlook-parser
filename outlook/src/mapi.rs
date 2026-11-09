@@ -18,6 +18,7 @@
 //! [MS-OXPROPS]: https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops/
 
 use std::fmt;
+use std::sync::Arc;
 
 /// A property as stored: its id (the high 16 bits of its tag), its type (the low 16 bits), its
 /// value and, for ids from 0x8000, the name the store's or file's name map gives it.
@@ -160,8 +161,9 @@ pub struct PropertyName {
 pub enum NameId {
     /// A numeric name (LID).
     Number(u32),
-    /// A string name.
-    Text(String),
+    /// A string name, shared by the properties and entries referring to it. Use `.into()`
+    /// when constructing this from an owned string or string literal.
+    Text(Arc<str>),
 }
 
 impl PropertyName {

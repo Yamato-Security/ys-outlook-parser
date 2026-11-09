@@ -30,9 +30,50 @@ fn synthetic_msg(streams: &[(&str, &[u8])]) -> Vec<u8> {
         .write_all(&[0; 32])
         .unwrap();
     for (name, data) in streams {
+        if let Some(parent) = std::path::Path::new(name).parent() {
+            file.create_storage_all(parent).unwrap();
+        }
         file.create_stream(name).unwrap().write_all(data).unwrap();
     }
     file.into_inner().into_inner()
+}
+
+#[test]
+fn large_shared_property_names_keep_every_property_readable() {
+    let name = "N".repeat(65_536);
+    let count = 1500u16;
+    let mut strings = (name.len() as u32 * 2).to_le_bytes().to_vec();
+    strings.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut mappings = Vec::new();
+    let mut properties = vec![0; 32];
+    for index in 0..count {
+        mappings.extend(0u32.to_le_bytes());
+        mappings.extend(((u32::from(index) << 16) | 5).to_le_bytes());
+        properties.extend(((u32::from(0x8000 + index) << 16) | 3).to_le_bytes());
+        properties.extend(6u32.to_le_bytes());
+        properties.extend(u64::from(index).to_le_bytes());
+    }
+    let bytes = synthetic_msg(&[
+        ("/__nameid_version1.0/__substg1.0_00030102", &mappings),
+        ("/__nameid_version1.0/__substg1.0_00040102", &strings),
+        ("/__properties_version1.0", &properties),
+    ]);
+    let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+    assert_eq!(msg.item.properties.len(), usize::from(count));
+    for property in &msg.item.properties {
+        assert_eq!(
+            property.value.as_i64(),
+            Some(i64::from(property.id - 0x8000))
+        );
+        let outlook::NameId::Text(text) = &property.name.as_ref().unwrap().id else {
+            panic!("not a string name");
+        };
+        assert!(
+            text.as_ref() == name.as_str(),
+            "wrong name on property {:#x}",
+            property.id
+        );
+    }
 }
 
 #[test]
