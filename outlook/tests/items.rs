@@ -219,6 +219,90 @@ fn multivalue_string8_preserves_each_elements_decoding_quality() {
 }
 
 #[test]
+fn mismatched_multivalue_lengths_remain_visible_in_the_unified_model() {
+    let lengths = [10u32.to_le_bytes(), 6u32.to_le_bytes()].concat();
+    let bytes = synthetic_msg(&[
+        ("/__substg1.0_3001101F", &lengths),
+        ("/__substg1.0_3001101F-00000000", b"A\0\0\0"),
+        ("/__substg1.0_3001101F-00000001", b"B\0C\0\0\0"),
+    ]);
+    let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+    let value = &msg.item.properties[0].value;
+    let outlook::Value::Damaged { raw, reason, .. } = value else {
+        panic!("length mismatch is not marked as damaged: {value:?}");
+    };
+    assert_eq!(raw, &lengths);
+    assert!(reason.contains("element 0"));
+    let recovered: Vec<_> = value
+        .as_multiple()
+        .unwrap()
+        .iter()
+        .map(outlook::Value::as_str)
+        .collect();
+    assert_eq!(recovered, [Some("A"), Some("BC")]);
+    assert!(msg.item.problems.iter().any(|p| p.contains("element 0")));
+}
+
+#[test]
+fn empty_long_attachment_path_does_not_hide_the_reference_target() {
+    let bytes = synthetic_msg(&[
+        (
+            "/__attach_version1.0_#00000000/__properties_version1.0",
+            &[0; 8],
+        ),
+        (
+            "/__attach_version1.0_#00000000/__substg1.0_370D001F",
+            b"\0\0",
+        ),
+        (
+            "/__attach_version1.0_#00000000/__substg1.0_3708001F",
+            b"C\0:\0\\\0T\0e\0m\0p\0\\\0p\0a\0y\0l\0o\0a\0d\0.\0b\0i\0n\0",
+        ),
+    ]);
+    let msg = MsgItem::from_bytes(&bytes, &Default::default()).unwrap();
+    assert_eq!(
+        msg.item.attachments[0].pathname.as_deref(),
+        Some(r"C:\Temp\payload.bin")
+    );
+    let original = msg.item.attachments[0]
+        .properties
+        .iter()
+        .find(|p| p.id == 0x370D)
+        .unwrap();
+    assert_eq!(original.value.as_str(), Some(""));
+}
+
+#[test]
+fn empty_recipient_metadata_does_not_hide_usable_fallbacks() {
+    let bytes = synthetic_msg(&[
+        (
+            "/__recip_version1.0_#00000000/__properties_version1.0",
+            &[0; 8],
+        ),
+        ("/__recip_version1.0_#00000000/__substg1.0_3001001E", b"\0"),
+        (
+            "/__recip_version1.0_#00000000/__substg1.0_5FF6001E",
+            b"Analyst",
+        ),
+        ("/__recip_version1.0_#00000000/__substg1.0_39FE001E", b"\0"),
+        (
+            "/__recip_version1.0_#00000000/__substg1.0_3003001E",
+            b"analyst@example.test",
+        ),
+    ]);
+    let low = outlook::outlook_msg::MsgFile::from_bytes(&bytes).unwrap();
+    let msg = MsgItem::from_file(&low);
+    assert_eq!(
+        (
+            low.message.recipients[0].email_address(),
+            msg.item.recipients[0].party.name.as_deref()
+        ),
+        (Some("analyst@example.test"), Some("Analyst"))
+    );
+    assert_eq!(msg.item.recipients[0].party.smtp.as_deref(), Some(""));
+}
+
+#[test]
 fn negative_message_codepages_do_not_hide_the_locale_fallback() {
     let mut properties = vec![0; 32];
     for (tag, value) in [(0x3FFD_0003u32, -1i32), (0x3FF1_0003, 1041)] {

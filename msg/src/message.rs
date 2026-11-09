@@ -154,10 +154,11 @@ impl Recipient {
         self.properties.string(tags::DISPLAY_NAME)
     }
 
-    /// `PidTagSmtpAddress`, else `PidTagEmailAddress`.
+    /// `PidTagSmtpAddress` when non-empty, else `PidTagEmailAddress`.
     pub fn email_address(&self) -> Option<&str> {
         self.properties
             .string(tags::SMTP_ADDRESS)
+            .filter(|address| !address.is_empty())
             .or_else(|| self.properties.string(tags::EMAIL_ADDRESS))
     }
 
@@ -1204,7 +1205,7 @@ impl<F: Read + Seek> Decoder<'_, '_, '_, F> {
 
     fn multiple_variable(&mut self, ty: PropertyType, stream: Option<&Child>) -> PropertyValue {
         // The length stream has one 4-byte length per string, or 8 bytes (length and 4
-        // reserved bytes) per binary value ([MS-OXMSG] 2.1.4.2.2).
+        // reserved bytes) per binary value ([MS-OXMSG] 2.1.4.2.1).
         let unit = if ty == PropertyType::MultipleBinary {
             8
         } else {
@@ -1247,6 +1248,23 @@ impl<F: Read + Seek> Decoder<'_, '_, '_, F> {
             let (raw, complete) = self.read(child);
             if !complete {
                 reasons.push(format!("element {index} could be read only in part"));
+            }
+            // The table contains lengths, not just an element count. A CFB stream
+            // can be read completely while still being shorter than its MAPI value.
+            // Keep every recovered byte; a mismatch is evidence of damage, not a
+            // reason to truncate the value or allocate the declared amount.
+            if let Some(length) = lengths
+                .chunks_exact(unit)
+                .nth(index as usize)
+                .and_then(|entry| entry.first_chunk::<4>())
+            {
+                let declared = u32::from_le_bytes(*length);
+                if u64::from(declared) != raw.len() as u64 {
+                    reasons.push(format!(
+                        "element {index} is {} bytes, but the length stream gives {declared}",
+                        raw.len()
+                    ));
+                }
             }
             values.push(raw);
         }

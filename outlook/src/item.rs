@@ -598,6 +598,7 @@ fn recipient(index: usize, properties: Vec<Property>) -> Recipient {
         party: Party {
             name: p
                 .text(tags::DISPLAY_NAME)
+                .filter(|name| !name.is_empty())
                 .or_else(|| p.text(tags::RECIPIENT_DISPLAY_NAME)),
             address_type: p.text(tags::ADDRESS_TYPE),
             address: p.text(tags::EMAIL_ADDRESS),
@@ -627,6 +628,7 @@ fn attachment(index: usize, parts: AttachmentParts) -> Attachment {
         content_location: p.text(tags::ATTACH_CONTENT_LOCATION),
         pathname: p
             .text(tags::ATTACH_LONG_PATHNAME)
+            .filter(|path| !path.is_empty())
             .or_else(|| p.text(tags::ATTACH_PATHNAME)),
         size: p.int(tags::ATTACH_SIZE),
         flags: p.int32(tags::ATTACH_FLAGS),

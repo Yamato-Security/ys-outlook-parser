@@ -367,6 +367,103 @@ fn value_bytes(v: &Value) -> usize {
 }
 
 #[test]
+fn multivalue_lengths_detect_truncation_without_discarding_elements() {
+    for (ty, raw) in [
+        (0x1102u32, b"data".as_slice()),
+        (0x101E, b"text\0".as_slice()),
+        (0x101F, b"t\0e\0x\0t\0\0\0".as_slice()),
+    ] {
+        // A complete length stream and all expected element streams exist, but one
+        // element's bytes disagree with its recorded length in either direction.
+        for adjustment in [-1i64, 1] {
+            let declared = (raw.len() as i64 + adjustment) as u32;
+            let mut lengths = declared.to_le_bytes().to_vec();
+            if ty == 0x1102 {
+                lengths.extend([0xFF; 4]); // reserved: ignored even when nonzero
+            }
+            let tag = 0x3001_0000 | ty;
+            let streams = vec![
+                ("/__properties_version1.0".into(), vec![0; 32]),
+                (format!("/__substg1.0_{tag:08X}"), lengths.clone()),
+                (format!("/__substg1.0_{tag:08X}-00000000"), raw.to_vec()),
+            ];
+            let file = MsgFile::from_bytes(&write_tree(&streams, &[])).unwrap();
+            let property = file.message.properties.get_tag(tag).unwrap();
+            let PropertyValue::Damaged {
+                recovered: Some(value),
+                raw: stored_lengths,
+                reason,
+            } = &property.value
+            else {
+                panic!("incorrect element length was presented as clean: {property:?}");
+            };
+            assert_eq!(stored_lengths, &lengths);
+            assert!(reason.contains("element 0"));
+            assert!(reason.contains(&declared.to_string()));
+            assert_eq!(value_bytes(value), raw.len());
+            match value {
+                Value::MultipleBinary(values) => assert_eq!(values[0], raw),
+                Value::MultipleString8(values) | Value::MultipleUnicode(values) => {
+                    assert_eq!(values[0].raw(), raw);
+                    assert_eq!(values[0].as_str(), "text");
+                }
+                other => panic!("unexpected recovered value: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn matching_multivalue_lengths_are_clean_and_ignore_binary_reserved_bytes() {
+    for (ty, raw) in [
+        (0x1102u32, b"data".as_slice()),
+        (0x101E, b"text\0".as_slice()),
+        (0x101F, b"t\0e\0x\0t\0\0\0".as_slice()),
+    ] {
+        let mut lengths = (raw.len() as u32).to_le_bytes().to_vec();
+        if ty == 0x1102 {
+            lengths.extend([0xFF; 4]);
+        }
+        let tag = 0x3001_0000 | ty;
+        let streams = vec![
+            ("/__properties_version1.0".into(), vec![0; 32]),
+            (format!("/__substg1.0_{tag:08X}"), lengths),
+            (format!("/__substg1.0_{tag:08X}-00000000"), raw.to_vec()),
+        ];
+        let file = MsgFile::from_bytes(&write_tree(&streams, &[])).unwrap();
+        assert!(matches!(
+            file.message.properties.get_tag(tag).unwrap().value,
+            PropertyValue::Ok(_)
+        ));
+    }
+}
+
+#[test]
+fn sparse_multivalue_indices_and_untrusted_lengths_keep_recovered_data() {
+    // Neither a four-gigabyte declaration nor an enormous stream index should
+    // request that much memory or turn an extra element into an indexed lookup.
+    let lengths = [u32::MAX.to_le_bytes(), [0; 4]].concat();
+    let streams = vec![
+        ("/__properties_version1.0".into(), vec![0; 32]),
+        ("/__substg1.0_30011102".into(), lengths),
+        ("/__substg1.0_30011102-00000000".into(), b"first".to_vec()),
+        ("/__substg1.0_30011102-FFFFFFFF".into(), b"last".to_vec()),
+    ];
+    let file = MsgFile::from_bytes(&write_tree(&streams, &[])).unwrap();
+    let PropertyValue::Damaged {
+        recovered: Some(Value::MultipleBinary(values)),
+        reason,
+        ..
+    } = &file.message.properties.get_tag(0x3001_1102).unwrap().value
+    else {
+        panic!("missing recovered binary values");
+    };
+    assert_eq!(values, &[b"first".to_vec(), b"last".to_vec()]);
+    assert!(reason.contains("4294967295"));
+    assert!(reason.contains("1 element streams beyond"));
+}
+
+#[test]
 fn streams_sharing_a_sector_chain_are_read_within_a_budget() {
     // Point every stream at the sector chain of the largest one: a small file that expands to
     // much more data than it holds. The total read is capped; what is cut is reported.

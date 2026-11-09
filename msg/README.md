@@ -40,7 +40,7 @@ for problem in file.all_problems() {
   (`__attach_version1.0_#XXXXXXXX`) and embedded messages (`__substg1.0_3701000D`), recursively
   up to [`Options::max_depth`]. OLE-object attachments are returned as their storage tree.
 - Every property: the entries of `__properties_version1.0` (32-, 24- and 8-byte headers),
-  fixed-size values inline, variable-size values in `__substg1.0_TTTTPPPP` streams,
+  fixed-size values inline, variable-size values in `__substg1.0_PPPPTTTT` streams,
   multi-valued properties (fixed-size, and variable-size with their length stream and
   `-XXXXXXXX` element streams), and streams that have no entry. Each [`Property`] has its id,
   type, raw entry, named-property identity and a [`PropertyValue`] that tells a decoded value
@@ -63,6 +63,9 @@ for problem in file.all_problems() {
 
 Reading fails soft: a stream, property, recipient or attachment that cannot be read is a
 [`Problem`] (of its [`Message`], or of the [`MsgFile`]) and its siblings are still read.
+Multi-valued strings and binary values whose element lengths disagree with their length
+stream are marked damaged, with every recovered element's bytes kept. Declared lengths
+are checked without using them to allocate or truncate the values.
 Nothing panics on any input, allocations are bounded by the size of the input (the total
 amount of stream data read is capped too), and nesting is capped. Only a compound file that
 the `cfb` crate cannot open at all (a broken header, FAT or directory) is an [`Error`]; one
