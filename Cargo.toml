@@ -15,10 +15,10 @@ categories = ["parser-implementations"]
 [workspace.dependencies]
 compressed-rtf = { package = "ys-outlook-parser-rtf", version = "1.0.0", path = "compressed-rtf" }
 
-byteorder = "1"
-cfb = "0.16"
-encoding_rs = "0.8"
-flate2 = "1"
-sha2 = "0.11"
-thiserror = "2"
-tracing = "0.1"
+byteorder = "1.5.0"
+cfb = "0.16.0"
+encoding_rs = "0.8.44"
+flate2 = "1.1.11"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tracing = "0.1.44"
